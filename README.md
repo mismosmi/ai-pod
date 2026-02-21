@@ -19,6 +19,16 @@ A CLI tool that runs Claude Code inside isolated Podman containers, giving each 
 
 ## Installation
 
+### Quick install (Linux & macOS)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/farbenmeer/ai-pod/main/install.sh | bash
+```
+
+This downloads the latest release binary for your OS and architecture and places it in `~/.local/bin/`.
+
+### Build from source
+
 ```sh
 cargo install --path .
 ```
