@@ -38,6 +38,13 @@ pub enum Command {
     /// Show notification daemon status
     ServerStatus,
 
+    /// Create ai-pod.Dockerfile in the workspace for editing
+    Init {
+        /// Workspace path (default: cwd)
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+    },
+
     /// List all claude containers
     List,
 

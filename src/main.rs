@@ -5,25 +5,61 @@ mod credentials;
 mod image;
 mod server;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use colored::Colorize;
+use std::path::Path;
 
 use cli::{Cli, Command};
 use config::AppConfig;
+
+fn resolve_workspace(workdir: &Option<std::path::PathBuf>) -> Result<std::path::PathBuf> {
+    match workdir {
+        Some(p) => std::fs::canonicalize(p).context("Invalid workspace path"),
+        None => std::env::current_dir().context("Failed to get current directory"),
+    }
+}
+
+fn init_project(workspace: &Path) -> Result<()> {
+    let dockerfile = workspace.join(image::DOCKERFILE_NAME);
+
+    if dockerfile.exists() {
+        println!(
+            "{} {}",
+            "Already exists:".yellow(),
+            dockerfile.display()
+        );
+        return Ok(());
+    }
+
+    let default = include_str!("../claude.Dockerfile");
+    std::fs::write(&dockerfile, default).context("Failed to write ai-pod.Dockerfile")?;
+
+    println!("{} {}", "Created:".green().bold(), dockerfile.display());
+    println!("Edit this file to customise your Claude container, then run `ai-pod` to launch.");
+
+    Ok(())
+}
 
 fn launch_flow(cli: &Cli) -> Result<()> {
     let config = AppConfig::new()?;
     config.init()?;
 
     // 1. Resolve workspace
-    let workspace = match &cli.workdir {
-        Some(p) => std::fs::canonicalize(p)?,
-        None => std::env::current_dir()?,
-    };
+    let workspace = resolve_workspace(&cli.workdir)?;
     println!("{} {}", "Workspace:".blue(), workspace.display());
 
-    // 2. Credential scan
+    // 2. Locate Dockerfile
+    let dockerfile = workspace.join(image::DOCKERFILE_NAME);
+    if !dockerfile.exists() {
+        anyhow::bail!(
+            "No {} found in {}.\nRun `ai-pod init` to create one.",
+            image::DOCKERFILE_NAME,
+            workspace.display()
+        );
+    }
+
+    // 3. Credential scan
     if !cli.no_credential_check {
         if !credentials::check_credentials(&workspace)? {
             println!("{}", "Aborted.".red());
@@ -31,13 +67,14 @@ fn launch_flow(cli: &Cli) -> Result<()> {
         }
     }
 
-    // 3. Build image if needed
-    image::ensure_image(&config, cli.rebuild)?;
+    // 4. Build image if needed
+    let image = image::image_name(&workspace);
+    image::ensure_image(&config, &dockerfile, &image, cli.rebuild)?;
 
-    // 4. Ensure notification server
+    // 5. Ensure notification server
     server::lifecycle::ensure_server(&config.pid_file, &config.log_file, cli.notify_port)?;
 
-    // 5 & 6. Generate settings + launch container
+    // 6. Generate settings + launch container
     container::launch_container(&config, &workspace, cli.notify_port)?;
 
     Ok(())
@@ -48,10 +85,24 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
+        Some(Command::Init { workdir }) => {
+            let workspace = resolve_workspace(workdir)?;
+            init_project(&workspace)?;
+        }
         Some(Command::Build) => {
             let config = AppConfig::new()?;
             config.init()?;
-            image::ensure_image(&config, cli.rebuild)?;
+            let workspace = resolve_workspace(&cli.workdir)?;
+            let dockerfile = workspace.join(image::DOCKERFILE_NAME);
+            if !dockerfile.exists() {
+                anyhow::bail!(
+                    "No {} found in {}.\nRun `ai-pod init` to create one.",
+                    image::DOCKERFILE_NAME,
+                    workspace.display()
+                );
+            }
+            let image = image::image_name(&workspace);
+            image::ensure_image(&config, &dockerfile, &image, cli.rebuild)?;
         }
         Some(Command::ServeNotifications) => {
             server::run_server(cli.notify_port).await?;
@@ -68,10 +119,7 @@ async fn main() -> Result<()> {
             container::list_containers()?;
         }
         Some(Command::Clean { workdir }) => {
-            let workspace = match workdir {
-                Some(p) => std::fs::canonicalize(p)?,
-                None => std::env::current_dir()?,
-            };
+            let workspace = resolve_workspace(workdir)?;
             container::clean_container(&workspace)?;
         }
         None => {

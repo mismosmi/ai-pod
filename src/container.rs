@@ -5,7 +5,6 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::config::AppConfig;
-use crate::image::IMAGE_NAME;
 
 const CONTAINER_CLAUDE_MD: &str = r#"# Container Environment
 You are running inside a Podman container. To reach services on the host machine,
@@ -148,7 +147,7 @@ fn create_container(
     ));
 
     // Image
-    args.push(IMAGE_NAME.into());
+    args.push(crate::image::image_name(workspace));
 
     println!("{} {}", "Creating container:".blue().bold(), container_name);
 
@@ -265,6 +264,146 @@ pub fn list_containers() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn make_test_config(dir: &TempDir) -> AppConfig {
+        let home = dir.path().to_path_buf();
+        let config_dir = home.join(".ai-pod");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        AppConfig {
+            pid_file: config_dir.join("server.pid"),
+            log_file: config_dir.join("server.log"),
+            runtime_settings: config_dir.join("runtime-settings.json"),
+            runtime_claude_md: config_dir.join("runtime-CLAUDE.md"),
+            config_dir,
+            home_dir: home,
+        }
+    }
+
+    #[test]
+    fn container_name_is_deterministic() {
+        let path = Path::new("/home/user/myproject");
+        assert_eq!(
+            generate_container_name(path),
+            generate_container_name(path)
+        );
+    }
+
+    #[test]
+    fn container_name_starts_with_claude() {
+        let name = generate_container_name(Path::new("/home/user/myproject"));
+        assert!(name.starts_with("claude-"));
+    }
+
+    #[test]
+    fn container_name_has_expected_length() {
+        // "claude-" (7) + hex of 6 bytes (12 chars) = 19
+        let name = generate_container_name(Path::new("/home/user/myproject"));
+        assert_eq!(name.len(), 19);
+    }
+
+    #[test]
+    fn container_name_differs_for_different_paths() {
+        let a = generate_container_name(Path::new("/home/user/project-a"));
+        let b = generate_container_name(Path::new("/home/user/project-b"));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn runtime_settings_contains_stop_hook() {
+        let dir = TempDir::new().unwrap();
+        let config = make_test_config(&dir);
+        generate_runtime_settings(&config, 9876).unwrap();
+
+        let content = std::fs::read_to_string(&config.runtime_settings).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+        let stop = &json["hooks"]["Stop"];
+        assert!(stop.is_array(), "hooks.Stop should be an array");
+        let cmd = stop[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("9876"));
+        assert!(cmd.contains("host.containers.internal"));
+    }
+
+    #[test]
+    fn runtime_settings_uses_correct_port() {
+        let dir = TempDir::new().unwrap();
+        let config = make_test_config(&dir);
+        generate_runtime_settings(&config, 1234).unwrap();
+
+        let content = std::fs::read_to_string(&config.runtime_settings).unwrap();
+        assert!(content.contains("1234"));
+        assert!(!content.contains("9876"));
+    }
+
+    #[test]
+    fn runtime_settings_preserves_existing_keys() {
+        let dir = TempDir::new().unwrap();
+        let config = make_test_config(&dir);
+
+        // Write existing settings with a custom key
+        let claude_dir = config.home_dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let existing = serde_json::json!({"theme": "dark", "verbosity": "verbose"});
+        std::fs::write(
+            config.claude_settings_path(),
+            serde_json::to_string(&existing).unwrap(),
+        )
+        .unwrap();
+
+        generate_runtime_settings(&config, 9876).unwrap();
+
+        let content = std::fs::read_to_string(&config.runtime_settings).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(json["theme"], "dark");
+        assert_eq!(json["verbosity"], "verbose");
+    }
+
+    #[test]
+    fn runtime_claude_md_contains_container_preamble() {
+        let dir = TempDir::new().unwrap();
+        let config = make_test_config(&dir);
+        generate_runtime_claude_md(&config).unwrap();
+
+        let content = std::fs::read_to_string(&config.runtime_claude_md).unwrap();
+        assert!(content.contains("host.containers.internal"));
+        assert!(content.contains("Podman container"));
+    }
+
+    #[test]
+    fn runtime_claude_md_appends_existing_claude_md() {
+        let dir = TempDir::new().unwrap();
+        let config = make_test_config(&dir);
+
+        let claude_dir = config.home_dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(
+            config.claude_md_path(),
+            "# My Rules\nAlways use Rust.\n",
+        )
+        .unwrap();
+
+        generate_runtime_claude_md(&config).unwrap();
+
+        let content = std::fs::read_to_string(&config.runtime_claude_md).unwrap();
+        assert!(content.contains("host.containers.internal"));
+        assert!(content.contains("My Rules"));
+        assert!(content.contains("Always use Rust."));
+    }
+
+    #[test]
+    fn runtime_claude_md_without_existing_file_does_not_error() {
+        let dir = TempDir::new().unwrap();
+        let config = make_test_config(&dir);
+        // No CLAUDE.md exists — should still succeed
+        generate_runtime_claude_md(&config).unwrap();
+        assert!(config.runtime_claude_md.exists());
+    }
 }
 
 pub fn clean_container(workspace: &Path) -> Result<()> {

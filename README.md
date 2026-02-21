@@ -72,13 +72,23 @@ ai-pod --workdir /path/to/project
 
 ## Configuration
 
-On first run, `ai-pod` creates `~/.ai-pod/` and writes a default `Dockerfile` there. Customize that file to install additional tools into your Claude containers (e.g. Node, Playwright, MCP servers).
-
 Your host `~/.claude/CLAUDE.md` and `~/.claude/settings.json` are merged with container defaults at launch time, so your personal Claude preferences carry over automatically.
 
-## Container image
+## Per-workspace Dockerfiles
 
-The default image (`claude.Dockerfile`) is based on Ubuntu and installs Claude Code via the official install script. Uncomment lines in the Dockerfile to add tools like Playwright or MCP servers.
+Each workspace can have its own `ai-pod.Dockerfile` that customizes the container image for that project — installing extra runtimes, tools, or MCP servers.
+
+To create one in the current directory:
+
+```sh
+ai-pod init
+```
+
+This writes an `ai-pod.Dockerfile` to the workspace root based on the default image. Edit it to add anything your project needs (e.g. Node, Python, Playwright, project-specific MCP servers). When `ai-pod` launches, it automatically uses `ai-pod.Dockerfile` if one is present, otherwise it falls back to the global default.
+
+If no `ai-pod.Dockerfile` exists in the workspace, `ai-pod` will remind you to run `ai-pod init` if you want to customise it.
+
+The default image is based on Ubuntu and installs Claude Code via the official install script. The generated Dockerfile includes commented-out examples for common additions like Playwright and MCP servers.
 
 ## How to secure credentials
 
