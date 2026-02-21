@@ -69,3 +69,7 @@ Your host `~/.claude/CLAUDE.md` and `~/.claude/settings.json` are merged with co
 ## Container image
 
 The default image (`claude.Dockerfile`) is based on Ubuntu and installs Claude Code via the official install script. Uncomment lines in the Dockerfile to add tools like Playwright or MCP servers.
+
+## How to secure credentials
+
+If you have sensible credentials stored in a .env file in your workspace, an easy way to avoid passing them to claude is to move the .env file somewhere else (`~/.env-files/<workspace-name>`) and symlink them back to the workspace directory (`ln -s ~/.env-files/<workspace-name> .env`).
