@@ -54,4 +54,14 @@ pub enum Command {
         #[arg(long)]
         workdir: Option<PathBuf>,
     },
+
+    /// Run a command in the container, overriding the default
+    Run {
+        /// Command to run (e.g. bash, claude)
+        command: String,
+
+        /// Arguments to pass to the command
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
