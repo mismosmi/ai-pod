@@ -132,6 +132,29 @@ async fn main() -> Result<()> {
             let workspace = resolve_workspace(workdir)?;
             container::clean_container(&workspace)?;
         }
+        Some(Command::Run { command, args }) => {
+            let config = AppConfig::new()?;
+            config.init()?;
+            let workspace = resolve_workspace(&cli.workdir)?;
+            let dockerfile = workspace.join(image::DOCKERFILE_NAME);
+            if !dockerfile.exists() {
+                anyhow::bail!(
+                    "No {} found in {}.\nRun `ai-pod init` to create one.",
+                    image::DOCKERFILE_NAME,
+                    workspace.display()
+                );
+            }
+            if !cli.no_credential_check {
+                if !credentials::check_credentials(&workspace)? {
+                    println!("{}", "Aborted.".red());
+                    return Ok(());
+                }
+            }
+            let image = image::image_name(&workspace);
+            image::ensure_image(&config, &dockerfile, &image, cli.rebuild)?;
+            server::lifecycle::ensure_server(&config.pid_file, &config.log_file, cli.notify_port)?;
+            container::run_in_container(&config, &workspace, cli.notify_port, command, args)?;
+        }
         None => {
             launch_flow(&cli)?;
         }

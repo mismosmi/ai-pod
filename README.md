@@ -67,8 +67,18 @@ ai-pod --workdir /path/to/project
 | `build` | Build the container image without launching |
 | `list` | List all Claude containers |
 | `clean [--workdir PATH]` | Stop and remove the container for a workspace |
+| `run <command> [args...]` | Run a command in the container instead of the default |
 | `stop-server` | Stop the background notification daemon |
 | `server-status` | Show notification daemon status |
+
+### Run a specific command in the container
+
+```sh
+ai-pod run claude resume   # resume the last Claude session
+ai-pod run bash            # open a bash shell in the container
+```
+
+The `run` subcommand ensures the container is built and running (creating it if needed), then executes the given command interactively via `podman exec`. All standard flags (`--workdir`, `--rebuild`, etc.) apply.
 
 ## Configuration
 

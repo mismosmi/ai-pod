@@ -241,6 +241,50 @@ pub fn launch_container(config: &AppConfig, workspace: &Path, port: u16) -> Resu
     Ok(())
 }
 
+pub fn run_in_container(
+    config: &AppConfig,
+    workspace: &Path,
+    port: u16,
+    command: &str,
+    args: &[String],
+) -> Result<()> {
+    let container_name = generate_container_name(workspace);
+
+    if container_exists(&container_name)? {
+        if !container_is_running(&container_name)? {
+            start_container(&container_name)?;
+        }
+    } else {
+        create_container(config, workspace, &container_name, port)?;
+    }
+
+    println!(
+        "{} {} {}",
+        "Running in container:".blue().bold(),
+        container_name,
+        command
+    );
+
+    let mut exec_args: Vec<&str> = vec!["exec", "-it", &container_name, command];
+    for arg in args {
+        exec_args.push(arg.as_str());
+    }
+
+    let status = Command::new("podman")
+        .args(&exec_args)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .context("Failed to exec command in container")?;
+
+    if !status.success() {
+        anyhow::bail!("Command exited with non-zero status");
+    }
+
+    Ok(())
+}
+
 pub fn list_containers() -> Result<()> {
     let output = Command::new("podman")
         .args([
