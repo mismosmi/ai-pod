@@ -4,6 +4,7 @@ mod container;
 mod credentials;
 mod image;
 mod server;
+mod update;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -83,6 +84,15 @@ fn launch_flow(cli: &Cli) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Skip update check for internal/daemon commands
+    if !matches!(&cli.command, Some(Command::ServeNotifications)) {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            update::check_for_update(),
+        )
+        .await;
+    }
 
     match &cli.command {
         Some(Command::Init { workdir }) => {
