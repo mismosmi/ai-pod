@@ -22,6 +22,13 @@ fn generate_container_name(workspace: &Path) -> String {
     format!("claude-{}", short_hash)
 }
 
+fn generate_volume_name(workspace: &Path) -> String {
+    let workspace_str = workspace.to_string_lossy();
+    let hash = Sha256::digest(workspace_str.as_bytes());
+    let short_hash = hex::encode(&hash[..6]);
+    format!("claude-{}-home", short_hash)
+}
+
 fn container_exists(name: &str) -> Result<bool> {
     let output = Command::new("podman")
         .args([
@@ -51,6 +58,14 @@ fn container_is_running(name: &str) -> Result<bool> {
         .context("Failed to check if container is running")?;
 
     Ok(!output.stdout.is_empty())
+}
+
+fn volume_exists(name: &str) -> Result<bool> {
+    let status = Command::new("podman")
+        .args(["volume", "exists", name])
+        .status()
+        .context("Failed to check if volume exists")?;
+    Ok(status.success())
 }
 
 fn generate_runtime_claude_md(config: &AppConfig) -> Result<()> {
@@ -106,136 +121,199 @@ fn generate_runtime_settings(config: &AppConfig, port: u16) -> Result<()> {
     Ok(())
 }
 
-fn create_container(
+/// Initialize a named home volume for the first time.
+/// Creates skeleton dirs, copies host ~/.claude.json and ~/.claude/, and injects runtime config.
+fn init_home_volume(
     config: &AppConfig,
-    workspace: &Path,
+    volume_name: &str,
     container_name: &str,
+    image: &str,
     port: u16,
 ) -> Result<()> {
+    println!("{} {}", "Initialising home volume:".blue().bold(), volume_name);
+
+    // 1. Create the volume
+    let status = Command::new("podman")
+        .args(["volume", "create", volume_name])
+        .status()
+        .context("Failed to create volume")?;
+    if !status.success() {
+        anyhow::bail!("Failed to create volume {}", volume_name);
+    }
+
+    // 2. Create skeleton dirs with correct ownership
+    let status = Command::new("podman")
+        .args([
+            "run",
+            "--rm",
+            "--user",
+            "root",
+            "--entrypoint",
+            "/bin/sh",
+            "-v",
+            &format!("{}:/home/claude", volume_name),
+            image,
+            "-c",
+            "mkdir -p /home/claude/.claude && chown -R claude:claude /home/claude",
+        ])
+        .status()
+        .context("Failed to initialise home volume skeleton")?;
+    if !status.success() {
+        anyhow::bail!("Failed to initialise home volume skeleton");
+    }
+
+    // 3. Create a stopped container for cp operations
+    let init_container = format!("{}-init", container_name);
+    let status = Command::new("podman")
+        .args([
+            "create",
+            "--name",
+            &init_container,
+            "-v",
+            &format!("{}:/home/claude", volume_name),
+            image,
+        ])
+        .status()
+        .context("Failed to create init container")?;
+    if !status.success() {
+        anyhow::bail!("Failed to create init container");
+    }
+
+    // 4. Copy ~/.claude.json (soft error)
+    let claude_json = config.home_dir.join(".claude.json");
+    if claude_json.exists() {
+        let _ = Command::new("podman")
+            .args([
+                "cp",
+                &claude_json.to_string_lossy(),
+                &format!("{}:/home/claude/", init_container),
+            ])
+            .status();
+    }
+
+    // 5. Copy ~/.claude/ (soft error)
+    let claude_dir = config.home_dir.join(".claude");
+    if claude_dir.exists() {
+        let _ = Command::new("podman")
+            .args([
+                "cp",
+                &format!("{}/.", claude_dir.to_string_lossy()),
+                &format!("{}:/home/claude/.claude/", init_container),
+            ])
+            .status();
+    }
+
+    // 6. Generate and copy runtime config
     generate_runtime_claude_md(config)?;
     generate_runtime_settings(config, port)?;
 
-    let workspace_str = workspace.to_string_lossy();
-    let volume_name = format!("{}-data", container_name);
-
-    let mut args: Vec<String> = vec![
-        "run".into(),
-        "-dit".into(),
-        "--init".into(),
-        "--name".into(),
-        container_name.to_string(),
-    ];
-
-    // Workspace mount
-    args.push("-v".into());
-    args.push(format!("{}:/app:Z", workspace_str));
-
-    // Persistent volume for Claude data
-    args.push("-v".into());
-    args.push(format!("{}:/home/claude/.claude", volume_name));
-
-    // Host gateway
-    args.push("--add-host=host.containers.internal:host-gateway".into());
-
-    // Environment variables
-    args.push("-e".into());
-    args.push("HOST_GATEWAY=host.containers.internal".into());
-    args.push("-e".into());
-    args.push(format!(
-        "NOTIFY_URL=http://host.containers.internal:{}/notify",
-        port
-    ));
-
-    // Image
-    args.push(crate::image::image_name(workspace));
-
-    println!("{} {}", "Creating container:".blue().bold(), container_name);
-
-    let status = Command::new("podman")
-        .args(&args)
-        .status()
-        .context("Failed to create container")?;
-
-    if !status.success() {
-        anyhow::bail!("Failed to create container");
-    }
-
-    // Copy merged CLAUDE.md
-    Command::new("podman")
+    let _ = Command::new("podman")
         .args([
             "cp",
             &config.runtime_claude_md.to_string_lossy(),
-            &format!("{}:/home/claude/.claude/CLAUDE.md", container_name),
+            &format!("{}:/home/claude/.claude/CLAUDE.md", init_container),
         ])
-        .status()
-        .context("Failed to copy CLAUDE.md")?;
+        .status();
 
-    // Copy merged settings.json
-    Command::new("podman")
+    let _ = Command::new("podman")
         .args([
             "cp",
             &config.runtime_settings.to_string_lossy(),
-            &format!("{}:/home/claude/.claude/settings.json", container_name),
+            &format!("{}:/home/claude/.claude/settings.json", init_container),
         ])
-        .status()
-        .context("Failed to copy settings.json")?;
+        .status();
 
-    println!("{}", "Container created successfully.".green());
+    // 7. Remove init container
+    let _ = Command::new("podman")
+        .args(["rm", &init_container])
+        .status();
 
-    Ok(())
-}
-
-fn attach_to_container(container_name: &str) -> Result<()> {
-    println!(
-        "{} {}",
-        "Attaching to container:".blue().bold(),
-        container_name
-    );
-
-    let status = Command::new("podman")
-        .args(["attach", container_name])
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status()
-        .context("Failed to attach to container")?;
-
-    if !status.success() {
-        anyhow::bail!("Failed to attach to container");
-    }
+    println!("{}", "Home volume initialised.".green());
 
     Ok(())
 }
 
-fn start_container(container_name: &str) -> Result<()> {
-    println!("{} {}", "Starting container:".blue().bold(), container_name);
-
-    let status = Command::new("podman")
-        .args(["start", container_name])
-        .status()
-        .context("Failed to start container")?;
-
-    if !status.success() {
-        anyhow::bail!("Failed to start container");
-    }
-
-    Ok(())
-}
-
-pub fn launch_container(config: &AppConfig, workspace: &Path, port: u16) -> Result<()> {
+pub fn launch_container(
+    config: &AppConfig,
+    workspace: &Path,
+    port: u16,
+    rebuild: bool,
+    image: &str,
+) -> Result<()> {
     let container_name = generate_container_name(workspace);
+    let volume_name = generate_volume_name(workspace);
+    let workspace_str = workspace.to_string_lossy();
 
-    if container_exists(&container_name)? {
-        println!("{} {}", "Found existing container:".green(), container_name);
+    // Handle rebuild: remove the container (but keep volume)
+    if rebuild && container_exists(&container_name)? {
+        println!(
+            "{} {}",
+            "Removing container for rebuild:".blue().bold(),
+            container_name
+        );
+        let _ = Command::new("podman")
+            .args(["rm", "--force", &container_name])
+            .status();
+    }
 
-        if !container_is_running(&container_name)? {
-            start_container(&container_name)?;
+    // Init home volume if it doesn't exist
+    if !volume_exists(&volume_name)? {
+        init_home_volume(config, &volume_name, &container_name, image, port)?;
+    }
+
+    if container_is_running(&container_name)? {
+        // Reconnect to existing running container
+        println!(
+            "{} {}",
+            "Attaching to running container:".green(),
+            container_name
+        );
+        Command::new("podman")
+            .args(["attach", &container_name])
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()
+            .context("Failed to attach to container")?;
+        // Non-zero exits (detach=0, ctrl+c=130) are intentionally ignored
+    } else {
+        // Clean up stale stopped container if one exists
+        if container_exists(&container_name)? {
+            let _ = Command::new("podman")
+                .args(["rm", &container_name])
+                .status();
         }
 
-        attach_to_container(&container_name)?;
-    } else {
-        create_container(config, workspace, &container_name, port)?;
-        attach_to_container(&container_name)?;
+        println!(
+            "{} {}",
+            "Starting container:".blue().bold(),
+            container_name
+        );
+
+        Command::new("podman")
+            .args([
+                "run",
+                "--rm",
+                "-it",
+                "--name",
+                &container_name,
+                "-v",
+                &format!("{}:/home/claude", volume_name),
+                "-v",
+                &format!("{}:/app:Z", workspace_str),
+                "--add-host=host.containers.internal:host-gateway",
+                "-e",
+                "HOST_GATEWAY=host.containers.internal",
+                "-e",
+                &format!("NOTIFY_URL=http://host.containers.internal:{}/notify", port),
+                image,
+            ])
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()
+            .context("Failed to run container")?;
+        // Non-zero exits intentionally ignored
     }
 
     Ok(())
@@ -249,13 +327,13 @@ pub fn run_in_container(
     args: &[String],
 ) -> Result<()> {
     let container_name = generate_container_name(workspace);
+    let volume_name = generate_volume_name(workspace);
+    let image = crate::image::image_name(workspace);
+    let workspace_str = workspace.to_string_lossy();
 
-    if container_exists(&container_name)? {
-        if !container_is_running(&container_name)? {
-            start_container(&container_name)?;
-        }
-    } else {
-        create_container(config, workspace, &container_name, port)?;
+    // Init home volume if it doesn't exist
+    if !volume_exists(&volume_name)? {
+        init_home_volume(config, &volume_name, &container_name, &image, port)?;
     }
 
     println!(
@@ -265,18 +343,32 @@ pub fn run_in_container(
         command
     );
 
-    let mut exec_args: Vec<&str> = vec!["exec", "-it", &container_name, command];
-    for arg in args {
-        exec_args.push(arg.as_str());
-    }
+    let mut run_args: Vec<String> = vec![
+        "run".into(),
+        "--rm".into(),
+        "-it".into(),
+        "-v".into(),
+        format!("{}:/home/claude", volume_name),
+        "-v".into(),
+        format!("{}:/app:Z", workspace_str),
+        "--add-host=host.containers.internal:host-gateway".into(),
+        "-e".into(),
+        "HOST_GATEWAY=host.containers.internal".into(),
+        "-e".into(),
+        format!("NOTIFY_URL=http://host.containers.internal:{}/notify", port),
+        "--entrypoint".into(),
+        command.to_string(),
+        image,
+    ];
+    run_args.extend_from_slice(args);
 
     let status = Command::new("podman")
-        .args(&exec_args)
+        .args(&run_args)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .status()
-        .context("Failed to exec command in container")?;
+        .context("Failed to run command in container")?;
 
     if !status.success() {
         anyhow::bail!("Command exited with non-zero status");
@@ -305,6 +397,51 @@ pub fn list_containers() -> Result<()> {
         println!("{:<20} {:<30} {}", "NAME", "STATUS", "CREATED");
         println!("{}", "-".repeat(80));
         print!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+
+    Ok(())
+}
+
+pub fn clean_container(workspace: &Path) -> Result<()> {
+    let container_name = generate_container_name(workspace);
+    let volume_name = generate_volume_name(workspace);
+
+    let container_existed = container_exists(&container_name)?;
+
+    if container_existed {
+        println!("{} {}", "Removing container:".red().bold(), container_name);
+
+        if container_is_running(&container_name)? {
+            Command::new("podman")
+                .args(["stop", &container_name])
+                .status()
+                .context("Failed to stop container")?;
+        }
+
+        Command::new("podman")
+            .args(["rm", &container_name])
+            .status()
+            .context("Failed to remove container")?;
+
+        println!("{}", "Container removed.".green());
+    } else {
+        println!(
+            "{} {}",
+            "Container does not exist:".yellow(),
+            container_name
+        );
+    }
+
+    // Remove named home volume
+    if volume_exists(&volume_name)? {
+        println!("{} {}", "Removing volume:".red().bold(), volume_name);
+        let status = Command::new("podman")
+            .args(["volume", "rm", &volume_name])
+            .status()
+            .context("Failed to remove volume")?;
+        if status.success() {
+            println!("{}", "Volume removed.".green());
+        }
     }
 
     Ok(())
@@ -352,6 +489,22 @@ mod tests {
     fn container_name_differs_for_different_paths() {
         let a = generate_container_name(Path::new("/home/user/project-a"));
         let b = generate_container_name(Path::new("/home/user/project-b"));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn volume_name_matches_container_hash() {
+        let path = Path::new("/home/user/myproject");
+        let container = generate_container_name(path);
+        let volume = generate_volume_name(path);
+        // Volume name should be container name + "-home"
+        assert_eq!(volume, format!("{}-home", container));
+    }
+
+    #[test]
+    fn volume_name_differs_for_different_paths() {
+        let a = generate_volume_name(Path::new("/home/user/project-a"));
+        let b = generate_volume_name(Path::new("/home/user/project-b"));
         assert_ne!(a, b);
     }
 
@@ -441,43 +594,4 @@ mod tests {
         generate_runtime_claude_md(&config).unwrap();
         assert!(config.runtime_claude_md.exists());
     }
-}
-
-pub fn clean_container(workspace: &Path) -> Result<()> {
-    let container_name = generate_container_name(workspace);
-
-    if !container_exists(&container_name)? {
-        println!(
-            "{} {}",
-            "Container does not exist:".yellow(),
-            container_name
-        );
-        return Ok(());
-    }
-
-    println!("{} {}", "Removing container:".red().bold(), container_name);
-
-    // Stop if running
-    if container_is_running(&container_name)? {
-        Command::new("podman")
-            .args(["stop", &container_name])
-            .status()
-            .context("Failed to stop container")?;
-    }
-
-    // Remove container
-    Command::new("podman")
-        .args(["rm", &container_name])
-        .status()
-        .context("Failed to remove container")?;
-
-    // Remove associated volume
-    let volume_name = format!("{}-data", container_name);
-    let _ = Command::new("podman")
-        .args(["volume", "rm", &volume_name])
-        .status();
-
-    println!("{}", "Container removed.".green());
-
-    Ok(())
 }

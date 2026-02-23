@@ -75,8 +75,8 @@ fn launch_flow(cli: &Cli) -> Result<()> {
     // 5. Ensure notification server
     server::lifecycle::ensure_server(&config.pid_file, &config.log_file, cli.notify_port)?;
 
-    // 6. Generate settings + launch container
-    container::launch_container(&config, &workspace, cli.notify_port)?;
+    // 6. Launch container
+    container::launch_container(&config, &workspace, cli.notify_port, cli.rebuild, &image)?;
 
     Ok(())
 }
