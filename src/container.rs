@@ -130,7 +130,11 @@ fn init_home_volume(
     image: &str,
     port: u16,
 ) -> Result<()> {
-    println!("{} {}", "Initialising home volume:".blue().bold(), volume_name);
+    println!(
+        "{} {}",
+        "Initialising home volume:".blue().bold(),
+        volume_name
+    );
 
     // 1. Create the volume
     let status = Command::new("podman")
@@ -141,7 +145,8 @@ fn init_home_volume(
         anyhow::bail!("Failed to create volume {}", volume_name);
     }
 
-    // 2. Create skeleton dirs with correct ownership
+    // 2. Seed the volume from the image's /home/claude (preserves claude install).
+    //    Mount at /mnt/claude-home so the image's /home/claude stays visible, then cp into it.
     let status = Command::new("podman")
         .args([
             "run",
@@ -151,15 +156,15 @@ fn init_home_volume(
             "--entrypoint",
             "/bin/sh",
             "-v",
-            &format!("{}:/home/claude", volume_name),
+            &format!("{}:/mnt/claude-home", volume_name),
             image,
             "-c",
-            "mkdir -p /home/claude/.claude && chown -R claude:claude /home/claude",
+            "cp -a /home/claude/. /mnt/claude-home/ && mkdir -p /mnt/claude-home/.claude && chown -R claude:claude /mnt/claude-home",
         ])
         .status()
-        .context("Failed to initialise home volume skeleton")?;
+        .context("Failed to seed home volume from image")?;
     if !status.success() {
-        anyhow::bail!("Failed to initialise home volume skeleton");
+        anyhow::bail!("Failed to seed home volume from image");
     }
 
     // 3. Create a stopped container for cp operations
@@ -284,11 +289,7 @@ pub fn launch_container(
                 .status();
         }
 
-        println!(
-            "{} {}",
-            "Starting container:".blue().bold(),
-            container_name
-        );
+        println!("{} {}", "Starting container:".blue().bold(), container_name);
 
         Command::new("podman")
             .args([
@@ -298,7 +299,7 @@ pub fn launch_container(
                 "--name",
                 &container_name,
                 "-v",
-                &format!("{}:/home/claude", volume_name),
+                &format!("{}:/home/claude:z", volume_name),
                 "-v",
                 &format!("{}:/app:Z", workspace_str),
                 "--add-host=host.containers.internal:host-gateway",
