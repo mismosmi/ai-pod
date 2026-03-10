@@ -16,9 +16,11 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             artifact: ai-pod-linux-x86_64
+            host_tools_artifact: host-tools-linux-x86_64
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             artifact: ai-pod-linux-aarch64
+            host_tools_artifact: host-tools-linux-aarch64
             use_cross: true
           - os: macos-latest
             target: x86_64-apple-darwin
@@ -67,11 +69,23 @@ jobs:
       - name: Prepare artifact
         run: cp target/${{ matrix.target }}/release/ai-pod ${{ matrix.artifact }}
 
+      - name: Prepare host-tools artifact
+        if: matrix.host_tools_artifact != ''
+        run: cp target/${{ matrix.target }}/release/host-tools ${{ matrix.host_tools_artifact }}
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
+          if-no-files-found: error
+
+      - name: Upload host-tools artifact
+        if: matrix.host_tools_artifact != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.host_tools_artifact }}
+          path: ${{ matrix.host_tools_artifact }}
           if-no-files-found: error
 
   release:
