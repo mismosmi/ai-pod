@@ -83,19 +83,13 @@ async fn launch_flow(cli: &Cli) -> Result<()> {
     // 7. Register project with the shared server
     server::lifecycle::register_project(&project_id, &state.api_key, &workspace).await?;
 
-    let project_url = format!(
-        "http://host.containers.internal:{}/mcp/{}",
-        server::lifecycle::MCP_PORT,
-        project_id
-    );
-
     // 8. Launch container
     container::launch_container(
         &config,
         &workspace,
         cli.rebuild,
         &image,
-        &project_url,
+        &project_id,
         &state.api_key,
     )?;
 
@@ -173,17 +167,11 @@ async fn main() -> Result<()> {
             let state = server::lifecycle::get_or_create_project_state(&config, &workspace)?;
             server::lifecycle::register_project(&project_id, &state.api_key, &workspace).await?;
 
-            let project_url = format!(
-                "http://host.containers.internal:{}/mcp/{}",
-                server::lifecycle::MCP_PORT,
-                project_id
-            );
-
             container::run_in_container(
                 &config,
                 &workspace,
                 &image,
-                &project_url,
+                &project_id,
                 &state.api_key,
                 command,
                 args,

@@ -1,7 +1,7 @@
 use colored::Colorize;
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const RELEASES_URL: &str = "https://api.github.com/repos/farbenmeer/ai-pod/releases/latest";
+const RELEASES_URL: &str = "https://api.github.com/repos/mismosmi/ai-pod/releases/latest";
 
 pub async fn check_for_update() {
     if let Ok(latest) = fetch_latest_version().await {
@@ -11,7 +11,7 @@ pub async fn check_for_update() {
                 "Update available:".yellow().bold(),
                 CURRENT_VERSION.dimmed(),
                 latest.green().bold(),
-                "https://github.com/farbenmeer/ai-pod/releases/latest"
+                "https://github.com/mismosmi/ai-pod/releases/latest"
             );
         }
     }
