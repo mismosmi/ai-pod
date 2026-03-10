@@ -122,7 +122,7 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
         .context("permissions is not an object")?;
     perms_obj.insert(
         "defaultMode".to_string(),
-        serde_json::Value::String("dontAsk".to_string()),
+        serde_json::Value::String("bypassPermissions".to_string()),
     );
 
     // Do NOT inject mcpServers here — the setup script handles that via `claude mcp add`
@@ -660,7 +660,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_settings_contains_default_mode_dont_ask() {
+    fn runtime_settings_contains_default_mode_bypass_permissions() {
         let dir = TempDir::new().unwrap();
         let config = make_test_config(&dir);
         generate_runtime_settings(&config).unwrap();
