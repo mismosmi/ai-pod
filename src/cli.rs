@@ -18,10 +18,6 @@ pub struct Cli {
     /// Override workspace directory (default: cwd)
     #[arg(long)]
     pub workdir: Option<PathBuf>,
-
-    /// Notification server port
-    #[arg(long, default_value = "9876", global = true)]
-    pub notify_port: u16,
 }
 
 #[derive(Subcommand)]
@@ -29,14 +25,8 @@ pub enum Command {
     /// Build the container image only
     Build,
 
-    /// Run the notification server (internal use)
-    ServeNotifications,
-
-    /// Stop the notification daemon
-    StopServer,
-
-    /// Show notification daemon status
-    ServerStatus,
+    /// Start the shared MCP server on port 7822
+    Serve,
 
     /// Create ai-pod.Dockerfile in the workspace for editing
     Init {

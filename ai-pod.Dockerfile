@@ -13,7 +13,5 @@ USER claude
 
 ENV PATH="/home/claude/.local/bin:${PATH}"
 
-# Install claude as the claude user so all symlinks/node modules land in ~/.local/
-RUN curl -fsSL https://claude.ai/install.sh | bash
 
 CMD ["claude"]

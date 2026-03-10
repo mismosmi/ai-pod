@@ -3,8 +3,6 @@ use std::path::PathBuf;
 
 pub struct AppConfig {
     pub config_dir: PathBuf,
-    pub pid_file: PathBuf,
-    pub log_file: PathBuf,
     pub runtime_settings: PathBuf,
     pub runtime_claude_md: PathBuf,
     pub home_dir: PathBuf,
@@ -16,8 +14,6 @@ impl AppConfig {
         let config_dir = home_dir.join(".ai-pod");
 
         Ok(Self {
-            pid_file: config_dir.join("server.pid"),
-            log_file: config_dir.join("server.log"),
             runtime_settings: config_dir.join("runtime-settings.json"),
             runtime_claude_md: config_dir.join("runtime-CLAUDE.md"),
             config_dir,
@@ -28,6 +24,16 @@ impl AppConfig {
     pub fn init(&self) -> Result<()> {
         std::fs::create_dir_all(&self.config_dir).context("Failed to create ~/.ai-pod/")?;
         Ok(())
+    }
+
+    /// Returns path to the per-project state file: ~/.ai-pod/{hash}.json
+    pub fn project_state_file(&self, hash: &str) -> PathBuf {
+        self.config_dir.join(format!("{}.json", hash))
+    }
+
+    /// Returns path to the shared server state file: ~/.ai-pod/server.json
+    pub fn server_state_file(&self) -> PathBuf {
+        self.config_dir.join("server.json")
     }
 
     pub fn claude_settings_path(&self) -> PathBuf {
@@ -48,8 +54,6 @@ mod tests {
         let home = dir.path().to_path_buf();
         let config_dir = home.join(".ai-pod");
         AppConfig {
-            pid_file: config_dir.join("server.pid"),
-            log_file: config_dir.join("server.log"),
             runtime_settings: config_dir.join("runtime-settings.json"),
             runtime_claude_md: config_dir.join("runtime-CLAUDE.md"),
             config_dir,
@@ -61,8 +65,6 @@ mod tests {
     fn all_paths_are_under_config_dir() {
         let dir = TempDir::new().unwrap();
         let config = temp_config(&dir);
-        assert!(config.pid_file.starts_with(&config.config_dir));
-        assert!(config.log_file.starts_with(&config.config_dir));
         assert!(config.runtime_settings.starts_with(&config.config_dir));
         assert!(config.runtime_claude_md.starts_with(&config.config_dir));
     }
@@ -72,6 +74,25 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = temp_config(&dir);
         assert!(config.config_dir.starts_with(&config.home_dir));
+    }
+
+    #[test]
+    fn project_state_file_is_under_config_dir() {
+        let dir = TempDir::new().unwrap();
+        let config = temp_config(&dir);
+        let p = config.project_state_file("abc123def456");
+        assert!(p.starts_with(&config.config_dir));
+        assert!(p.to_string_lossy().ends_with(".json"));
+        assert!(p.to_string_lossy().contains("abc123def456"));
+    }
+
+    #[test]
+    fn server_state_file_is_under_config_dir() {
+        let dir = TempDir::new().unwrap();
+        let config = temp_config(&dir);
+        let p = config.server_state_file();
+        assert!(p.starts_with(&config.config_dir));
+        assert!(p.to_string_lossy().ends_with("server.json"));
     }
 
     #[test]
