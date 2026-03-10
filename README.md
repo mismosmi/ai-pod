@@ -4,13 +4,14 @@ A CLI tool that runs Claude Code inside isolated Podman containers, giving each 
 
 ## How it works
 
-`ai-pod` manages per-workspace Podman containers that run Claude Code. Each workspace gets a dedicated container named by a hash of its path. A background notification server detects when Claude finishes a task and can be used to trigger host-side automations.
+`ai-pod` manages per-workspace Podman containers that run Claude Code. Each workspace gets a dedicated container named by a hash of its path. A shared background server handles host interaction requests from containers.
 
 - **Workspace isolation** — each directory gets its own container
 - **Persistent Claude data** — a named volume preserves `~/.claude` state across sessions (login, settings, memory)
 - **Credential scanning** — scans the workspace for secrets before mounting it into a container
 - **Host access** — containers can reach host services via `host.containers.internal`
 - **Settings & CLAUDE.md merging** — your host `~/.claude/settings.json` and `CLAUDE.md` are merged with container defaults and injected at launch
+- **Host commands** — Claude can run commands on the host machine with user approval via the `host-tools` binary
 
 ## Requirements
 
@@ -22,7 +23,7 @@ A CLI tool that runs Claude Code inside isolated Podman containers, giving each 
 ### Quick install (Linux & macOS)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/farbenmeer/ai-pod/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mismosmi/ai-pod/main/install.sh | bash
 ```
 
 This downloads the latest release binary for your OS and architecture and places it in `~/.local/bin/`.
@@ -58,18 +59,17 @@ ai-pod --workdir /path/to/project
 | `--workdir <PATH>` | Use a specific workspace directory (default: cwd) |
 | `--rebuild` | Force a rebuild of the container image |
 | `--no-credential-check` | Skip scanning the workspace for credential files |
-| `--notify-port <PORT>` | Notification server port (default: `9876`) |
 
 ### Subcommands
 
 | Command | Description |
 |---|---|
+| `init [--workdir PATH]` | Create an `ai-pod.Dockerfile` in the workspace |
 | `build` | Build the container image without launching |
 | `list` | List all Claude containers |
 | `clean [--workdir PATH]` | Stop and remove the container for a workspace |
 | `run <command> [args...]` | Run a command in the container instead of the default |
-| `stop-server` | Stop the background notification daemon |
-| `server-status` | Show notification daemon status |
+| `serve` | Start the shared server manually (normally auto-started) |
 
 ### Run a specific command in the container
 
@@ -99,6 +99,35 @@ This writes an `ai-pod.Dockerfile` to the workspace root based on the default im
 If no `ai-pod.Dockerfile` exists in the workspace, `ai-pod` will remind you to run `ai-pod init` if you want to customise it.
 
 The default image is based on Ubuntu and installs Claude Code via the official install script. The generated Dockerfile includes commented-out examples for common additions like Playwright and MCP servers.
+
+## Host interaction
+
+The `host-tools` binary is installed in every container at `/home/claude/.local/bin/host-tools`. Claude is taught to use it via a skill file that is automatically installed in each container.
+
+### host-tools run-command
+
+Run a shell command on the host. The host user is prompted to approve commands not previously allowed. Output streams back in real time.
+
+```sh
+host-tools run-command ls ~/Desktop
+host-tools run-command open https://example.com
+```
+
+List previously approved commands:
+
+```sh
+host-tools run-command --list
+```
+
+### host-tools notify-user
+
+Send a desktop notification to the host user. The notification title is automatically set to the project name.
+
+```sh
+host-tools notify-user "Build finished successfully"
+```
+
+A Stop hook already calls this automatically when the Claude session ends.
 
 ## How to secure credentials
 

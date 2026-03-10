@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::config::AppConfig;
@@ -16,17 +16,47 @@ For example: `curl http://host.containers.internal:3000`
 Working directory: /app
 "#;
 
-/// Setup script: installs Claude Code and registers the MCP server entry.
-/// Arguments: $1 = project_url, $2 = api_key
+/// Setup script: installs Claude Code.
 const SETUP_SCRIPT: &str = r#"#!/bin/sh
 set -e
-PROJECT_URL="$1"
-API_KEY="$2"
 export PATH="$HOME/.local/bin:$PATH"
 curl -fsSL https://claude.ai/install.sh | bash
-if ! claude mcp get ai-pod > /dev/null 2>&1; then
-    claude mcp add --transport http --header "X-Api-Key: $API_KEY" -s user ai-pod "$PROJECT_URL"
-fi
+"#;
+
+const SKILL_MD: &str = r#"---
+name: ai-pod
+description: This skill should be used when the user asks to run a command on the host machine, open an application on the host, send a desktop notification to the user, or list previously approved host commands. Provides the host-tools binary at /home/claude/.local/bin/host-tools.
+version: 0.1.0
+---
+# host-tools — Host Interaction
+
+`/home/claude/.local/bin/host-tools` interacts with the host machine from inside this container.
+
+## run-command
+
+Run a shell command on the host. The host user is prompted to approve commands not previously allowed. Output streams back in real time.
+
+    host-tools run-command <shell command and args>
+
+Examples:
+- `host-tools run-command ls ~/Desktop`
+- `host-tools run-command open https://example.com`
+
+List previously approved commands:
+
+    host-tools run-command --list
+
+Use only for tasks that require host-side effects. Prefer doing things inside the container.
+
+## notify-user
+
+Send a desktop notification to the host user. The notification title is set automatically to the project name.
+
+    host-tools notify-user "<message>"
+
+Example: `host-tools notify-user "Build finished successfully"`
+
+A Stop hook already calls this automatically when the session ends.
 "#;
 
 fn container_exists(name: &str) -> Result<bool> {
@@ -95,7 +125,7 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
     };
 
     let hook_command =
-        "curl -sf -X POST http://host.containers.internal:7822/notify || true".to_string();
+        r#"/home/claude/.local/bin/host-tools notify-user "Task completed" || true"#.to_string();
 
     let stop_hook = serde_json::json!([{
         "matcher": "*",
@@ -125,22 +155,56 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
         serde_json::Value::String("bypassPermissions".to_string()),
     );
 
-    // Do NOT inject mcpServers here — the setup script handles that via `claude mcp add`
-
     let output = serde_json::to_string_pretty(&settings)?;
     std::fs::write(&config.runtime_settings, output).context("Failed to write runtime settings")?;
 
     Ok(())
 }
 
+fn ensure_host_tools_binary(config: &AppConfig) -> Result<PathBuf> {
+    let cache_path = config
+        .config_dir
+        .join(format!("host-tools-v{}", env!("CARGO_PKG_VERSION")));
+    if cache_path.exists() {
+        return Ok(cache_path);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+
+    let url = format!(
+        "https://github.com/mismosmi/ai-pod/releases/download/v{}/host-tools-linux-{}",
+        env!("CARGO_PKG_VERSION"),
+        arch
+    );
+
+    let response =
+        reqwest::blocking::get(&url).context("Failed to download host-tools binary")?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("Failed to download host-tools: HTTP {}", response.status());
+    }
+
+    let bytes = response
+        .bytes()
+        .context("Failed to read host-tools binary")?;
+    std::fs::write(&cache_path, &bytes).context("Failed to write host-tools binary")?;
+
+    // chmod 755
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cache_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    Ok(cache_path)
+}
+
 /// Run the setup script inside a temporary container with the home volume mounted.
-/// Installs Claude Code and registers the ai-pod MCP server entry.
-fn run_setup_script(
-    volume_name: &str,
-    image: &str,
-    project_url: &str,
-    api_key: &str,
-) -> Result<()> {
+/// Installs Claude Code.
+fn run_setup_script(volume_name: &str, image: &str) -> Result<()> {
     println!(
         "{}",
         "Running setup script (installing Claude Code)...".blue()
@@ -159,9 +223,6 @@ fn run_setup_script(
             image,
             "sh",
             "-s",
-            "--",
-            project_url,
-            api_key,
         ])
         .stdin(Stdio::piped())
         .spawn()
@@ -189,7 +250,7 @@ fn init_home_volume(
     volume_name: &str,
     container_name: &str,
     image: &str,
-    project_url: &str,
+    project_id: &str,
     api_key: &str,
 ) -> Result<()> {
     println!(
@@ -257,13 +318,39 @@ fn init_home_volume(
         ])
         .status();
 
-    // 5. Remove init container
+    // 5. Copy host-tools binary and skill
+    if let Ok(host_tools) = ensure_host_tools_binary(config) {
+        let _ = Command::new("podman")
+            .args([
+                "cp",
+                host_tools.to_str().unwrap(),
+                &format!("{}:/home/claude/.local/bin/host-tools", init_container),
+            ])
+            .status();
+    }
+
+    let skill_path = config.config_dir.join("skill.md");
+    std::fs::write(&skill_path, SKILL_MD)?;
+    let _ = Command::new("podman")
+        .args([
+            "cp",
+            skill_path.to_str().unwrap(),
+            &format!(
+                "{}:/home/claude/.claude/skills/ai-pod/SKILL.md",
+                init_container
+            ),
+        ])
+        .status();
+
+    // 6. Remove init container
     let _ = Command::new("podman")
         .args(["rm", &init_container])
         .status();
 
-    // 6. Run setup script — installs Claude + writes mcpServers entry
-    run_setup_script(volume_name, image, project_url, api_key)?;
+    // 7. Run setup script — installs Claude
+    run_setup_script(volume_name, image)?;
+
+    let _ = (project_id, api_key); // used via env vars at runtime
 
     println!("{}", "Home volume initialised.".green());
 
@@ -277,7 +364,7 @@ fn reseed_home_volume(
     volume_name: &str,
     container_name: &str,
     image: &str,
-    project_url: &str,
+    project_id: &str,
     api_key: &str,
 ) -> Result<()> {
     println!(
@@ -324,13 +411,39 @@ fn reseed_home_volume(
         ])
         .status();
 
-    // 3. Remove init container
+    // 3. Copy host-tools binary and skill
+    if let Ok(host_tools) = ensure_host_tools_binary(config) {
+        let _ = Command::new("podman")
+            .args([
+                "cp",
+                host_tools.to_str().unwrap(),
+                &format!("{}:/home/claude/.local/bin/host-tools", init_container),
+            ])
+            .status();
+    }
+
+    let skill_path = config.config_dir.join("skill.md");
+    std::fs::write(&skill_path, SKILL_MD)?;
+    let _ = Command::new("podman")
+        .args([
+            "cp",
+            skill_path.to_str().unwrap(),
+            &format!(
+                "{}:/home/claude/.claude/skills/ai-pod/SKILL.md",
+                init_container
+            ),
+        ])
+        .status();
+
+    // 4. Remove init container
     let _ = Command::new("podman")
         .args(["rm", &init_container])
         .status();
 
-    // 4. Run setup script — updates Claude + refreshes mcpServers entry
-    run_setup_script(volume_name, image, project_url, api_key)?;
+    // 5. Run setup script — updates Claude
+    run_setup_script(volume_name, image)?;
+
+    let _ = (project_id, api_key); // used via env vars at runtime
 
     println!("{}", "Home volume reseeded.".green());
 
@@ -342,7 +455,7 @@ pub fn launch_container(
     workspace: &Path,
     rebuild: bool,
     image: &str,
-    project_url: &str,
+    project_id: &str,
     api_key: &str,
 ) -> Result<()> {
     let container_name = gen_container_name(workspace);
@@ -368,7 +481,7 @@ pub fn launch_container(
             &volume_name,
             &container_name,
             image,
-            project_url,
+            project_id,
             api_key,
         )?;
     }
@@ -380,7 +493,7 @@ pub fn launch_container(
             &volume_name,
             &container_name,
             image,
-            project_url,
+            project_id,
             api_key,
         )?;
     }
@@ -423,6 +536,12 @@ pub fn launch_container(
                 "--add-host=host.containers.internal:host-gateway",
                 "-e",
                 "HOST_GATEWAY=host.containers.internal",
+                "-e",
+                &format!("AI_POD_PROJECT_ID={}", project_id),
+                "-e",
+                &format!("AI_POD_API_KEY={}", api_key),
+                "-e",
+                "AI_POD_SERVER_URL=http://host.containers.internal:7822",
                 image,
                 "claude",
             ])
@@ -440,7 +559,7 @@ pub fn run_in_container(
     config: &AppConfig,
     workspace: &Path,
     image: &str,
-    project_url: &str,
+    project_id: &str,
     api_key: &str,
     command: &str,
     args: &[String],
@@ -456,7 +575,7 @@ pub fn run_in_container(
             &volume_name,
             &container_name,
             image,
-            project_url,
+            project_id,
             api_key,
         )?;
     }
@@ -479,6 +598,12 @@ pub fn run_in_container(
         "--add-host=host.containers.internal:host-gateway".into(),
         "-e".into(),
         "HOST_GATEWAY=host.containers.internal".into(),
+        "-e".into(),
+        format!("AI_POD_PROJECT_ID={}", project_id),
+        "-e".into(),
+        format!("AI_POD_API_KEY={}", api_key),
+        "-e".into(),
+        "AI_POD_SERVER_URL=http://host.containers.internal:7822".into(),
         "--entrypoint".into(),
         command.to_string(),
         image.to_string(),
@@ -641,12 +766,12 @@ mod tests {
         let stop = &json["hooks"]["Stop"];
         assert!(stop.is_array(), "hooks.Stop should be an array");
         let cmd = stop[0]["hooks"][0]["command"].as_str().unwrap();
-        assert!(cmd.contains("7822"));
-        assert!(cmd.contains("host.containers.internal"));
+        assert!(cmd.contains("host-tools"));
+        assert!(cmd.contains("notify-user"));
     }
 
     #[test]
-    fn runtime_settings_stop_hook_uses_port_7822() {
+    fn runtime_settings_stop_hook_calls_host_tools() {
         let dir = TempDir::new().unwrap();
         let config = make_test_config(&dir);
         generate_runtime_settings(&config).unwrap();
@@ -656,7 +781,7 @@ mod tests {
         let cmd = json["hooks"]["Stop"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap();
-        assert!(cmd.contains("7822"));
+        assert!(cmd.contains("host-tools"));
     }
 
     #[test]

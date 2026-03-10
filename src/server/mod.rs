@@ -1,7 +1,7 @@
 pub mod commands;
 pub mod lifecycle;
-pub mod mcp;
 pub mod notify;
+pub mod rest;
 
 use axum::{Json, Router, extract::State, routing::{get, post}};
 use serde::Deserialize;
@@ -28,11 +28,6 @@ pub struct AppState {
 }
 
 async fn health_handler() -> &'static str {
-    "ok"
-}
-
-async fn notify_handler(State(_state): State<AppState>) -> &'static str {
-    notify::send_notification("Claude Code", "Task completed.");
     "ok"
 }
 
@@ -98,16 +93,16 @@ pub async fn run_server(port: u16, config: AppConfig) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/register", post(register_handler))
-        .route("/notify", post(notify_handler))
-        .route("/mcp/:project_id", post(mcp::mcp_handler))
+        .route("/run_command", post(rest::run_command_handler))
+        .route("/notify_user", post(rest::notify_user_handler))
+        .route("/list_allowed_commands", post(rest::list_allowed_commands_handler))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    println!("Shared MCP server listening on {}", addr);
+    println!("Shared server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
 
     Ok(())
 }
-
