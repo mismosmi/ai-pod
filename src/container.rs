@@ -300,6 +300,24 @@ async fn init_home_volume(
             .status();
     }
 
+    // 3b. Ensure required directories exist in the volume
+    let _ = Command::new("podman")
+        .args([
+            "run",
+            "--rm",
+            "--user",
+            "claude",
+            "-v",
+            &format!("{}:/home/claude:z", volume_name),
+            image,
+            "mkdir",
+            "-p",
+            "/home/claude/.claude",
+            "/home/claude/.claude/skills/ai-pod",
+            "/home/claude/.local/bin",
+        ])
+        .status();
+
     // 4. Generate and copy runtime config
     generate_runtime_claude_md(config)?;
     generate_runtime_settings(config)?;
@@ -393,7 +411,25 @@ async fn reseed_home_volume(
         anyhow::bail!("Failed to create init container for reseed");
     }
 
-    // 2. Regenerate and copy runtime config (refreshes hooks + permissions)
+    // 2. Ensure required directories exist in the volume
+    let _ = Command::new("podman")
+        .args([
+            "run",
+            "--rm",
+            "--user",
+            "claude",
+            "-v",
+            &format!("{}:/home/claude:z", volume_name),
+            image,
+            "mkdir",
+            "-p",
+            "/home/claude/.claude",
+            "/home/claude/.claude/skills/ai-pod",
+            "/home/claude/.local/bin",
+        ])
+        .status();
+
+    // 2b. Regenerate and copy runtime config (refreshes hooks + permissions)
     generate_runtime_claude_md(config)?;
     generate_runtime_settings(config)?;
 
