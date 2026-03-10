@@ -5,6 +5,7 @@ mod credentials;
 mod image;
 mod server;
 mod update;
+mod workspace;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -42,7 +43,7 @@ fn init_project(workspace: &Path) -> Result<()> {
     Ok(())
 }
 
-fn launch_flow(cli: &Cli) -> Result<()> {
+async fn launch_flow(cli: &Cli) -> Result<()> {
     let config = AppConfig::new()?;
     config.init()?;
 
@@ -72,11 +73,31 @@ fn launch_flow(cli: &Cli) -> Result<()> {
     let image = image::image_name(&workspace);
     image::ensure_image(&config, &dockerfile, &image, cli.rebuild)?;
 
-    // 5. Ensure notification server
-    server::lifecycle::ensure_server(&config.pid_file, &config.log_file, cli.notify_port)?;
+    // 5. Ensure shared server is running
+    server::lifecycle::ensure_shared_server(&config)?;
 
-    // 6. Launch container
-    container::launch_container(&config, &workspace, cli.notify_port, cli.rebuild, &image)?;
+    // 6. Get or create project state (stable api_key)
+    let project_id = workspace::workspace_hash(&workspace);
+    let state = server::lifecycle::get_or_create_project_state(&config, &workspace)?;
+
+    // 7. Register project with the shared server
+    server::lifecycle::register_project(&project_id, &state.api_key, &workspace).await?;
+
+    let project_url = format!(
+        "http://host.containers.internal:{}/mcp/{}",
+        server::lifecycle::MCP_PORT,
+        project_id
+    );
+
+    // 8. Launch container
+    container::launch_container(
+        &config,
+        &workspace,
+        cli.rebuild,
+        &image,
+        &project_url,
+        &state.api_key,
+    )?;
 
     Ok(())
 }
@@ -86,7 +107,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Skip update check for internal/daemon commands
-    if !matches!(&cli.command, Some(Command::ServeNotifications)) {
+    if !matches!(&cli.command, Some(Command::Serve)) {
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(3),
             update::check_for_update(),
@@ -114,16 +135,10 @@ async fn main() -> Result<()> {
             let image = image::image_name(&workspace);
             image::ensure_image(&config, &dockerfile, &image, cli.rebuild)?;
         }
-        Some(Command::ServeNotifications) => {
-            server::run_server(cli.notify_port).await?;
-        }
-        Some(Command::StopServer) => {
+        Some(Command::Serve) => {
             let config = AppConfig::new()?;
-            server::lifecycle::stop_server(&config.pid_file)?;
-        }
-        Some(Command::ServerStatus) => {
-            let config = AppConfig::new()?;
-            server::lifecycle::print_status(&config.pid_file, cli.notify_port);
+            config.init()?;
+            server::run_server(server::lifecycle::MCP_PORT, config).await?;
         }
         Some(Command::List) => {
             container::list_containers()?;
@@ -152,11 +167,30 @@ async fn main() -> Result<()> {
             }
             let image = image::image_name(&workspace);
             image::ensure_image(&config, &dockerfile, &image, cli.rebuild)?;
-            server::lifecycle::ensure_server(&config.pid_file, &config.log_file, cli.notify_port)?;
-            container::run_in_container(&config, &workspace, cli.notify_port, command, args)?;
+
+            server::lifecycle::ensure_shared_server(&config)?;
+            let project_id = workspace::workspace_hash(&workspace);
+            let state = server::lifecycle::get_or_create_project_state(&config, &workspace)?;
+            server::lifecycle::register_project(&project_id, &state.api_key, &workspace).await?;
+
+            let project_url = format!(
+                "http://host.containers.internal:{}/mcp/{}",
+                server::lifecycle::MCP_PORT,
+                project_id
+            );
+
+            container::run_in_container(
+                &config,
+                &workspace,
+                &image,
+                &project_url,
+                &state.api_key,
+                command,
+                args,
+            )?;
         }
         None => {
-            launch_flow(&cli)?;
+            launch_flow(&cli).await?;
         }
     }
 

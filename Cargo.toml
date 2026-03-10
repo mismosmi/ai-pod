@@ -21,5 +21,7 @@ uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
 notify-rust = "4"
 tempfile = "3"
+tokio-stream = "0.1"
+futures-util = "0.3"
 
 [dev-dependencies]
