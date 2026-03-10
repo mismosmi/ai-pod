@@ -161,7 +161,7 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
-fn ensure_host_tools_binary(config: &AppConfig) -> Result<PathBuf> {
+async fn ensure_host_tools_binary(config: &AppConfig) -> Result<PathBuf> {
     let cache_path = config
         .config_dir
         .join(format!("host-tools-v{}", env!("CARGO_PKG_VERSION")));
@@ -180,8 +180,9 @@ fn ensure_host_tools_binary(config: &AppConfig) -> Result<PathBuf> {
         arch
     );
 
-    let response =
-        reqwest::blocking::get(&url).context("Failed to download host-tools binary")?;
+    let response = reqwest::get(&url)
+        .await
+        .context("Failed to download host-tools binary")?;
 
     if !response.status().is_success() {
         anyhow::bail!("Failed to download host-tools: HTTP {}", response.status());
@@ -189,6 +190,7 @@ fn ensure_host_tools_binary(config: &AppConfig) -> Result<PathBuf> {
 
     let bytes = response
         .bytes()
+        .await
         .context("Failed to read host-tools binary")?;
     std::fs::write(&cache_path, &bytes).context("Failed to write host-tools binary")?;
 
@@ -245,7 +247,7 @@ fn run_setup_script(volume_name: &str, image: &str) -> Result<()> {
 }
 
 /// Initialize a named home volume for the first time.
-fn init_home_volume(
+async fn init_home_volume(
     config: &AppConfig,
     volume_name: &str,
     container_name: &str,
@@ -319,7 +321,7 @@ fn init_home_volume(
         .status();
 
     // 5. Copy host-tools binary and skill
-    if let Ok(host_tools) = ensure_host_tools_binary(config) {
+    if let Ok(host_tools) = ensure_host_tools_binary(config).await {
         let _ = Command::new("podman")
             .args([
                 "cp",
@@ -359,7 +361,7 @@ fn init_home_volume(
 
 /// Re-apply runtime config and re-run setup after a rebuild.
 /// Does NOT wipe the volume — auth state is preserved.
-fn reseed_home_volume(
+async fn reseed_home_volume(
     config: &AppConfig,
     volume_name: &str,
     container_name: &str,
@@ -412,7 +414,7 @@ fn reseed_home_volume(
         .status();
 
     // 3. Copy host-tools binary and skill
-    if let Ok(host_tools) = ensure_host_tools_binary(config) {
+    if let Ok(host_tools) = ensure_host_tools_binary(config).await {
         let _ = Command::new("podman")
             .args([
                 "cp",
@@ -450,7 +452,7 @@ fn reseed_home_volume(
     Ok(())
 }
 
-pub fn launch_container(
+pub async fn launch_container(
     config: &AppConfig,
     workspace: &Path,
     rebuild: bool,
@@ -483,7 +485,8 @@ pub fn launch_container(
             image,
             project_id,
             api_key,
-        )?;
+        )
+        .await?;
     }
 
     // Init home volume if it doesn't exist
@@ -495,7 +498,8 @@ pub fn launch_container(
             image,
             project_id,
             api_key,
-        )?;
+        )
+        .await?;
     }
 
     if container_is_running(&container_name)? {
@@ -555,7 +559,7 @@ pub fn launch_container(
     Ok(())
 }
 
-pub fn run_in_container(
+pub async fn run_in_container(
     config: &AppConfig,
     workspace: &Path,
     image: &str,
@@ -577,7 +581,8 @@ pub fn run_in_container(
             image,
             project_id,
             api_key,
-        )?;
+        )
+        .await?;
     }
 
     println!(
