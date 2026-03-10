@@ -98,7 +98,7 @@ pub fn ensure_shared_server(config: &AppConfig) -> Result<()> {
 
     println!(
         "{} (PID {}, port {})",
-        "Shared MCP server started.".green(),
+        "Shared server started.".green(),
         pid,
         MCP_PORT,
     );
@@ -131,11 +131,7 @@ pub fn get_or_create_project_state(config: &AppConfig, workspace: &Path) -> Resu
 }
 
 /// Register a project with the running shared server.
-pub async fn register_project(
-    project_id: &str,
-    api_key: &str,
-    workspace: &Path,
-) -> Result<()> {
+pub async fn register_project(project_id: &str, api_key: &str, workspace: &Path) -> Result<()> {
     let url = format!("http://127.0.0.1:{}/register", MCP_PORT);
     let body = serde_json::json!({
         "project_id": project_id,
