@@ -85,14 +85,7 @@ fn generate_runtime_claude_md(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
-fn project_name(workspace: &Path) -> String {
-    workspace
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "Claude Code".to_string())
-}
-
-fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
+fn generate_runtime_settings(config: &AppConfig, port: u16) -> Result<()> {
     let mut settings: serde_json::Value = if config.claude_settings_path().exists() {
         let raw = std::fs::read_to_string(config.claude_settings_path())
             .context("Failed to read settings.json")?;
@@ -101,7 +94,10 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
         serde_json::json!({})
     };
 
-    let hook_command = "curl -sf -X POST \"$NOTIFY_URL\" || true".to_string();
+    let hook_command = format!(
+        "curl -sf -X POST http://host.containers.internal:{}/notify || true",
+        port
+    );
 
     let stop_hook = serde_json::json!([{
         "matcher": "*",
@@ -132,6 +128,7 @@ fn init_home_volume(
     volume_name: &str,
     container_name: &str,
     image: &str,
+    port: u16,
 ) -> Result<()> {
     println!(
         "{} {}",
@@ -213,7 +210,7 @@ fn init_home_volume(
 
     // 6. Generate and copy runtime config
     generate_runtime_claude_md(config)?;
-    generate_runtime_settings(config)?;
+    generate_runtime_settings(config, port)?;
 
     let _ = Command::new("podman")
         .args([
@@ -247,7 +244,6 @@ pub fn launch_container(
     port: u16,
     rebuild: bool,
     image: &str,
-    ports: &[String],
 ) -> Result<()> {
     let container_name = generate_container_name(workspace);
     let volume_name = generate_volume_name(workspace);
@@ -267,7 +263,7 @@ pub fn launch_container(
 
     // Init home volume if it doesn't exist
     if !volume_exists(&volume_name)? {
-        init_home_volume(config, &volume_name, &container_name, image)?;
+        init_home_volume(config, &volume_name, &container_name, image, port)?;
     }
 
     if container_is_running(&container_name)? {
@@ -295,31 +291,24 @@ pub fn launch_container(
 
         println!("{} {}", "Starting container:".blue().bold(), container_name);
 
-        let proj = project_name(workspace);
-        let mut run_args: Vec<String> = vec![
-            "run".into(),
-            "--rm".into(),
-            "-it".into(),
-            "--name".into(),
-            container_name.clone(),
-            "-v".into(),
-            format!("{}:/home/claude:z", volume_name),
-            "-v".into(),
-            format!("{}:/app:Z", workspace_str),
-            "--add-host=host.containers.internal:host-gateway".into(),
-            "-e".into(),
-            "HOST_GATEWAY=host.containers.internal".into(),
-            "-e".into(),
-            format!("NOTIFY_URL=http://host.containers.internal:{}/notify?project={}", port, proj),
-        ];
-        for p in ports {
-            run_args.push("-p".into());
-            run_args.push(p.clone());
-        }
-        run_args.push(image.to_string());
-
         Command::new("podman")
-            .args(&run_args)
+            .args([
+                "run",
+                "--rm",
+                "-it",
+                "--name",
+                &container_name,
+                "-v",
+                &format!("{}:/home/claude:z", volume_name),
+                "-v",
+                &format!("{}:/app:Z", workspace_str),
+                "--add-host=host.containers.internal:host-gateway",
+                "-e",
+                "HOST_GATEWAY=host.containers.internal",
+                "-e",
+                &format!("NOTIFY_URL=http://host.containers.internal:{}/notify", port),
+                image,
+            ])
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
@@ -337,7 +326,6 @@ pub fn run_in_container(
     port: u16,
     command: &str,
     args: &[String],
-    ports: &[String],
 ) -> Result<()> {
     let container_name = generate_container_name(workspace);
     let volume_name = generate_volume_name(workspace);
@@ -346,7 +334,7 @@ pub fn run_in_container(
 
     // Init home volume if it doesn't exist
     if !volume_exists(&volume_name)? {
-        init_home_volume(config, &volume_name, &container_name, &image)?;
+        init_home_volume(config, &volume_name, &container_name, &image, port)?;
     }
 
     println!(
@@ -356,7 +344,6 @@ pub fn run_in_container(
         command
     );
 
-    let proj = project_name(workspace);
     let mut run_args: Vec<String> = vec![
         "run".into(),
         "--rm".into(),
@@ -369,17 +356,11 @@ pub fn run_in_container(
         "-e".into(),
         "HOST_GATEWAY=host.containers.internal".into(),
         "-e".into(),
-        format!("NOTIFY_URL=http://host.containers.internal:{}/notify?project={}", port, proj),
-    ];
-    for p in ports {
-        run_args.push("-p".into());
-        run_args.push(p.clone());
-    }
-    run_args.extend_from_slice(&[
+        format!("NOTIFY_URL=http://host.containers.internal:{}/notify", port),
         "--entrypoint".into(),
         command.to_string(),
         image,
-    ]);
+    ];
     run_args.extend_from_slice(args);
 
     let status = Command::new("podman")
@@ -532,7 +513,7 @@ mod tests {
     fn runtime_settings_contains_stop_hook() {
         let dir = TempDir::new().unwrap();
         let config = make_test_config(&dir);
-        generate_runtime_settings(&config).unwrap();
+        generate_runtime_settings(&config, 9876).unwrap();
 
         let content = std::fs::read_to_string(&config.runtime_settings).unwrap();
         let json: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -540,7 +521,19 @@ mod tests {
         let stop = &json["hooks"]["Stop"];
         assert!(stop.is_array(), "hooks.Stop should be an array");
         let cmd = stop[0]["hooks"][0]["command"].as_str().unwrap();
-        assert!(cmd.contains("NOTIFY_URL"));
+        assert!(cmd.contains("9876"));
+        assert!(cmd.contains("host.containers.internal"));
+    }
+
+    #[test]
+    fn runtime_settings_uses_correct_port() {
+        let dir = TempDir::new().unwrap();
+        let config = make_test_config(&dir);
+        generate_runtime_settings(&config, 1234).unwrap();
+
+        let content = std::fs::read_to_string(&config.runtime_settings).unwrap();
+        assert!(content.contains("1234"));
+        assert!(!content.contains("9876"));
     }
 
     #[test]
@@ -558,7 +551,7 @@ mod tests {
         )
         .unwrap();
 
-        generate_runtime_settings(&config).unwrap();
+        generate_runtime_settings(&config, 9876).unwrap();
 
         let content = std::fs::read_to_string(&config.runtime_settings).unwrap();
         let json: serde_json::Value = serde_json::from_str(&content).unwrap();

@@ -1,22 +1,15 @@
 pub mod lifecycle;
 pub mod notify;
 
-use axum::{Router, extract::Query, routing::get, routing::post};
-use serde::Deserialize;
+use axum::{Router, routing::get, routing::post};
 use std::net::SocketAddr;
 
 async fn health_handler() -> &'static str {
     "ok"
 }
 
-#[derive(Deserialize)]
-struct NotifyParams {
-    project: Option<String>,
-}
-
-async fn notify_handler(Query(params): Query<NotifyParams>) -> &'static str {
-    let title = params.project.as_deref().unwrap_or("Claude Code");
-    notify::send_notification(title, "ai-pod: task complete");
+async fn notify_handler() -> &'static str {
+    notify::send_notification("Claude Code", "Task completed.");
     "ok"
 }
 

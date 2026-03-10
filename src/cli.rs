@@ -22,10 +22,6 @@ pub struct Cli {
     /// Notification server port
     #[arg(long, default_value = "9876", global = true)]
     pub notify_port: u16,
-
-    /// Publish container port(s) to the host (e.g. -p 8080:80)
-    #[arg(short = 'p', long = "publish", value_name = "PORT")]
-    pub ports: Vec<String>,
 }
 
 #[derive(Subcommand)]
