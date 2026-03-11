@@ -1,22 +1,31 @@
 # ai-pod
 
-A CLI tool that runs Claude Code inside isolated Podman containers, giving each workspace its own persistent container environment.
+**Claude Code inside isolated Podman containers — safe, persistent, and project-aware.**
 
-## How it works
+ai-pod manages per-workspace Podman containers that run Claude Code. Each workspace gets a dedicated container, a shared background server bridges host interaction, and your personal Claude settings follow you everywhere.
 
-`ai-pod` manages per-workspace Podman containers that run Claude Code. Each workspace gets a dedicated container named by a hash of its path. A shared background server handles host interaction requests from containers.
+---
 
-- **Workspace isolation** — each directory gets its own container
-- **Persistent Claude data** — a named volume preserves `~/.claude` state across sessions (login, settings, memory)
-- **Credential scanning** — scans the workspace for secrets before mounting it into a container
-- **Host access** — containers can reach host services via `host.containers.internal`
-- **Settings & CLAUDE.md merging** — your host `~/.claude/settings.json` and `CLAUDE.md` are merged with container defaults and injected at launch
-- **Host commands** — Claude can run commands on the host machine with user approval via the `host-tools` binary
+## Features
+
+- **Workspace isolation** — each directory gets its own container, named by a hash of its path; projects can't interfere with each other
+- **Persistent Claude state** — a named volume preserves `~/.claude` (login, memory, settings) across container restarts
+- **Credential scanning** — scans the workspace for secrets before mounting it; prompts you to review or abort
+- **Custom Dockerfiles per project** — drop an `ai-pod.Dockerfile` in any project to install extra runtimes, tools, or MCP servers
+- **Settings & CLAUDE.md merging** — your host `~/.claude/settings.json` and `CLAUDE.md` are merged with container defaults at launch
+- **Host command execution** — the bundled `host-tools` binary lets Claude run commands on the host machine; every command requires your explicit approval with a persistent allowlist
+- **Desktop notifications** — a Stop hook fires `host-tools notify-user` when a Claude session ends so you know when to come back
+- **Transparent host networking** — containers reach host services at `host.containers.internal`; no manual port mapping needed
+- **Auto-update checks** — silently checks for new releases on startup and notifies you when one is available
+
+---
 
 ## Requirements
 
 - [Podman](https://podman.io/)
 - Rust (to build from source)
+
+---
 
 ## Installation
 
@@ -26,13 +35,15 @@ A CLI tool that runs Claude Code inside isolated Podman containers, giving each 
 curl -fsSL https://raw.githubusercontent.com/mismosmi/ai-pod/main/install.sh | bash
 ```
 
-This downloads the latest release binary for your OS and architecture and places it in `~/.local/bin/`.
+Downloads the latest release binary for your OS and architecture and places it in `~/.local/bin/`.
 
 ### Build from source
 
 ```sh
 cargo install --path .
 ```
+
+---
 
 ## Usage
 
@@ -78,11 +89,13 @@ ai-pod run claude resume   # resume the last Claude session
 ai-pod run bash            # open a bash shell in the container
 ```
 
-The `run` subcommand ensures the container is built and running (creating it if needed), then executes the given command interactively via `podman exec`. All standard flags (`--workdir`, `--rebuild`, etc.) apply.
+---
 
 ## Configuration
 
 Your host `~/.claude/CLAUDE.md` and `~/.claude/settings.json` are merged with container defaults at launch time, so your personal Claude preferences carry over automatically.
+
+---
 
 ## Per-workspace Dockerfiles
 
@@ -96,9 +109,9 @@ ai-pod init
 
 This writes an `ai-pod.Dockerfile` to the workspace root based on the default image. Edit it to add anything your project needs (e.g. Node, Python, Playwright, project-specific MCP servers). When `ai-pod` launches, it automatically uses `ai-pod.Dockerfile` if one is present, otherwise it falls back to the global default.
 
-If no `ai-pod.Dockerfile` exists in the workspace, `ai-pod` will remind you to run `ai-pod init` if you want to customise it.
-
 The default image is based on Ubuntu and installs Claude Code via the official install script. The generated Dockerfile includes commented-out examples for common additions like Playwright and MCP servers.
+
+---
 
 ## Host interaction
 
@@ -129,6 +142,32 @@ host-tools notify-user "Build finished successfully"
 
 A Stop hook already calls this automatically when the Claude session ends.
 
-## How to secure credentials
+---
 
-If you have sensible credentials stored in a .env file in your workspace, an easy way to avoid passing them to claude is to move the .env file somewhere else (`~/.env-files/<workspace-name>`) and symlink them back to the workspace directory (`ln -s ~/.env-files/<workspace-name> .env`).
+## Security
+
+### Credential scanning
+
+Before mounting your workspace, ai-pod scans for common credential files (`.env`, SSH keys, API token files, etc.) and prompts you to continue or abort. Pass `--no-credential-check` to skip this if you know the workspace is clean.
+
+### Keeping .env files out of the container
+
+Move your `.env` file outside the workspace and symlink it back:
+
+```sh
+mkdir -p ~/.env-files/my-project
+mv .env ~/.env-files/my-project/.env
+ln -s ~/.env-files/my-project/.env .env
+```
+
+The symlink target is outside the mount — the container never sees the actual file. Your app still works on the host.
+
+### Host command approval
+
+Claude can only run host commands you have explicitly approved via the interactive prompt. Approved commands are persisted so you only approve each one once.
+
+---
+
+## Marketing website
+
+A static marketing site lives in [`website/index.html`](website/index.html). Open it in any browser — no build step required.
