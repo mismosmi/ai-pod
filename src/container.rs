@@ -111,14 +111,19 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
         serde_json::json!({})
     };
 
-    let hook_command =
-        r#"/home/claude/.local/bin/host-tools notify-user "Task completed" || true"#.to_string();
-
     let stop_hook = serde_json::json!([{
         "matcher": "*",
         "hooks": [{
             "type": "command",
-            "command": hook_command
+            "command": "/home/claude/.local/bin/host-tools notify-user \"Task completed\" || true"
+        }]
+    }]);
+
+    let permission_hook = serde_json::json!([{
+        "matcher": "*",
+        "hooks": [{
+            "type": "command",
+            "command": "/home/claude/.local/bin/host-tools notify-user \"Claude needs your approval\" || true"
         }]
     }]);
 
@@ -129,6 +134,7 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
     let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
     let hooks_obj = hooks.as_object_mut().context("hooks is not an object")?;
     hooks_obj.insert("Stop".to_string(), stop_hook);
+    hooks_obj.insert("PermissionRequest".to_string(), permission_hook);
 
     // Set default permission mode — no per-tool prompts in TUI
     let permissions = obj
