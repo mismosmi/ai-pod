@@ -135,6 +135,9 @@ async fn main() -> Result<()> {
             config.init()?;
             server::run_server(server::lifecycle::MCP_PORT, config).await?;
         }
+        Some(Command::Attach) => {
+            container::attach_container()?;
+        }
         Some(Command::List) => {
             container::list_containers()?;
         }

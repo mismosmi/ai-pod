@@ -35,6 +35,9 @@ pub enum Command {
         workdir: Option<PathBuf>,
     },
 
+    /// Attach to a running claude container session
+    Attach,
+
     /// List all claude containers
     List,
 

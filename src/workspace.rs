@@ -7,8 +7,15 @@ pub fn workspace_hash(workspace: &Path) -> String {
     hex::encode(&hash[..6])
 }
 
-pub fn container_name(workspace: &Path) -> String {
+/// Stable prefix shared by all containers for this workspace.
+pub fn container_prefix(workspace: &Path) -> String {
     format!("claude-{}", workspace_hash(workspace))
+}
+
+/// Unique container name for a new session.
+pub fn new_container_name(workspace: &Path) -> String {
+    let suffix = &uuid::Uuid::new_v4().to_string().replace("-", "")[..8];
+    format!("{}-{}", container_prefix(workspace), suffix)
 }
 
 pub fn volume_name(workspace: &Path) -> String {
@@ -18,6 +25,7 @@ pub fn volume_name(workspace: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn hash_is_deterministic() {
@@ -32,28 +40,34 @@ mod tests {
     }
 
     #[test]
-    fn container_name_starts_with_claude() {
-        let name = container_name(Path::new("/home/user/myproject"));
-        assert!(name.starts_with("claude-"));
+    fn container_prefix_starts_with_claude() {
+        let prefix = container_prefix(Path::new("/home/user/myproject"));
+        assert!(prefix.starts_with("claude-"));
     }
 
     #[test]
-    fn container_name_has_expected_length() {
-        // "claude-" (7) + 12 hex chars = 19
-        let name = container_name(Path::new("/home/user/myproject"));
-        assert_eq!(name.len(), 19);
-    }
-
-    #[test]
-    fn volume_name_is_container_name_plus_home() {
+    fn new_container_name_starts_with_prefix() {
         let p = Path::new("/home/user/myproject");
-        assert_eq!(volume_name(p), format!("{}-home", container_name(p)));
+        let name = new_container_name(p);
+        assert!(name.starts_with(&container_prefix(p)));
+    }
+
+    #[test]
+    fn new_container_name_is_unique() {
+        let p = Path::new("/home/user/myproject");
+        assert_ne!(new_container_name(p), new_container_name(p));
+    }
+
+    #[test]
+    fn volume_name_uses_workspace_hash() {
+        let p = Path::new("/home/user/myproject");
+        assert_eq!(volume_name(p), format!("claude-{}-home", workspace_hash(p)));
     }
 
     #[test]
     fn names_differ_for_different_paths() {
-        let a = container_name(Path::new("/home/user/project-a"));
-        let b = container_name(Path::new("/home/user/project-b"));
+        let a = container_prefix(Path::new("/home/user/project-a"));
+        let b = container_prefix(Path::new("/home/user/project-b"));
         assert_ne!(a, b);
     }
 }
