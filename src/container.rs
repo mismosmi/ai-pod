@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
+use dialoguer;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use dialoguer;
 
 use crate::config::AppConfig;
 use crate::workspace::{container_prefix, new_container_name, volume_name as gen_volume_name};
@@ -43,11 +43,16 @@ Examples:
 - `host-tools run-command ls ~/Desktop`
 - `host-tools run-command open https://example.com`
 
+Prefer to run a single command and manage output in the container:
+- `host-tools run-command pnpm dev | head -n 10` is better than `host-tools run-command 'pnpm dev | head -n 10'`
+- `host-tools run-command bun tsc && host-tools run-command bun lint` is better than `host-tools run-command 'bun tsc && bun lint'`
+
 List previously approved commands:
 
     host-tools run-command --list
 
-Use only for tasks that require host-side effects. Prefer doing things inside the container.
+If a command is in the list, always run it on the host.
+If a command is not in the list, prefer to run it inside the container.
 
 ## notify-user
 
@@ -496,7 +501,11 @@ pub async fn launch_container(
     // On rebuild: stop all existing containers for this workspace and reseed the volume
     if rebuild {
         for name in containers_for_prefix(&prefix, false)? {
-            println!("{} {}", "Removing container for rebuild:".blue().bold(), name);
+            println!(
+                "{} {}",
+                "Removing container for rebuild:".blue().bold(),
+                name
+            );
             let _ = Command::new("podman")
                 .args(["rm", "--force", &name])
                 .status();
