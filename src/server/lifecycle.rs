@@ -21,6 +21,8 @@ pub struct ProjectState {
     pub workspace: String,
     pub allowed_commands: Vec<String>,
     pub api_key: String,
+    #[serde(default)]
+    pub ignored_credential_files: Vec<String>,
 }
 
 impl ProjectState {
@@ -47,6 +49,16 @@ impl ProjectState {
     pub fn add_allowed(&mut self, cmd: &str) {
         if !self.is_allowed(cmd) {
             self.allowed_commands.push(cmd.to_string());
+        }
+    }
+
+    pub fn is_credential_ignored(&self, rel_path: &str) -> bool {
+        self.ignored_credential_files.contains(&rel_path.to_string())
+    }
+
+    pub fn add_ignored_credential(&mut self, rel_path: &str) {
+        if !self.is_credential_ignored(rel_path) {
+            self.ignored_credential_files.push(rel_path.to_string());
         }
     }
 }
@@ -181,6 +193,7 @@ mod tests {
             workspace: "/home/user/project".into(),
             allowed_commands: vec!["make build".into()],
             api_key: "deadbeef1234567890abcdef12345678".into(),
+            ignored_credential_files: vec![],
         };
         state.save(&path).unwrap();
         let loaded = ProjectState::load(&path);

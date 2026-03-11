@@ -63,7 +63,7 @@ async fn launch_flow(cli: &Cli) -> Result<()> {
 
     // 3. Credential scan
     if !cli.no_credential_check {
-        if !credentials::check_credentials(&workspace)? {
+        if !credentials::check_credentials(&workspace, &config)? {
             println!("{}", "Aborted.".red());
             return Ok(());
         }
@@ -158,7 +158,7 @@ async fn main() -> Result<()> {
                 );
             }
             if !cli.no_credential_check {
-                if !credentials::check_credentials(&workspace)? {
+                if !credentials::check_credentials(&workspace, &config)? {
                     println!("{}", "Aborted.".red());
                     return Ok(());
                 }

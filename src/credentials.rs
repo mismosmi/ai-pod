@@ -3,6 +3,10 @@ use colored::Colorize;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use crate::config::AppConfig;
+use crate::server::lifecycle::ProjectState;
+use crate::workspace::workspace_hash;
+
 const CREDENTIAL_PATTERNS: &[&str] = &[
     ".env",
     ".env.local",
@@ -148,9 +152,25 @@ pub fn scan_workspace(workspace: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-pub fn check_credentials(workspace: &Path) -> Result<bool> {
+pub fn check_credentials(workspace: &Path, config: &AppConfig) -> Result<bool> {
     let found = scan_workspace(workspace);
     if found.is_empty() {
+        return Ok(true);
+    }
+
+    let hash = workspace_hash(workspace);
+    let state_path = config.project_state_file(&hash);
+    let mut state = ProjectState::load(&state_path);
+
+    let pending: Vec<PathBuf> = found
+        .into_iter()
+        .filter(|path| {
+            let rel = path.strip_prefix(workspace).unwrap_or(path);
+            !state.is_credential_ignored(&rel.to_string_lossy())
+        })
+        .collect();
+
+    if pending.is_empty() {
         return Ok(true);
     }
 
@@ -160,22 +180,75 @@ pub fn check_credentials(workspace: &Path) -> Result<bool> {
             .yellow()
             .bold()
     );
-    for path in &found {
-        let relative = path.strip_prefix(workspace).unwrap_or(path);
-        println!("  {} {}", "•".yellow(), relative.display());
+
+    let mut any_kept = false;
+    let mut state_changed = false;
+
+    for path in &pending {
+        let rel = path.strip_prefix(workspace).unwrap_or(path);
+        println!("\n  {} {}", "•".yellow(), rel.display());
+
+        let choices = &[
+            "Keep (allow in container, warn next time)",
+            "Ignore (never warn for this file again)",
+            "Move to ~/.env-files/<slug>/ and symlink",
+        ];
+        let selection = dialoguer::Select::new()
+            .with_prompt("What would you like to do?")
+            .items(choices)
+            .default(0)
+            .interact()?;
+
+        match selection {
+            0 => {
+                any_kept = true;
+            }
+            1 => {
+                state.add_ignored_credential(&rel.to_string_lossy());
+                state_changed = true;
+            }
+            2 => {
+                let dst_dir = config.env_files_project_dir(workspace);
+                let file_name = path.file_name().unwrap_or_default();
+                let dst = dst_dir.join(file_name);
+                move_and_symlink(path, &dst)?;
+                println!(
+                    "  {} Moved to {} and symlinked",
+                    "✓".green(),
+                    dst.display()
+                );
+                state_changed = true;
+            }
+            _ => unreachable!(),
+        }
     }
-    println!(
-        "\n{}",
-        "These files will be accessible inside the container."
-            .yellow()
-    );
 
-    let proceed = dialoguer::Confirm::new()
-        .with_prompt("Continue anyway?")
-        .default(false)
-        .interact()?;
+    if state_changed {
+        state.save(&state_path)?;
+    }
 
-    Ok(proceed)
+    if any_kept {
+        let proceed = dialoguer::Confirm::new()
+            .with_prompt("Continue anyway?")
+            .default(false)
+            .interact()?;
+        return Ok(proceed);
+    }
+
+    Ok(true)
+}
+
+fn move_and_symlink(src: &Path, dst: &Path) -> Result<()> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if let Err(_) = std::fs::rename(src, dst) {
+        // Cross-device move fallback
+        std::fs::copy(src, dst)?;
+        std::fs::remove_file(src)?;
+    }
+    std::os::unix::fs::symlink(dst, src)?;
+    Ok(())
 }
 
 #[cfg(test)]

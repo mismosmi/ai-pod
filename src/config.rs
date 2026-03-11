@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub struct AppConfig {
     pub config_dir: PathBuf,
@@ -42,6 +42,16 @@ impl AppConfig {
 
     pub fn claude_md_path(&self) -> PathBuf {
         self.home_dir.join(".claude").join("CLAUDE.md")
+    }
+
+    /// Returns the directory for storing moved credential files for a given workspace.
+    /// E.g., `/home/user/my-project` → `~/.env-files/home-user-my-project/`
+    pub fn env_files_project_dir(&self, workspace: &Path) -> PathBuf {
+        let slug = workspace
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .replace('/', "-");
+        self.home_dir.join(".env-files").join(slug)
     }
 }
 
