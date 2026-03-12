@@ -121,6 +121,13 @@ pub async fn run_command_handler(
             )
                 .into_response();
         }
+        commands::CheckResult::PermissionTimeout => {
+            return (
+                StatusCode::REQUEST_TIMEOUT,
+                r#"{"error":"Permission request timed out after 60 seconds. Stop your current work and ask the user to confirm they would like to try again."}"#,
+            )
+                .into_response();
+        }
         commands::CheckResult::AlwaysAllow => {
             // Save command to project state file
             use crate::workspace::workspace_hash;
