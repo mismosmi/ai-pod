@@ -26,7 +26,7 @@ curl -fsSL https://claude.ai/install.sh | bash
 
 const SKILL_MD: &str = r#"---
 name: ai-pod
-description: This skill should be used when the user asks to run a command on the host machine, open an application on the host, send a desktop notification to the user, or list previously approved host commands. Provides the host-tools binary at /home/claude/.local/bin/host-tools.
+description: This skill should be used when the user asks to run a command on the host machine, open an application on the host, send a desktop notification to the user, list previously approved host commands, or manage long-running background processes (daemons) on the host. Provides the host-tools binary at /home/claude/.local/bin/host-tools.
 version: 0.1.0
 ---
 # host-tools — Host Interaction
@@ -64,6 +64,19 @@ Send a desktop notification to the host user. The notification title is set auto
 Example: `host-tools notify-user "Build finished successfully"`
 
 A Stop hook already calls this automatically when the session ends.
+
+## daemon
+
+Manage long-running background processes on the host.
+
+    host-tools daemon start <shell command>   # returns daemon ID
+    host-tools daemon list                    # show all daemons for this project
+    host-tools daemon output <daemon-id>      # stream output (follows until daemon exits)
+    host-tools daemon status <daemon-id>      # running/finished, exit code
+    host-tools daemon stop <daemon-id>
+    host-tools daemon stop-all
+
+YOU MUST NOT end daemon commands with | head or | tail. This is rejected by the server.
 "#;
 
 fn containers_for_prefix(prefix: &str, running_only: bool) -> Result<Vec<String>> {
@@ -121,7 +134,7 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
         "matcher": "*",
         "hooks": [{
             "type": "command",
-            "command": "/home/claude/.local/bin/host-tools notify-user \"Task completed\" || true"
+            "command": "/home/claude/.local/bin/host-tools daemon stop-all || true; /home/claude/.local/bin/host-tools notify-user \"Task completed\" || true"
         }]
     }]);
 

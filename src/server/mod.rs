@@ -1,4 +1,5 @@
 pub mod commands;
+pub mod daemons;
 pub mod lifecycle;
 pub mod notify;
 pub mod rest;
@@ -12,6 +13,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::config::AppConfig;
+use daemons::DaemonEntry;
 use lifecycle::ProjectState;
 
 #[derive(Clone)]
@@ -25,6 +27,7 @@ pub struct AppState {
     pub projects: Arc<Mutex<HashMap<String, ProjectInfo>>>,
     pub config_dir: PathBuf,
     pub approval_lock: Arc<Mutex<()>>,
+    pub daemons: Arc<Mutex<HashMap<String, DaemonEntry>>>,
 }
 
 async fn health_handler() -> &'static str {
@@ -88,7 +91,18 @@ pub async fn run_server(port: u16, config: AppConfig) -> anyhow::Result<()> {
         projects: Arc::new(Mutex::new(projects)),
         config_dir: config.config_dir.clone(),
         approval_lock: Arc::new(Mutex::new(())),
+        daemons: Arc::new(Mutex::new(HashMap::new())),
     };
+
+    // Background task: kill daemons when their project has no running containers
+    let bg_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            daemons::cleanup_orphaned_daemons(&bg_state).await;
+        }
+    });
 
     let app = Router::new()
         .route("/health", get(health_handler))
@@ -96,6 +110,12 @@ pub async fn run_server(port: u16, config: AppConfig) -> anyhow::Result<()> {
         .route("/run_command", post(rest::run_command_handler))
         .route("/notify_user", post(rest::notify_user_handler))
         .route("/list_allowed_commands", post(rest::list_allowed_commands_handler))
+        .route("/daemon/start", post(daemons::start_daemon_handler))
+        .route("/daemon/stop", post(daemons::stop_daemon_handler))
+        .route("/daemon/stop-all", post(daemons::stop_all_daemons_handler))
+        .route("/daemon/list", post(daemons::list_daemons_handler))
+        .route("/daemon/status", post(daemons::daemon_status_handler))
+        .route("/daemon/output", post(daemons::daemon_output_handler))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

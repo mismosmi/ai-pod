@@ -53,6 +53,16 @@ impl AppConfig {
             .replace('/', "-");
         self.home_dir.join(".env-files").join(slug)
     }
+
+    #[allow(dead_code)]
+    pub fn daemon_log_dir(&self, project_hash: &str) -> PathBuf {
+        self.config_dir.join("daemon-logs").join(project_hash)
+    }
+
+    #[allow(dead_code)]
+    pub fn daemon_log_file(&self, project_hash: &str, daemon_id: &str) -> PathBuf {
+        self.daemon_log_dir(project_hash).join(format!("{}.log", daemon_id))
+    }
 }
 
 #[cfg(test)]

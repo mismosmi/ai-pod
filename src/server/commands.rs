@@ -115,6 +115,15 @@ pub async fn check_approval(state: &AppState, command: &str, workspace: &Path) -
     }
 }
 
+pub fn ends_with_pipe_to_head_or_tail(cmd: &str) -> bool {
+    if let Some(pipe_pos) = cmd.trim_end().rfind('|') {
+        let after = cmd[pipe_pos + 1..].trim_start();
+        let word = &after[..after.find(|c: char| c.is_whitespace()).unwrap_or(after.len())];
+        return word == "head" || word == "tail";
+    }
+    false
+}
+
 pub fn get_allowed_commands(state: &AppState, workspace: &Path) -> Vec<String> {
     let hash = workspace_hash(workspace);
     let state_file = state.config_dir.join(format!("{}.json", hash));

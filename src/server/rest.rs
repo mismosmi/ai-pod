@@ -113,6 +113,14 @@ pub async fn run_command_handler(
         Err((status, msg)) => return (status, msg.to_string()).into_response(),
     };
 
+    if commands::ends_with_pipe_to_head_or_tail(&req.command) {
+        return (
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"Command must not end with | head or | tail — pipe those inside the container instead"}"#,
+        )
+            .into_response();
+    }
+
     match commands::check_approval(&state, &req.command, &workspace).await {
         commands::CheckResult::Denied => {
             return (

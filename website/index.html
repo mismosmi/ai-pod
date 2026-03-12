@@ -350,14 +350,8 @@
             /* ── CODE DEMO ── */
             .demo-grid {
                 display: grid;
-                grid-template-columns: 1fr 1fr;
+                grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
                 gap: 1.5rem;
-            }
-
-            @media (max-width: 700px) {
-                .demo-grid {
-                    grid-template-columns: 1fr;
-                }
             }
 
             .code-block {
@@ -655,6 +649,17 @@
                             available — no manual polling needed.
                         </p>
                     </div>
+
+                    <div class="feature-card">
+                        <div class="feature-icon">⚡</div>
+                        <h3>Background daemon management</h3>
+                        <p>
+                            Claude can start long-running processes on the host
+                            — dev servers, file watchers, build pipelines — and
+                            track them by ID. Daemons are stopped automatically
+                            when the session ends.
+                        </p>
+                    </div>
                 </div>
             </div>
         </section>
@@ -778,6 +783,29 @@
 
 <span class="comment"># Send a desktop notification</span>
 <span class="cmd">host-tools notify-user</span> <span class="string">"Build finished"</span></pre>
+                    </div>
+
+                    <div class="code-block">
+                        <div class="code-block-header">
+                            <span class="dot"></span>
+                            Daemon management (inside container)
+                        </div>
+                        <pre><span class="comment"># Start a background process, get its ID</span>
+<span class="cmd">host-tools daemon start</span> npm run dev
+<span class="comment">  → a3f91c820b4e</span>
+
+<span class="comment"># Stream its output (follows until exit)</span>
+<span class="cmd">host-tools daemon output</span> a3f91c820b4e
+
+<span class="comment"># Check status and exit code</span>
+<span class="cmd">host-tools daemon status</span> a3f91c820b4e
+
+<span class="comment"># List all daemons for this project</span>
+<span class="cmd">host-tools daemon list</span>
+
+<span class="comment"># Stop one or all daemons</span>
+<span class="cmd">host-tools daemon stop</span> a3f91c820b4e
+<span class="cmd">host-tools daemon stop-all</span></pre>
                     </div>
 
                     <div class="code-block">
