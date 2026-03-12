@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 
 #[derive(Parser)]
 #[command(name = "host-tools", about = "Interact with the host machine from inside an ai-pod container")]
@@ -104,13 +104,17 @@ fn run_command(project_id: &str, api_key: &str, server_url: &str, command: &str)
     }
 
     let reader = BufReader::new(response);
+    let mut exit_code: i32 = 0;
     for line in reader.lines() {
         match line {
             Ok(l) if l.is_empty() => continue,
             Ok(l) => match serde_json::from_str::<Message>(&l) {
                 Ok(Message::Stdout(s)) => print!("{}", s),
                 Ok(Message::Stderr(s)) => eprint!("{}", s),
-                Ok(Message::Exit(code)) => std::process::exit(code),
+                Ok(Message::Exit(code)) => {
+                    exit_code = code;
+                    break;
+                }
                 Err(_) => {}
             },
             Err(e) => {
@@ -119,6 +123,10 @@ fn run_command(project_id: &str, api_key: &str, server_url: &str, command: &str)
             }
         }
     }
+    // BufReader/Response drops here → graceful TCP FIN instead of RST
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(exit_code);
 }
 
 fn run_list_commands(project_id: &str, api_key: &str, server_url: &str) {

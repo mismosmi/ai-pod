@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::AsyncBufReadExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
 struct KillOnDrop(Option<u32>);
@@ -164,6 +164,8 @@ pub async fn run_command_handler(
     let stderr = child.stderr.take().unwrap();
 
     let (tx, rx) = mpsc::channel::<String>(64);
+    let (stdout_done_tx, stdout_done_rx) = oneshot::channel::<()>();
+    let (stderr_done_tx, stderr_done_rx) = oneshot::channel::<()>();
 
     let tx_stdout = tx.clone();
     tokio::spawn(async move {
@@ -181,6 +183,7 @@ pub async fn run_command_handler(
                 Err(_) => break,
             }
         }
+        let _ = stdout_done_tx.send(());
     });
 
     let tx_stderr = tx.clone();
@@ -199,6 +202,7 @@ pub async fn run_command_handler(
                 Err(_) => break,
             }
         }
+        let _ = stderr_done_tx.send(());
     });
 
     tokio::spawn(async move {
@@ -206,6 +210,10 @@ pub async fn run_command_handler(
             Ok(status) => status.code().unwrap_or(-1),
             Err(_) => -1,
         };
+        // Wait for both reader tasks to finish before sending Exit,
+        // ensuring Exit is always the last message in the channel.
+        let _ = stdout_done_rx.await;
+        let _ = stderr_done_rx.await;
         let msg = serde_json::to_string(&Message::Exit(exit_code)).unwrap() + "\n";
         let _ = tx.send(msg).await;
     });
