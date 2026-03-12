@@ -223,7 +223,7 @@ pub async fn cleanup_orphaned_daemons(state: &AppState) {
         // Container prefix is "claude-{project_id}" (project_id == workspace_hash)
         let filter = format!("name=^claude-{}-", project_id);
         let output = match tokio::process::Command::new("podman")
-            .args(["ps", "--filter", &filter, "--format", "{{.Names}}"])
+            .args(["ps", "--filter", &filter, "--filter", "label=managed-by=ai-pod", "--format", "{{.Names}}"])
             .output()
             .await
         {

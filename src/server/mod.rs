@@ -104,6 +104,27 @@ pub async fn run_server(port: u16, config: AppConfig) -> anyhow::Result<()> {
         }
     });
 
+    // Background task: shut down server when all claude-* containers have stopped
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        // Grace period: allow container to start before first check
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        loop {
+            let output = tokio::process::Command::new("podman")
+                .args(["ps", "--filter", "label=managed-by=ai-pod", "--format", "{{.Names}}"])
+                .output()
+                .await;
+            let has_containers = output
+                .map(|o| String::from_utf8_lossy(&o.stdout).lines().any(|l| !l.is_empty()))
+                .unwrap_or(true); // on error, stay alive
+            if !has_containers {
+                let _ = shutdown_tx.send(());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+    });
+
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/register", post(register_handler))
@@ -122,7 +143,9 @@ pub async fn run_server(port: u16, config: AppConfig) -> anyhow::Result<()> {
     println!("Shared server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async { shutdown_rx.await.ok(); })
+        .await?;
 
     Ok(())
 }

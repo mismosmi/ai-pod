@@ -86,7 +86,7 @@ fn containers_for_prefix(prefix: &str, running_only: bool) -> Result<Vec<String>
     if !running_only {
         cmd.arg("-a");
     }
-    cmd.args(["--filter", &filter, "--format", "{{.Names}}"]);
+    cmd.args(["--filter", &filter, "--filter", "label=managed-by=ai-pod", "--format", "{{.Names}}"]);
     let output = cmd.output().context("Failed to list containers")?;
     let names = String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -230,6 +230,8 @@ fn run_setup_script(volume_name: &str, image: &str) -> Result<()> {
             "--rm",
             "--user",
             "claude",
+            "--label",
+            "managed-by=ai-pod",
             "-v",
             &format!("{}:/home/claude:z", volume_name),
             "--add-host=host.containers.internal:host-gateway",
@@ -544,6 +546,8 @@ pub async fn launch_container(
             "-it",
             "--name",
             &container_name,
+            "--label",
+            "managed-by=ai-pod",
             "-v",
             &format!("{}:/home/claude:z", volume_name),
             "-v",
@@ -606,6 +610,8 @@ pub async fn run_in_container(
         "run".into(),
         "--rm".into(),
         "-it".into(),
+        "--label".into(),
+        "managed-by=ai-pod".into(),
         "-v".into(),
         format!("{}:/home/claude:z", volume_name),
         "-v".into(),
@@ -646,7 +652,7 @@ pub fn list_containers() -> Result<()> {
             "ps",
             "-a",
             "--filter",
-            "name=^claude-",
+            "label=managed-by=ai-pod",
             "--format",
             "{{.Names}}\t{{.Status}}\t{{.CreatedAt}}",
         ])
@@ -671,7 +677,7 @@ pub fn attach_container() -> Result<()> {
         .args([
             "ps",
             "--filter",
-            "name=^claude-",
+            "label=managed-by=ai-pod",
             "--format",
             "{{.Names}}\t{{.CreatedAt}}",
         ])
