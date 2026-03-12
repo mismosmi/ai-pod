@@ -76,14 +76,17 @@ async fn launch_flow(cli: &Cli) -> Result<()> {
     // 5. Ensure shared server is running
     server::lifecycle::ensure_shared_server(&config)?;
 
-    // 6. Get or create project state (stable api_key)
+    // 6. Check server version compatibility
+    server::lifecycle::check_server_version().await?;
+
+    // 7. Get or create project state (stable api_key)
     let project_id = workspace::workspace_hash(&workspace);
     let state = server::lifecycle::get_or_create_project_state(&config, &workspace)?;
 
-    // 7. Register project with the shared server
-    server::lifecycle::register_project(&project_id, &state.api_key, &workspace).await?;
+    // 8. Reload server config so it picks up the updated project file
+    server::lifecycle::reload_config().await?;
 
-    // 8. Launch container
+    // 9. Launch container
     container::launch_container(
         &config,
         &workspace,
@@ -167,9 +170,10 @@ async fn main() -> Result<()> {
             image::ensure_image(&config, &dockerfile, &image, cli.rebuild)?;
 
             server::lifecycle::ensure_shared_server(&config)?;
+            server::lifecycle::check_server_version().await?;
             let project_id = workspace::workspace_hash(&workspace);
             let state = server::lifecycle::get_or_create_project_state(&config, &workspace)?;
-            server::lifecycle::register_project(&project_id, &state.api_key, &workspace).await?;
+            server::lifecycle::reload_config().await?;
 
             container::run_in_container(
                 &config,

@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
+
+const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -143,21 +145,57 @@ pub fn get_or_create_project_state(config: &AppConfig, workspace: &Path) -> Resu
     Ok(state)
 }
 
-/// Register a project with the running shared server.
-pub async fn register_project(project_id: &str, api_key: &str, workspace: &Path) -> Result<()> {
-    let url = format!("http://127.0.0.1:{}/register", MCP_PORT);
-    let body = serde_json::json!({
-        "project_id": project_id,
-        "api_key": api_key,
-        "workspace": workspace.to_string_lossy(),
-    });
-
+/// Tell the running shared server to rescan config files.
+pub async fn reload_config() -> Result<()> {
+    let url = format!("http://127.0.0.1:{}/reload", MCP_PORT);
     reqwest::Client::new()
         .post(&url)
-        .json(&body)
         .send()
         .await
-        .context("Failed to register project with shared server")?;
+        .context("Failed to reload server config")?;
+    Ok(())
+}
+
+fn is_newer_version(server: &str, cli: &str) -> bool {
+    let parse = |v: &str| -> Option<(u64, u64, u64)> {
+        let mut parts = v.splitn(3, '.');
+        Some((
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+        ))
+    };
+    match (parse(cli), parse(server)) {
+        (Some(c), Some(s)) => c > s,
+        _ => false,
+    }
+}
+
+/// Check that the running server version matches the CLI. Returns Err if CLI is newer.
+pub async fn check_server_version() -> Result<()> {
+    let url = format!("http://127.0.0.1:{}/version", MCP_PORT);
+    let resp: serde_json::Value = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .context("Failed to reach server /version")?
+        .json()
+        .await
+        .context("Invalid JSON from server /version")?;
+
+    let server_version = resp["version"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing version field in server response"))?;
+
+    if is_newer_version(server_version, CLI_VERSION) {
+        println!(
+            "{} Server is v{}, CLI is v{}. Finish active ai-pod sessions so a new server can start.",
+            "Version mismatch:".yellow().bold(),
+            server_version,
+            CLI_VERSION,
+        );
+        anyhow::bail!("Server version mismatch");
+    }
 
     Ok(())
 }

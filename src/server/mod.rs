@@ -5,7 +5,7 @@ pub mod notify;
 pub mod rest;
 
 use axum::{Json, Router, extract::State, routing::{get, post}};
-use serde::Deserialize;
+use serde_json::json;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -34,26 +34,38 @@ async fn health_handler() -> &'static str {
     "ok"
 }
 
-#[derive(Deserialize)]
-struct RegisterRequest {
-    project_id: String,
-    api_key: String,
-    workspace: String,
+async fn version_handler() -> Json<serde_json::Value> {
+    Json(json!({ "version": env!("CARGO_PKG_VERSION") }))
 }
 
-async fn register_handler(
-    State(state): State<AppState>,
-    Json(req): Json<RegisterRequest>,
-) -> &'static str {
+async fn reload_handler(State(state): State<AppState>) -> &'static str {
     let mut projects = state.projects.lock().await;
-    projects.insert(
-        req.project_id,
-        ProjectInfo {
-            workspace: PathBuf::from(req.workspace),
-            api_key: req.api_key,
-        },
-    );
-    "registered"
+    if let Ok(entries) = std::fs::read_dir(&state.config_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            if stem == "server" {
+                continue;
+            }
+            let ps = ProjectState::load(&path);
+            if !ps.api_key.is_empty() && !ps.workspace.is_empty() {
+                projects.insert(
+                    stem,
+                    ProjectInfo {
+                        workspace: PathBuf::from(&ps.workspace),
+                        api_key: ps.api_key,
+                    },
+                );
+            }
+        }
+    }
+    "reloaded"
 }
 
 pub async fn run_server(port: u16, config: AppConfig) -> anyhow::Result<()> {
@@ -127,7 +139,8 @@ pub async fn run_server(port: u16, config: AppConfig) -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(health_handler))
-        .route("/register", post(register_handler))
+        .route("/version", get(version_handler))
+        .route("/reload", post(reload_handler))
         .route("/run_command", post(rest::run_command_handler))
         .route("/notify_user", post(rest::notify_user_handler))
         .route("/list_allowed_commands", post(rest::list_allowed_commands_handler))
