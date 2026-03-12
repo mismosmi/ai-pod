@@ -53,7 +53,8 @@ impl ProjectState {
     }
 
     pub fn is_credential_ignored(&self, rel_path: &str) -> bool {
-        self.ignored_credential_files.contains(&rel_path.to_string())
+        self.ignored_credential_files
+            .contains(&rel_path.to_string())
     }
 
     pub fn add_ignored_credential(&mut self, rel_path: &str) {
@@ -73,7 +74,7 @@ pub fn state_file_for(config: &AppConfig, workspace: &Path) -> PathBuf {
     config.project_state_file(&hash)
 }
 
-/// Ensure the shared MCP server is running. Starts it if not alive.
+/// Ensure the shared server is running. Starts it if not alive.
 pub fn ensure_shared_server(config: &AppConfig) -> Result<()> {
     let state_path = config.server_state_file();
     let state: ServerState = std::fs::read_to_string(&state_path)

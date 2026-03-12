@@ -4,12 +4,41 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+
+struct KillOnDrop(Option<u32>);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            if pid > 0 {
+                // Kill the entire process group to catch children of sh
+                unsafe {
+                    libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
+                }
+            }
+        }
+    }
+}
+
+struct GuardedStream<S: Unpin> {
+    inner: S,
+    _guard: KillOnDrop,
+}
+
+impl<S: Stream + Unpin> Stream for GuardedStream<S> {
+    type Item = S::Item;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
 
 use super::commands;
 use super::notify;
@@ -110,6 +139,7 @@ pub async fn run_command_handler(
         .current_dir(&workspace)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .process_group(0)
         .spawn()
     {
         Ok(c) => c,
@@ -122,6 +152,7 @@ pub async fn run_command_handler(
         }
     };
 
+    let pid = child.id();
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
 
@@ -172,7 +203,10 @@ pub async fn run_command_handler(
         let _ = tx.send(msg).await;
     });
 
-    let stream = ReceiverStream::new(rx).map(|s| Ok::<_, std::convert::Infallible>(s));
+    let stream = GuardedStream {
+        inner: ReceiverStream::new(rx).map(|s| Ok::<_, std::convert::Infallible>(s)),
+        _guard: KillOnDrop(pid),
+    };
     axum::body::Body::from_stream(stream).into_response()
 }
 
