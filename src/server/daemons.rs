@@ -285,9 +285,19 @@ pub async fn start_daemon_handler(
     let gc_state = state.clone();
     tokio::spawn(async move { gc_old_daemon_logs(gc_state).await });
 
+    // Look up workspace for this project (guaranteed to exist after authentication)
+    let workspace = {
+        let projects = state.projects.lock().await;
+        projects
+            .get(&req.project_id)
+            .map(|info| info.workspace.clone())
+            .unwrap_or_default()
+    };
+
     // Spawn the process
     let mut child = match tokio::process::Command::new("sh")
         .args(["-c", &req.command])
+        .current_dir(&workspace)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .process_group(0)
@@ -1106,6 +1116,125 @@ mod tests {
                 .unwrap();
 
             assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn start_daemon_runs_in_project_workspace() {
+            let config_dir = TempDir::new().unwrap();
+            let workspace1 = TempDir::new().unwrap();
+            let workspace2 = TempDir::new().unwrap();
+
+            // Canonicalize to resolve any symlinks (e.g. /var -> /private/var on macOS)
+            let ws1 = workspace1.path().canonicalize().unwrap();
+            let ws2 = workspace2.path().canonicalize().unwrap();
+
+            let mut projects = std::collections::HashMap::new();
+            projects.insert(
+                "proj1".to_string(),
+                crate::server::ProjectInfo {
+                    workspace: ws1.clone(),
+                    api_key: "key1".to_string(),
+                },
+            );
+            projects.insert(
+                "proj2".to_string(),
+                crate::server::ProjectInfo {
+                    workspace: ws2.clone(),
+                    api_key: "key2".to_string(),
+                },
+            );
+            let state = AppState {
+                projects: Arc::new(Mutex::new(projects)),
+                config_dir: config_dir.path().to_path_buf(),
+                approval_lock: Arc::new(Mutex::new(())),
+                daemons: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            };
+
+            // Start `pwd` in proj1
+            let resp1 = make_router(state.clone())
+                .oneshot(json_req(
+                    "/daemon/start",
+                    "key1",
+                    serde_json::json!({"project_id": "proj1", "command": "pwd"}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp1.status(), axum::http::StatusCode::OK);
+            let id1 = to_json(resp1).await["daemon_id"].as_str().unwrap().to_string();
+
+            // Start `pwd` in proj2
+            let resp2 = make_router(state.clone())
+                .oneshot(json_req(
+                    "/daemon/start",
+                    "key2",
+                    serde_json::json!({"project_id": "proj2", "command": "pwd"}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp2.status(), axum::http::StatusCode::OK);
+            let id2 = to_json(resp2).await["daemon_id"].as_str().unwrap().to_string();
+
+            wait_until_done(&state, &id1).await;
+            wait_until_done(&state, &id2).await;
+
+            // Read output for proj1
+            let out1 = to_text(
+                make_router(state.clone())
+                    .oneshot(json_req(
+                        "/daemon/output",
+                        "key1",
+                        serde_json::json!({"project_id": "proj1", "daemon_id": id1}),
+                    ))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+
+            // Read output for proj2
+            let out2 = to_text(
+                make_router(state.clone())
+                    .oneshot(json_req(
+                        "/daemon/output",
+                        "key2",
+                        serde_json::json!({"project_id": "proj2", "daemon_id": id2}),
+                    ))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+
+            #[derive(Deserialize)]
+            #[serde(tag = "type", content = "data")]
+            enum Msg { Stdout(String), Stderr(String), Exit(i32) }
+
+            let stdout1: String = out1
+                .lines()
+                .filter(|l| !l.is_empty())
+                .filter_map(|l| serde_json::from_str::<Msg>(l).ok())
+                .filter_map(|m| if let Msg::Stdout(s) = m { Some(s) } else { None })
+                .collect::<Vec<_>>()
+                .join("");
+
+            let stdout2: String = out2
+                .lines()
+                .filter(|l| !l.is_empty())
+                .filter_map(|l| serde_json::from_str::<Msg>(l).ok())
+                .filter_map(|m| if let Msg::Stdout(s) = m { Some(s) } else { None })
+                .collect::<Vec<_>>()
+                .join("");
+
+            assert!(
+                stdout1.trim() == ws1.to_string_lossy(),
+                "proj1 daemon must run in its workspace: expected {:?}, got {:?}",
+                ws1,
+                stdout1.trim()
+            );
+            assert!(
+                stdout2.trim() == ws2.to_string_lossy(),
+                "proj2 daemon must run in its workspace: expected {:?}, got {:?}",
+                ws2,
+                stdout2.trim()
+            );
         }
 
         // ── POST /daemon/stop ─────────────────────────────────────────────────
