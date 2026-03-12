@@ -43,9 +43,10 @@ Examples:
 - `host-tools run-command ls ~/Desktop`
 - `host-tools run-command open https://example.com`
 
-Prefer to run a single command and manage output in the container:
-- `host-tools run-command pnpm dev | head -n 10` is better than `host-tools run-command 'pnpm dev | head -n 10'`
-- `host-tools run-command bun tsc && host-tools run-command bun lint` is better than `host-tools run-command 'bun tsc && bun lint'`
+YOU MUST NOT TRIM OUTPUT ON THE HOST.
+do not use `host-tools run-command 'command | head -n 10'` to trim output.
+ALWAYS use head or tail this in the container instead: `host-tools run-command 'command' | head -n 10`
+host-tools run-command forwards all output (stdout and stderr).
 
 List previously approved commands:
 
