@@ -49,3 +49,5 @@ git push -f
 # Create annotated tag and push
 git tag -a "v$VERSION" -m "$TAG_MESSAGE"
 git push --tags
+
+cargo install --path .
