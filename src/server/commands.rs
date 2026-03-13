@@ -115,6 +115,38 @@ pub async fn check_approval(state: &AppState, command: &str, workspace: &Path) -
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ApprovalOutcome {
+    Approved,
+    AlwaysAllow,
+    Denied,
+    Timeout,
+    PipeRejected,
+}
+
+pub async fn run_host_command(
+    state: &AppState,
+    command: &str,
+    workspace: &Path,
+) -> ApprovalOutcome {
+    if ends_with_pipe_to_head_or_tail(command) {
+        return ApprovalOutcome::PipeRejected;
+    }
+    match check_approval(state, command, workspace).await {
+        CheckResult::PreApproved => ApprovalOutcome::Approved,
+        CheckResult::AlwaysAllow => {
+            let hash = workspace_hash(workspace);
+            let state_file = state.config_dir.join(format!("{}.json", hash));
+            let mut ps = ProjectState::load(&state_file);
+            ps.add_allowed(command);
+            let _ = ps.save(&state_file);
+            ApprovalOutcome::AlwaysAllow
+        }
+        CheckResult::Denied => ApprovalOutcome::Denied,
+        CheckResult::PermissionTimeout => ApprovalOutcome::Timeout,
+    }
+}
+
 pub fn ends_with_pipe_to_head_or_tail(cmd: &str) -> bool {
     if let Some(pipe_pos) = cmd.trim_end().rfind('|') {
         let after = cmd[pipe_pos + 1..].trim_start();

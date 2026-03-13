@@ -57,4 +57,31 @@ pub enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+
+    /// Manage the whitelist of always-allowed commands for a workspace
+    Allowed {
+        #[command(subcommand)]
+        action: AllowedAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AllowedAction {
+    /// List whitelisted commands
+    List {
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+    },
+    /// Add a command to the whitelist
+    Add {
+        command: String,
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+    },
+    /// Remove a command from the whitelist
+    Remove {
+        command: String,
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+    },
 }

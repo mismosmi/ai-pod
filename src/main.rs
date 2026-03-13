@@ -12,7 +12,7 @@ use clap::Parser;
 use colored::Colorize;
 use std::path::Path;
 
-use cli::{Cli, Command};
+use cli::{AllowedAction, Cli, Command};
 use config::AppConfig;
 
 fn resolve_workspace(workdir: &Option<std::path::PathBuf>) -> Result<std::path::PathBuf> {
@@ -185,6 +185,39 @@ async fn main() -> Result<()> {
                 args,
             )
             .await?;
+        }
+        Some(Command::Allowed { action }) => {
+            let config = AppConfig::new()?;
+            match action {
+                AllowedAction::List { workdir } => {
+                    let workspace = resolve_workspace(workdir)?;
+                    let hash = workspace::workspace_hash(&workspace);
+                    let state = server::lifecycle::ProjectState::load(
+                        &config.project_state_file(&hash),
+                    );
+                    for cmd in &state.allowed_commands {
+                        println!("{}", cmd);
+                    }
+                }
+                AllowedAction::Add { command, workdir } => {
+                    let workspace = resolve_workspace(workdir)?;
+                    let hash = workspace::workspace_hash(&workspace);
+                    let state_path = config.project_state_file(&hash);
+                    let mut state = server::lifecycle::ProjectState::load(&state_path);
+                    state.add_allowed(command);
+                    state.save(&state_path)?;
+                    println!("Added: {}", command);
+                }
+                AllowedAction::Remove { command, workdir } => {
+                    let workspace = resolve_workspace(workdir)?;
+                    let hash = workspace::workspace_hash(&workspace);
+                    let state_path = config.project_state_file(&hash);
+                    let mut state = server::lifecycle::ProjectState::load(&state_path);
+                    state.remove_allowed(command);
+                    state.save(&state_path)?;
+                    println!("Removed: {}", command);
+                }
+            }
         }
         None => {
             launch_flow(&cli).await?;

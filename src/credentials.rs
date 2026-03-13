@@ -153,6 +153,10 @@ pub fn scan_workspace(workspace: &Path) -> Vec<PathBuf> {
 }
 
 pub fn check_credentials(workspace: &Path, config: &AppConfig) -> Result<bool> {
+    // Canonicalize so WalkDir paths and strip_prefix share the same base.
+    let workspace_buf = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let workspace = workspace_buf.as_path();
+
     let found = scan_workspace(workspace);
     if found.is_empty() {
         return Ok(true);
@@ -249,6 +253,68 @@ fn move_and_symlink(src: &Path, dst: &Path) -> Result<()> {
     }
     std::os::unix::fs::symlink(dst, src)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests_ignore_list {
+    use super::*;
+    use crate::server::lifecycle::ProjectState;
+    use tempfile::TempDir;
+
+    #[test]
+    fn ignored_credential_file_is_filtered_out() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".env"), "SECRET=123").unwrap();
+
+        let found = scan_workspace(dir.path());
+        assert_eq!(found.len(), 1);
+
+        let rel = found[0]
+            .strip_prefix(dir.path())
+            .expect("strip_prefix should succeed")
+            .to_string_lossy()
+            .to_string();
+        let mut state = ProjectState::default();
+        state.add_ignored_credential(&rel);
+
+        let pending: Vec<PathBuf> = scan_workspace(dir.path())
+            .into_iter()
+            .filter(|path| {
+                let r = path.strip_prefix(dir.path()).unwrap_or(path);
+                !state.is_credential_ignored(&r.to_string_lossy())
+            })
+            .collect();
+
+        assert!(
+            pending.is_empty(),
+            "ignored file should be filtered out, got: {:?}",
+            pending
+        );
+    }
+
+    #[test]
+    fn ignored_credential_file_is_filtered_when_workspace_is_canonicalized() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".env"), "SECRET=123").unwrap();
+
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+
+        let mut state = ProjectState::default();
+        state.add_ignored_credential(".env");
+
+        let pending: Vec<PathBuf> = scan_workspace(&canonical)
+            .into_iter()
+            .filter(|path| {
+                let r = path.strip_prefix(&canonical).unwrap_or(path);
+                !state.is_credential_ignored(&r.to_string_lossy())
+            })
+            .collect();
+
+        assert!(
+            pending.is_empty(),
+            "ignored file should be filtered out after canonicalization"
+        );
+    }
 }
 
 #[cfg(test)]

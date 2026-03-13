@@ -150,7 +150,6 @@ async fn authenticate(
     }
 }
 
-use super::commands::ends_with_pipe_to_head_or_tail;
 
 async fn gc_old_daemon_logs(state: AppState) {
     let cutoff = std::time::SystemTime::now()
@@ -254,12 +253,38 @@ pub async fn start_daemon_handler(
         return (status, msg.to_string()).into_response();
     }
 
-    if ends_with_pipe_to_head_or_tail(&req.command) {
-        return (
-            StatusCode::BAD_REQUEST,
-            r#"{"error":"Command must not end with | head or | tail"}"#,
-        )
-            .into_response();
+    // Look up workspace for this project (guaranteed to exist after authentication)
+    let workspace = {
+        let projects = state.projects.lock().await;
+        projects
+            .get(&req.project_id)
+            .map(|info| info.workspace.clone())
+            .unwrap_or_default()
+    };
+
+    match super::commands::run_host_command(&state, &req.command, &workspace).await {
+        super::commands::ApprovalOutcome::PipeRejected => {
+            return (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"Command must not end with | head or | tail"}"#,
+            )
+                .into_response();
+        }
+        super::commands::ApprovalOutcome::Denied => {
+            return (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"Command denied by user"}"#,
+            )
+                .into_response();
+        }
+        super::commands::ApprovalOutcome::Timeout => {
+            return (
+                StatusCode::REQUEST_TIMEOUT,
+                r#"{"error":"Permission request timed out after 60 seconds."}"#,
+            )
+                .into_response();
+        }
+        super::commands::ApprovalOutcome::Approved | super::commands::ApprovalOutcome::AlwaysAllow => {}
     }
 
     // Generate daemon_id: first 12 chars of UUID v4 without dashes
@@ -284,15 +309,6 @@ pub async fn start_daemon_handler(
     // Spawn background GC (best-effort)
     let gc_state = state.clone();
     tokio::spawn(async move { gc_old_daemon_logs(gc_state).await });
-
-    // Look up workspace for this project (guaranteed to exist after authentication)
-    let workspace = {
-        let projects = state.projects.lock().await;
-        projects
-            .get(&req.project_id)
-            .map(|info| info.workspace.clone())
-            .unwrap_or_default()
-    };
 
     // Spawn the process
     let mut child = match tokio::process::Command::new("sh")
@@ -609,6 +625,7 @@ pub async fn daemon_output_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::commands::ends_with_pipe_to_head_or_tail;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -948,6 +965,18 @@ mod tests {
             panic!("daemon '{}' did not finish within 5s", daemon_id);
         }
 
+        /// Pre-approve a command in the project state file so tests bypass the
+        /// interactive approval prompt.
+        fn pre_allow(config_dir: &std::path::Path, workspace: &std::path::Path, cmd: &str) {
+            use crate::server::lifecycle::ProjectState;
+            use crate::workspace::workspace_hash;
+            let hash = workspace_hash(workspace);
+            let state_path = config_dir.join(format!("{}.json", hash));
+            let mut state = ProjectState::load(&state_path);
+            state.add_allowed(cmd);
+            state.save(&state_path).unwrap();
+        }
+
         // ── Authentication ────────────────────────────────────────────────────
 
         #[tokio::test]
@@ -992,6 +1021,7 @@ mod tests {
         async fn start_daemon_returns_12_char_id() {
             let dir = TempDir::new().unwrap();
             let state = make_state(dir.path());
+            pre_allow(dir.path(), dir.path(), "echo hello");
             let router = make_router(state);
 
             let resp = router
@@ -1014,6 +1044,7 @@ mod tests {
         async fn start_daemon_is_inserted_into_state() {
             let dir = TempDir::new().unwrap();
             let state = make_state(dir.path());
+            pre_allow(dir.path(), dir.path(), "echo hello");
             let router = make_router(state.clone());
 
             let resp = router
@@ -1037,6 +1068,7 @@ mod tests {
         async fn start_daemon_creates_log_dir() {
             let dir = TempDir::new().unwrap();
             let state = make_state(dir.path());
+            pre_allow(dir.path(), dir.path(), "true");
             let router = make_router(state);
 
             let resp = router
@@ -1057,6 +1089,8 @@ mod tests {
         async fn start_two_daemons_produce_different_ids() {
             let dir = TempDir::new().unwrap();
             let state = make_state(dir.path());
+            pre_allow(dir.path(), dir.path(), "echo 1");
+            pre_allow(dir.path(), dir.path(), "echo 2");
 
             let r1 = make_router(state.clone())
                 .oneshot(json_req(
@@ -1149,6 +1183,9 @@ mod tests {
                 approval_lock: Arc::new(Mutex::new(())),
                 daemons: Arc::new(Mutex::new(std::collections::HashMap::new())),
             };
+
+            pre_allow(config_dir.path(), &ws1, "pwd");
+            pre_allow(config_dir.path(), &ws2, "pwd");
 
             // Start `pwd` in proj1
             let resp1 = make_router(state.clone())
@@ -1313,6 +1350,7 @@ mod tests {
         async fn stop_running_daemon_sets_status_killed() {
             let dir = TempDir::new().unwrap();
             let state = make_state(dir.path());
+            pre_allow(dir.path(), dir.path(), "sleep 60");
             let router = make_router(state.clone());
 
             // Start a long-running process
@@ -1680,6 +1718,7 @@ mod tests {
         async fn output_streams_stdout_and_exit_for_finished_daemon() {
             let dir = TempDir::new().unwrap();
             let state = make_state(dir.path());
+            pre_allow(dir.path(), dir.path(), "printf 'line1\\nline2\\n'");
             let router = make_router(state.clone());
 
             // Start daemon
@@ -1746,6 +1785,7 @@ mod tests {
         async fn output_exit_code_reflects_command_failure() {
             let dir = TempDir::new().unwrap();
             let state = make_state(dir.path());
+            pre_allow(dir.path(), dir.path(), "exit 3");
             let router = make_router(state.clone());
 
             let start_resp = router

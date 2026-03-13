@@ -113,40 +113,29 @@ pub async fn run_command_handler(
         Err((status, msg)) => return (status, msg.to_string()).into_response(),
     };
 
-    if commands::ends_with_pipe_to_head_or_tail(&req.command) {
-        return (
-            StatusCode::BAD_REQUEST,
-            r#"{"error":"Command must not end with | head or | tail — pipe those inside the container instead"}"#,
-        )
-            .into_response();
-    }
-
-    match commands::check_approval(&state, &req.command, &workspace).await {
-        commands::CheckResult::Denied => {
+    match commands::run_host_command(&state, &req.command, &workspace).await {
+        commands::ApprovalOutcome::PipeRejected => {
+            return (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"Command must not end with | head or | tail — pipe those inside the container instead"}"#,
+            )
+                .into_response();
+        }
+        commands::ApprovalOutcome::Denied => {
             return (
                 StatusCode::BAD_REQUEST,
                 r#"{"error":"Command denied by user"}"#,
             )
                 .into_response();
         }
-        commands::CheckResult::PermissionTimeout => {
+        commands::ApprovalOutcome::Timeout => {
             return (
                 StatusCode::REQUEST_TIMEOUT,
                 r#"{"error":"Permission request timed out after 60 seconds. Stop your current work and ask the user to confirm they would like to try again."}"#,
             )
                 .into_response();
         }
-        commands::CheckResult::AlwaysAllow => {
-            // Save command to project state file
-            use crate::workspace::workspace_hash;
-            use super::lifecycle::ProjectState;
-            let hash = workspace_hash(&workspace);
-            let state_file = state.config_dir.join(format!("{}.json", hash));
-            let mut ps = ProjectState::load(&state_file);
-            ps.add_allowed(&req.command);
-            let _ = ps.save(&state_file);
-        }
-        commands::CheckResult::PreApproved => {}
+        commands::ApprovalOutcome::Approved | commands::ApprovalOutcome::AlwaysAllow => {}
     }
 
     let mut child = match tokio::process::Command::new("sh")

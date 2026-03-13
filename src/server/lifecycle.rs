@@ -54,6 +54,10 @@ impl ProjectState {
         }
     }
 
+    pub fn remove_allowed(&mut self, cmd: &str) {
+        self.allowed_commands.retain(|c| c != cmd);
+    }
+
     pub fn is_credential_ignored(&self, rel_path: &str) -> bool {
         self.ignored_credential_files
             .contains(&rel_path.to_string())
