@@ -44,6 +44,11 @@ impl AppConfig {
         self.home_dir.join(".claude").join("CLAUDE.md")
     }
 
+    /// Returns path to the worktrees directory: ~/.ai-pod/worktrees/
+    pub fn worktrees_dir(&self) -> PathBuf {
+        self.config_dir.join("worktrees")
+    }
+
     /// Returns the directory for storing moved credential files for a given workspace.
     /// E.g., `/home/user/my-project` → `~/.env-files/home-user-my-project/`
     pub fn env_files_project_dir(&self, workspace: &Path) -> PathBuf {

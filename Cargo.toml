@@ -21,9 +21,11 @@ serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
 notify-rust = "4"
+petname = "2"
 tempfile = "3"
 tokio-stream = "0.1"
 futures-util = "0.3"
+rand = "0.8"
 
 [[bin]]
 name = "host-tools"
