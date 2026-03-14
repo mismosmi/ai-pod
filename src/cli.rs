@@ -58,6 +58,12 @@ pub enum Command {
         args: Vec<String>,
     },
 
+    /// Fork the current workspace into a git worktree with its own container
+    Fork {
+        /// Name for the fork (generates a mnemonic if omitted)
+        name: Option<String>,
+    },
+
     /// Manage the whitelist of always-allowed commands for a workspace
     Allowed {
         #[command(subcommand)]

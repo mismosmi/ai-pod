@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use colored::Colorize;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -240,6 +240,55 @@ pub fn check_credentials(workspace: &Path, config: &AppConfig) -> Result<bool> {
     }
 
     Ok(true)
+}
+
+pub fn link_credentials_to_worktree(original_workspace: &Path, worktree: &Path) -> Result<()> {
+    let original_workspace =
+        std::fs::canonicalize(original_workspace).unwrap_or_else(|_| original_workspace.to_path_buf());
+    let found = scan_workspace(&original_workspace);
+    if found.is_empty() {
+        return Ok(());
+    }
+
+    let mut linked = 0;
+    for original_path in &found {
+        let rel = match original_path.strip_prefix(&original_workspace) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let dest = worktree.join(rel);
+
+        if dest.exists() || dest.symlink_metadata().is_ok() {
+            continue;
+        }
+
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        if original_path.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
+            let target = std::fs::read_link(original_path)
+                .with_context(|| format!("Failed to read symlink {}", original_path.display()))?;
+            std::os::unix::fs::symlink(&target, &dest)
+                .with_context(|| format!("Failed to symlink {}", dest.display()))?;
+        } else {
+            std::os::unix::fs::symlink(original_path, &dest)
+                .with_context(|| format!("Failed to symlink {}", dest.display()))?;
+        }
+        linked += 1;
+    }
+
+    if linked > 0 {
+        use colored::Colorize;
+        println!(
+            "{} Linked {} credential file{} into worktree",
+            "✓".green(),
+            linked,
+            if linked == 1 { "" } else { "s" }
+        );
+    }
+
+    Ok(())
 }
 
 fn move_and_symlink(src: &Path, dst: &Path) -> Result<()> {

@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod container;
 mod credentials;
+mod fork;
 mod image;
 mod server;
 mod update;
@@ -43,15 +44,17 @@ fn init_project(workspace: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn launch_flow(cli: &Cli) -> Result<()> {
+async fn launch_flow(
+    workspace: &Path,
+    no_credential_check: bool,
+    rebuild: bool,
+) -> Result<()> {
     let config = AppConfig::new()?;
     config.init()?;
 
-    // 1. Resolve workspace
-    let workspace = resolve_workspace(&cli.workdir)?;
     println!("{} {}", "Workspace:".blue(), workspace.display());
 
-    // 2. Locate Dockerfile
+    // 1. Locate Dockerfile
     let dockerfile = workspace.join(image::DOCKERFILE_NAME);
     if !dockerfile.exists() {
         anyhow::bail!(
@@ -61,36 +64,36 @@ async fn launch_flow(cli: &Cli) -> Result<()> {
         );
     }
 
-    // 3. Credential scan
-    if !cli.no_credential_check {
-        if !credentials::check_credentials(&workspace, &config)? {
+    // 2. Credential scan
+    if !no_credential_check {
+        if !credentials::check_credentials(workspace, &config)? {
             println!("{}", "Aborted.".red());
             return Ok(());
         }
     }
 
-    // 4. Build image if needed
-    let image = image::image_name(&workspace);
-    image::ensure_image(&config, &dockerfile, &image, cli.rebuild)?;
+    // 3. Build image if needed
+    let image = image::image_name(workspace);
+    image::ensure_image(&config, &dockerfile, &image, rebuild)?;
 
-    // 5. Ensure shared server is running
+    // 4. Ensure shared server is running
     server::lifecycle::ensure_shared_server(&config)?;
 
-    // 6. Check server version compatibility
+    // 5. Check server version compatibility
     server::lifecycle::check_server_version().await?;
 
-    // 7. Get or create project state (stable api_key)
-    let project_id = workspace::workspace_hash(&workspace);
-    let state = server::lifecycle::get_or_create_project_state(&config, &workspace)?;
+    // 6. Get or create project state (stable api_key)
+    let project_id = workspace::workspace_hash(workspace);
+    let state = server::lifecycle::get_or_create_project_state(&config, workspace)?;
 
-    // 8. Reload server config so it picks up the updated project file
+    // 7. Reload server config so it picks up the updated project file
     server::lifecycle::reload_config().await?;
 
-    // 9. Launch container
+    // 8. Launch container
     container::launch_container(
         &config,
-        &workspace,
-        cli.rebuild,
+        workspace,
+        rebuild,
         &image,
         &project_id,
         &state.api_key,
@@ -219,8 +222,18 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Some(Command::Fork { name }) => {
+            let config = AppConfig::new()?;
+            config.init()?;
+            let workspace = resolve_workspace(&cli.workdir)?;
+            let (_fork_name, worktree_path) =
+                fork::create_fork(&config, &workspace, name.as_deref())?;
+            credentials::link_credentials_to_worktree(&workspace, &worktree_path)?;
+            launch_flow(&worktree_path, cli.no_credential_check, cli.rebuild).await?;
+        }
         None => {
-            launch_flow(&cli).await?;
+            let workspace = resolve_workspace(&cli.workdir)?;
+            launch_flow(&workspace, cli.no_credential_check, cli.rebuild).await?;
         }
     }
 
