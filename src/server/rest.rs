@@ -1,8 +1,8 @@
 use axum::{
+    Json,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    Json,
 };
 use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -40,9 +40,9 @@ impl<S: Stream + Unpin> Stream for GuardedStream<S> {
     }
 }
 
+use super::AppState;
 use super::commands;
 use super::notify;
-use super::AppState;
 
 #[derive(Deserialize)]
 pub struct RunCommandRequest {
@@ -131,7 +131,7 @@ pub async fn run_command_handler(
         commands::ApprovalOutcome::Timeout => {
             return (
                 StatusCode::REQUEST_TIMEOUT,
-                r#"{"error":"Permission request timed out after 60 seconds. Stop your current work and ask the user to confirm they would like to try again."}"#,
+                r#"{"error":"Permission request timed out after 60 seconds. Stop your current work and ask the user if they would like to try again."}"#,
             )
                 .into_response();
         }
@@ -173,8 +173,7 @@ pub async fn run_command_handler(
             match reader.read_line(&mut line).await {
                 Ok(0) => break,
                 Ok(_) => {
-                    let msg = serde_json::to_string(&Message::Stdout(line.clone())).unwrap()
-                        + "\n";
+                    let msg = serde_json::to_string(&Message::Stdout(line.clone())).unwrap() + "\n";
                     let _ = tx_stdout.send(msg).await;
                 }
                 Err(_) => break,
@@ -192,8 +191,7 @@ pub async fn run_command_handler(
             match reader.read_line(&mut line).await {
                 Ok(0) => break,
                 Ok(_) => {
-                    let msg = serde_json::to_string(&Message::Stderr(line.clone())).unwrap()
-                        + "\n";
+                    let msg = serde_json::to_string(&Message::Stderr(line.clone())).unwrap() + "\n";
                     let _ = tx_stderr.send(msg).await;
                 }
                 Err(_) => break,

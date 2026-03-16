@@ -1,8 +1,8 @@
 use axum::{
+    Json,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    Json,
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -150,7 +150,6 @@ async fn authenticate(
     }
 }
 
-
 async fn gc_old_daemon_logs(state: AppState) {
     let cutoff = std::time::SystemTime::now()
         .checked_sub(std::time::Duration::from_secs(7 * 24 * 3600))
@@ -222,7 +221,15 @@ pub async fn cleanup_orphaned_daemons(state: &AppState) {
         // Container prefix is "claude-{project_id}" (project_id == workspace_hash)
         let filter = format!("name=^claude-{}-", project_id);
         let output = match tokio::process::Command::new("podman")
-            .args(["ps", "--filter", &filter, "--filter", "label=managed-by=ai-pod", "--format", "{{.Names}}"])
+            .args([
+                "ps",
+                "--filter",
+                &filter,
+                "--filter",
+                "label=managed-by=ai-pod",
+                "--format",
+                "{{.Names}}",
+            ])
             .output()
             .await
         {
@@ -280,11 +287,12 @@ pub async fn start_daemon_handler(
         super::commands::ApprovalOutcome::Timeout => {
             return (
                 StatusCode::REQUEST_TIMEOUT,
-                r#"{"error":"Permission request timed out after 60 seconds."}"#,
+                r#"{"error":"Permission request timed out after 60 seconds. Stop your current work and ask the user if they would like to try again."}"#,
             )
                 .into_response();
         }
-        super::commands::ApprovalOutcome::Approved | super::commands::ApprovalOutcome::AlwaysAllow => {}
+        super::commands::ApprovalOutcome::Approved
+        | super::commands::ApprovalOutcome::AlwaysAllow => {}
     }
 
     // Generate daemon_id: first 12 chars of UUID v4 without dashes
@@ -292,10 +300,7 @@ pub async fn start_daemon_handler(
     let daemon_id = raw[..12].to_string();
 
     // Compute log path (project_id is already the workspace hash)
-    let log_dir = state
-        .config_dir
-        .join("daemon-logs")
-        .join(&req.project_id);
+    let log_dir = state.config_dir.join("daemon-logs").join(&req.project_id);
     let log_path = log_dir.join(format!("{}.log", daemon_id));
 
     if let Err(e) = tokio::fs::create_dir_all(&log_dir).await {
@@ -620,7 +625,12 @@ mod tests {
 
     // ── Shared helpers ────────────────────────────────────────────────────────
 
-    fn make_entry(id: &str, project_id: &str, status: DaemonStatus, log_path: PathBuf) -> DaemonEntry {
+    fn make_entry(
+        id: &str,
+        project_id: &str,
+        status: DaemonStatus,
+        log_path: PathBuf,
+    ) -> DaemonEntry {
         DaemonEntry {
             id: id.to_string(),
             project_id: project_id.to_string(),
@@ -723,7 +733,12 @@ mod tests {
 
     #[test]
     fn daemon_meta_preserves_running_status() {
-        let entry = make_entry("d1", "p1", DaemonStatus::Running, PathBuf::from("/tmp/d1.log"));
+        let entry = make_entry(
+            "d1",
+            "p1",
+            DaemonStatus::Running,
+            PathBuf::from("/tmp/d1.log"),
+        );
         let meta = DaemonMeta::from_entry(&entry);
         assert_eq!(meta.status, DaemonStatus::Running);
     }
@@ -742,7 +757,12 @@ mod tests {
 
     #[test]
     fn daemon_meta_preserves_killed_status() {
-        let entry = make_entry("d1", "p1", DaemonStatus::Killed, PathBuf::from("/tmp/d1.log"));
+        let entry = make_entry(
+            "d1",
+            "p1",
+            DaemonStatus::Killed,
+            PathBuf::from("/tmp/d1.log"),
+        );
         let meta = DaemonMeta::from_entry(&entry);
         assert_eq!(meta.status, DaemonStatus::Killed);
     }
@@ -823,7 +843,10 @@ mod tests {
 
         gc_old_daemon_logs(state.clone()).await;
 
-        assert!(state.daemons.lock().await.is_empty(), "daemon should be removed");
+        assert!(
+            state.daemons.lock().await.is_empty(),
+            "daemon should be removed"
+        );
         assert!(!log_path.exists(), "log file should be deleted");
     }
 
@@ -867,7 +890,11 @@ mod tests {
 
         gc_old_daemon_logs(state.clone()).await;
 
-        assert_eq!(state.daemons.lock().await.len(), 1, "running daemon must not be removed");
+        assert_eq!(
+            state.daemons.lock().await.len(),
+            1,
+            "running daemon must not be removed"
+        );
         assert!(log_path.exists());
     }
 
@@ -893,7 +920,11 @@ mod tests {
 
         gc_old_daemon_logs(state.clone()).await;
 
-        assert_eq!(state.daemons.lock().await.len(), 1, "recent daemon must not be removed");
+        assert_eq!(
+            state.daemons.lock().await.len(),
+            1,
+            "recent daemon must not be removed"
+        );
     }
 
     // ── HTTP integration tests ────────────────────────────────────────────────
@@ -925,12 +956,16 @@ mod tests {
         }
 
         async fn to_json(resp: axum::response::Response) -> serde_json::Value {
-            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
             serde_json::from_slice(&bytes).unwrap_or(serde_json::json!({}))
         }
 
         async fn to_text(resp: axum::response::Response) -> String {
-            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
             String::from_utf8_lossy(&bytes).to_string()
         }
 
@@ -1024,7 +1059,10 @@ mod tests {
             let body = to_json(resp).await;
             let id = body["daemon_id"].as_str().unwrap();
             assert_eq!(id.len(), 12, "daemon_id must be 12 characters");
-            assert!(id.chars().all(|c| c.is_ascii_alphanumeric()), "daemon_id must be alphanumeric");
+            assert!(
+                id.chars().all(|c| c.is_ascii_alphanumeric()),
+                "daemon_id must be alphanumeric"
+            );
         }
 
         #[tokio::test]
@@ -1118,7 +1156,10 @@ mod tests {
 
             assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
             let text = to_text(resp).await;
-            assert!(text.contains("must not end with"), "error should mention the restriction");
+            assert!(
+                text.contains("must not end with"),
+                "error should mention the restriction"
+            );
         }
 
         #[tokio::test]
@@ -1184,7 +1225,10 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(resp1.status(), axum::http::StatusCode::OK);
-            let id1 = to_json(resp1).await["daemon_id"].as_str().unwrap().to_string();
+            let id1 = to_json(resp1).await["daemon_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
 
             // Start `pwd` in proj2
             let resp2 = make_router(state.clone())
@@ -1196,7 +1240,10 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(resp2.status(), axum::http::StatusCode::OK);
-            let id2 = to_json(resp2).await["daemon_id"].as_str().unwrap().to_string();
+            let id2 = to_json(resp2).await["daemon_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
 
             wait_until_done(&state, &id1).await;
             wait_until_done(&state, &id2).await;
@@ -1229,13 +1276,23 @@ mod tests {
 
             #[derive(Deserialize)]
             #[serde(tag = "type", content = "data")]
-            enum Msg { Stdout(String), Stderr(String), Exit(i32) }
+            enum Msg {
+                Stdout(String),
+                Stderr(String),
+                Exit(i32),
+            }
 
             let stdout1: String = out1
                 .lines()
                 .filter(|l| !l.is_empty())
                 .filter_map(|l| serde_json::from_str::<Msg>(l).ok())
-                .filter_map(|m| if let Msg::Stdout(s) = m { Some(s) } else { None })
+                .filter_map(|m| {
+                    if let Msg::Stdout(s) = m {
+                        Some(s)
+                    } else {
+                        None
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("");
 
@@ -1243,7 +1300,13 @@ mod tests {
                 .lines()
                 .filter(|l| !l.is_empty())
                 .filter_map(|l| serde_json::from_str::<Msg>(l).ok())
-                .filter_map(|m| if let Msg::Stdout(s) = m { Some(s) } else { None })
+                .filter_map(|m| {
+                    if let Msg::Stdout(s) = m {
+                        Some(s)
+                    } else {
+                        None
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("");
 
@@ -1287,7 +1350,12 @@ mod tests {
             let state = make_state(dir.path());
             state.daemons.lock().await.insert(
                 "d1".to_string(),
-                make_entry("d1", "proj1", DaemonStatus::Running, dir.path().join("d1.log")),
+                make_entry(
+                    "d1",
+                    "proj1",
+                    DaemonStatus::Running,
+                    dir.path().join("d1.log"),
+                ),
             );
             let router = make_router(state);
 
@@ -1349,7 +1417,10 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            let daemon_id = to_json(start_resp).await["daemon_id"].as_str().unwrap().to_string();
+            let daemon_id = to_json(start_resp).await["daemon_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
 
             // Stop it
             let stop_resp = make_router(state.clone())
@@ -1400,7 +1471,12 @@ mod tests {
                     let id = format!("d{}", i);
                     daemons.insert(
                         id.clone(),
-                        make_entry(&id, "proj1", DaemonStatus::Running, dir.path().join(format!("{}.log", id))),
+                        make_entry(
+                            &id,
+                            "proj1",
+                            DaemonStatus::Running,
+                            dir.path().join(format!("{}.log", id)),
+                        ),
                     );
                 }
                 // One already-finished daemon — should not be counted
@@ -1437,11 +1513,21 @@ mod tests {
                 let mut daemons = state.daemons.lock().await;
                 daemons.insert(
                     "p1d1".to_string(),
-                    make_entry("p1d1", "proj1", DaemonStatus::Running, dir.path().join("p1d1.log")),
+                    make_entry(
+                        "p1d1",
+                        "proj1",
+                        DaemonStatus::Running,
+                        dir.path().join("p1d1.log"),
+                    ),
                 );
                 daemons.insert(
                     "p2d1".to_string(),
-                    make_entry("p2d1", "proj2", DaemonStatus::Running, dir.path().join("p2d1.log")),
+                    make_entry(
+                        "p2d1",
+                        "proj2",
+                        DaemonStatus::Running,
+                        dir.path().join("p2d1.log"),
+                    ),
                 );
             }
             let router = make_router(state.clone());
@@ -1460,7 +1546,11 @@ mod tests {
 
             let daemons = state.daemons.lock().await;
             assert_eq!(daemons["p1d1"].status, DaemonStatus::Killed);
-            assert_eq!(daemons["p2d1"].status, DaemonStatus::Running, "other project untouched");
+            assert_eq!(
+                daemons["p2d1"].status,
+                DaemonStatus::Running,
+                "other project untouched"
+            );
         }
 
         // ── POST /daemon/list ─────────────────────────────────────────────────
@@ -1493,11 +1583,21 @@ mod tests {
                 let mut daemons = state.daemons.lock().await;
                 daemons.insert(
                     "a".to_string(),
-                    make_entry("a", "proj1", DaemonStatus::Running, dir.path().join("a.log")),
+                    make_entry(
+                        "a",
+                        "proj1",
+                        DaemonStatus::Running,
+                        dir.path().join("a.log"),
+                    ),
                 );
                 daemons.insert(
                     "b".to_string(),
-                    make_entry("b", "proj2", DaemonStatus::Running, dir.path().join("b.log")),
+                    make_entry(
+                        "b",
+                        "proj2",
+                        DaemonStatus::Running,
+                        dir.path().join("b.log"),
+                    ),
                 );
             }
             let router = make_router(state);
@@ -1524,7 +1624,12 @@ mod tests {
             let state = make_state(dir.path());
             state.daemons.lock().await.insert(
                 "d1".to_string(),
-                make_entry("d1", "proj1", DaemonStatus::Running, dir.path().join("d1.log")),
+                make_entry(
+                    "d1",
+                    "proj1",
+                    DaemonStatus::Running,
+                    dir.path().join("d1.log"),
+                ),
             );
             let router = make_router(state);
 
@@ -1573,7 +1678,12 @@ mod tests {
             let state = make_state(dir.path());
             state.daemons.lock().await.insert(
                 "d1".to_string(),
-                make_entry("d1", "proj1", DaemonStatus::Running, dir.path().join("d1.log")),
+                make_entry(
+                    "d1",
+                    "proj1",
+                    DaemonStatus::Running,
+                    dir.path().join("d1.log"),
+                ),
             );
             let router = make_router(state);
 
@@ -1655,7 +1765,12 @@ mod tests {
             let state = make_state(dir.path());
             state.daemons.lock().await.insert(
                 "d1".to_string(),
-                make_entry("d1", "proj1", DaemonStatus::Running, dir.path().join("d1.log")),
+                make_entry(
+                    "d1",
+                    "proj1",
+                    DaemonStatus::Running,
+                    dir.path().join("d1.log"),
+                ),
             );
             let router = make_router(state);
 
@@ -1698,7 +1813,10 @@ mod tests {
             // Must return 200 (not 500); body will be empty since the file open fails silently
             assert_eq!(resp.status(), axum::http::StatusCode::OK);
             let text = to_text(resp).await;
-            assert!(text.is_empty(), "body should be empty when log file is missing");
+            assert!(
+                text.is_empty(),
+                "body should be empty when log file is missing"
+            );
         }
 
         #[tokio::test]
@@ -1721,7 +1839,10 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(start_resp.status(), axum::http::StatusCode::OK);
-            let daemon_id = to_json(start_resp).await["daemon_id"].as_str().unwrap().to_string();
+            let daemon_id = to_json(start_resp).await["daemon_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
 
             // Wait for the reaper to mark it finished
             wait_until_done(&state, &daemon_id).await;
@@ -1742,18 +1863,30 @@ mod tests {
             // Parse line-delimited JSON messages
             #[derive(Deserialize)]
             #[serde(tag = "type", content = "data")]
-            enum Msg { Stdout(String), Stderr(String), Exit(i32) }
+            enum Msg {
+                Stdout(String),
+                Stderr(String),
+                Exit(i32),
+            }
 
             let messages: Vec<Msg> = text
                 .lines()
                 .filter(|l| !l.is_empty())
-                .map(|l| serde_json::from_str::<Msg>(l).expect("each line must be valid Message JSON"))
+                .map(|l| {
+                    serde_json::from_str::<Msg>(l).expect("each line must be valid Message JSON")
+                })
                 .collect();
 
             // Must have at least two Stdout messages and a final Exit(0)
             let stdout_content: Vec<&str> = messages
                 .iter()
-                .filter_map(|m| if let Msg::Stdout(s) = m { Some(s.as_str()) } else { None })
+                .filter_map(|m| {
+                    if let Msg::Stdout(s) = m {
+                        Some(s.as_str())
+                    } else {
+                        None
+                    }
+                })
                 .collect();
             assert!(
                 stdout_content.iter().any(|s| s.contains("line1")),
@@ -1783,7 +1916,10 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            let daemon_id = to_json(start_resp).await["daemon_id"].as_str().unwrap().to_string();
+            let daemon_id = to_json(start_resp).await["daemon_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
 
             wait_until_done(&state, &daemon_id).await;
 
@@ -1800,7 +1936,11 @@ mod tests {
 
             #[derive(Deserialize)]
             #[serde(tag = "type", content = "data")]
-            enum Msg { Stdout(String), Stderr(String), Exit(i32) }
+            enum Msg {
+                Stdout(String),
+                Stderr(String),
+                Exit(i32),
+            }
 
             let messages: Vec<Msg> = text
                 .lines()
