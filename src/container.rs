@@ -71,7 +71,7 @@ Manage long-running background processes on the host.
 
     host-tools daemon start <shell command>   # returns daemon ID
     host-tools daemon list                    # show all daemons for this project
-    host-tools daemon output <daemon-id>      # stream output (follows until daemon exits)
+    host-tools daemon output <daemon-id>      # print log and exit
     host-tools daemon status <daemon-id>      # running/finished, exit code
     host-tools daemon stop <daemon-id>
     host-tools daemon stop-all
