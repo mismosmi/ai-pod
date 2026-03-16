@@ -411,8 +411,8 @@ pub async fn start_daemon_handler(
             let mut writer = tokio::io::BufWriter::new(log_file);
             while let Some(msg) = log_rx.recv().await {
                 let _ = writer.write_all(msg.as_bytes()).await;
+                let _ = writer.flush().await;
             }
-            let _ = writer.flush().await;
             writer
         });
 
@@ -577,7 +577,6 @@ pub async fn daemon_output_handler(
     };
 
     let (tx, rx) = mpsc::channel::<String>(64);
-    let daemon_id = req.daemon_id.clone();
 
     tokio::spawn(async move {
         let file = match tokio::fs::File::open(&log_path).await {
@@ -591,20 +590,8 @@ pub async fn daemon_output_handler(
             line.clear();
             match reader.read_line(&mut line).await {
                 Ok(0) => {
-                    // EOF – check if daemon is still running
-                    let status = {
-                        let daemons = state.daemons.lock().await;
-                        daemons
-                            .get(&daemon_id)
-                            .map(|e| e.status.clone())
-                            .unwrap_or(DaemonStatus::Killed)
-                    };
-                    match status {
-                        DaemonStatus::Running => {
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        }
-                        _ => break, // Daemon finished; reaper wrote Exit message to log already
-                    }
+                    // EOF – print log and exit
+                    break;
                 }
                 Ok(_) => {
                     if tx.send(line.clone()).await.is_err() {

@@ -49,7 +49,7 @@ enum DaemonAction {
     StopAll,
     /// List all daemons for this project
     List,
-    /// Stream output from a daemon (follows until exit)
+    /// Print the log output from a daemon and exit
     Output {
         /// Daemon ID
         daemon_id: String,
