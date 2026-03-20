@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod container;
 mod credentials;
+mod daemons;
 mod image;
 mod server;
 mod update;
@@ -185,6 +186,11 @@ async fn main() -> Result<()> {
                 args,
             )
             .await?;
+        }
+        Some(Command::Daemons) => {
+            let config = AppConfig::new()?;
+            let workspace = resolve_workspace(&cli.workdir)?;
+            daemons::run_daemons(&config, &workspace).await?;
         }
         Some(Command::Allowed { action }) => {
             let config = AppConfig::new()?;

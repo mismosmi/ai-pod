@@ -58,6 +58,9 @@ pub enum Command {
         args: Vec<String>,
     },
 
+    /// View and inspect running daemons for this workspace
+    Daemons,
+
     /// Manage the whitelist of always-allowed commands for a workspace
     Allowed {
         #[command(subcommand)]
