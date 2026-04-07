@@ -3,19 +3,27 @@ use colored::Colorize;
 use dialoguer;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use crate::config::AppConfig;
+use crate::runtime::ContainerRuntime;
 use crate::workspace::{container_prefix, new_container_name, volume_name as gen_volume_name};
 
-const CONTAINER_CLAUDE_MD: &str = r#"# Container Environment
-You are running inside a Podman container. To reach services on the host machine,
-use `host.containers.internal` instead of `localhost`.
+fn container_claude_md(rt: &ContainerRuntime) -> String {
+    format!(
+        r#"# Container Environment
+You are running inside a {} container. To reach services on the host machine,
+use `{}` instead of `localhost`.
 
-For example: `curl http://host.containers.internal:3000`
+For example: `curl http://{}:3000`
 
 Working directory: /app
-"#;
+"#,
+        rt.display_name(),
+        rt.host_gateway(),
+        rt.host_gateway(),
+    )
+}
 
 /// Setup script: installs Claude Code.
 const SETUP_SCRIPT: &str = r#"#!/bin/sh
@@ -79,9 +87,9 @@ Manage long-running background processes on the host.
 YOU MUST NOT end daemon commands with | head or | tail. This is rejected by the server.
 "#;
 
-fn containers_for_prefix(prefix: &str, running_only: bool) -> Result<Vec<String>> {
+fn containers_for_prefix(rt: &ContainerRuntime, prefix: &str, running_only: bool) -> Result<Vec<String>> {
     let filter = format!("name=^{}-", prefix);
-    let mut cmd = Command::new("podman");
+    let mut cmd = rt.command();
     cmd.arg("ps");
     if !running_only {
         cmd.arg("-a");
@@ -96,16 +104,17 @@ fn containers_for_prefix(prefix: &str, running_only: bool) -> Result<Vec<String>
     Ok(names)
 }
 
-fn volume_exists(name: &str) -> Result<bool> {
-    let status = Command::new("podman")
+fn volume_exists(rt: &ContainerRuntime, name: &str) -> Result<bool> {
+    let status = rt
+        .command()
         .args(["volume", "exists", name])
         .status()
         .context("Failed to check if volume exists")?;
     Ok(status.success())
 }
 
-fn generate_runtime_claude_md(config: &AppConfig) -> Result<()> {
-    let mut content = CONTAINER_CLAUDE_MD.to_string();
+fn generate_runtime_claude_md(rt: &ContainerRuntime, config: &AppConfig) -> Result<()> {
+    let mut content = container_claude_md(rt);
 
     let host_claude_md = config.claude_md_path();
     if host_claude_md.exists() {
@@ -218,13 +227,15 @@ async fn ensure_host_tools_binary(config: &AppConfig) -> Result<PathBuf> {
 
 /// Run the setup script inside a temporary container with the home volume mounted.
 /// Installs Claude Code.
-fn run_setup_script(volume_name: &str, image: &str) -> Result<()> {
+fn run_setup_script(rt: &ContainerRuntime, volume_name: &str, image: &str) -> Result<()> {
     println!(
         "{}",
         "Running setup script (installing Claude Code)...".blue()
     );
 
-    let mut child = Command::new("podman")
+    let add_host = rt.add_host_arg();
+    let mut child = rt
+        .command()
         .args([
             "run",
             "--rm",
@@ -234,7 +245,7 @@ fn run_setup_script(volume_name: &str, image: &str) -> Result<()> {
             "managed-by=ai-pod",
             "-v",
             &format!("{}:/home/claude:z", volume_name),
-            "--add-host=host.containers.internal:host-gateway",
+            &add_host,
             "-i",
             image,
             "sh",
@@ -262,6 +273,7 @@ fn run_setup_script(volume_name: &str, image: &str) -> Result<()> {
 
 /// Initialize a named home volume for the first time.
 async fn init_home_volume(
+    rt: &ContainerRuntime,
     config: &AppConfig,
     volume_name: &str,
     container_name: &str,
@@ -276,7 +288,8 @@ async fn init_home_volume(
     );
 
     // 1. Create the volume
-    let status = Command::new("podman")
+    let status = rt
+        .command()
         .args(["volume", "create", volume_name])
         .status()
         .context("Failed to create volume")?;
@@ -286,7 +299,8 @@ async fn init_home_volume(
 
     // 2. Create a stopped container for cp operations
     let init_container = format!("{}-init", container_name);
-    let status = Command::new("podman")
+    let status = rt
+        .command()
         .args([
             "create",
             "--name",
@@ -305,7 +319,8 @@ async fn init_home_volume(
     // 3. Copy ~/.claude.json (soft error — auth state)
     let claude_json = config.home_dir.join(".claude.json");
     if claude_json.exists() {
-        let _ = Command::new("podman")
+        let _ = rt
+            .command()
             .args([
                 "cp",
                 &claude_json.to_string_lossy(),
@@ -315,7 +330,8 @@ async fn init_home_volume(
     }
 
     // 3b. Ensure required directories exist in the volume
-    let _ = Command::new("podman")
+    let _ = rt
+        .command()
         .args([
             "run",
             "--rm",
@@ -333,10 +349,11 @@ async fn init_home_volume(
         .status();
 
     // 4. Generate and copy runtime config
-    generate_runtime_claude_md(config)?;
+    generate_runtime_claude_md(rt, config)?;
     generate_runtime_settings(config)?;
 
-    let _ = Command::new("podman")
+    let _ = rt
+        .command()
         .args([
             "cp",
             &config.runtime_settings.to_string_lossy(),
@@ -344,7 +361,8 @@ async fn init_home_volume(
         ])
         .status();
 
-    let _ = Command::new("podman")
+    let _ = rt
+        .command()
         .args([
             "cp",
             &config.runtime_claude_md.to_string_lossy(),
@@ -354,7 +372,8 @@ async fn init_home_volume(
 
     // 5. Copy host-tools binary and skill
     if let Ok(host_tools) = ensure_host_tools_binary(config).await {
-        let _ = Command::new("podman")
+        let _ = rt
+            .command()
             .args([
                 "cp",
                 host_tools.to_str().unwrap(),
@@ -365,7 +384,8 @@ async fn init_home_volume(
 
     let skill_path = config.config_dir.join("skill.md");
     std::fs::write(&skill_path, SKILL_MD)?;
-    let _ = Command::new("podman")
+    let _ = rt
+        .command()
         .args([
             "cp",
             skill_path.to_str().unwrap(),
@@ -377,12 +397,10 @@ async fn init_home_volume(
         .status();
 
     // 6. Remove init container
-    let _ = Command::new("podman")
-        .args(["rm", &init_container])
-        .status();
+    let _ = rt.command().args(["rm", &init_container]).status();
 
     // 7. Run setup script — installs Claude
-    run_setup_script(volume_name, image)?;
+    run_setup_script(rt, volume_name, image)?;
 
     let _ = (project_id, api_key); // used via env vars at runtime
 
@@ -394,6 +412,7 @@ async fn init_home_volume(
 /// Re-apply runtime config and re-run setup after a rebuild.
 /// Does NOT wipe the volume — auth state is preserved.
 async fn reseed_home_volume(
+    rt: &ContainerRuntime,
     config: &AppConfig,
     volume_name: &str,
     container_name: &str,
@@ -409,7 +428,8 @@ async fn reseed_home_volume(
 
     // 1. Create a stopped container for cp operations
     let init_container = format!("{}-init", container_name);
-    let status = Command::new("podman")
+    let status = rt
+        .command()
         .args([
             "create",
             "--name",
@@ -426,7 +446,8 @@ async fn reseed_home_volume(
     }
 
     // 2. Ensure required directories exist in the volume
-    let _ = Command::new("podman")
+    let _ = rt
+        .command()
         .args([
             "run",
             "--rm",
@@ -444,10 +465,11 @@ async fn reseed_home_volume(
         .status();
 
     // 2b. Regenerate and copy runtime config (refreshes hooks + permissions)
-    generate_runtime_claude_md(config)?;
+    generate_runtime_claude_md(rt, config)?;
     generate_runtime_settings(config)?;
 
-    let _ = Command::new("podman")
+    let _ = rt
+        .command()
         .args([
             "cp",
             &config.runtime_settings.to_string_lossy(),
@@ -455,7 +477,8 @@ async fn reseed_home_volume(
         ])
         .status();
 
-    let _ = Command::new("podman")
+    let _ = rt
+        .command()
         .args([
             "cp",
             &config.runtime_claude_md.to_string_lossy(),
@@ -465,7 +488,8 @@ async fn reseed_home_volume(
 
     // 3. Copy host-tools binary and skill
     if let Ok(host_tools) = ensure_host_tools_binary(config).await {
-        let _ = Command::new("podman")
+        let _ = rt
+            .command()
             .args([
                 "cp",
                 host_tools.to_str().unwrap(),
@@ -476,7 +500,8 @@ async fn reseed_home_volume(
 
     let skill_path = config.config_dir.join("skill.md");
     std::fs::write(&skill_path, SKILL_MD)?;
-    let _ = Command::new("podman")
+    let _ = rt
+        .command()
         .args([
             "cp",
             skill_path.to_str().unwrap(),
@@ -488,12 +513,10 @@ async fn reseed_home_volume(
         .status();
 
     // 4. Remove init container
-    let _ = Command::new("podman")
-        .args(["rm", &init_container])
-        .status();
+    let _ = rt.command().args(["rm", &init_container]).status();
 
     // 5. Run setup script — updates Claude
-    run_setup_script(volume_name, image)?;
+    run_setup_script(rt, volume_name, image)?;
 
     let _ = (project_id, api_key); // used via env vars at runtime
 
@@ -503,6 +526,7 @@ async fn reseed_home_volume(
 }
 
 pub async fn launch_container(
+    rt: &ContainerRuntime,
     config: &AppConfig,
     workspace: &Path,
     rebuild: bool,
@@ -517,31 +541,33 @@ pub async fn launch_container(
 
     // On rebuild: stop all existing containers for this workspace and reseed the volume
     if rebuild {
-        for name in containers_for_prefix(&prefix, false)? {
+        for name in containers_for_prefix(rt, &prefix, false)? {
             println!(
                 "{} {}",
                 "Removing container for rebuild:".blue().bold(),
                 name
             );
-            let _ = Command::new("podman")
-                .args(["rm", "--force", &name])
-                .status();
+            let _ = rt.command().args(["rm", "--force", &name]).status();
         }
-        if volume_exists(&volume_name)? {
-            reseed_home_volume(config, &volume_name, &prefix, image, project_id, api_key).await?;
+        if volume_exists(rt, &volume_name)? {
+            reseed_home_volume(rt, config, &volume_name, &prefix, image, project_id, api_key).await?;
         }
     }
 
     // Init home volume if it doesn't exist
-    if !volume_exists(&volume_name)? {
-        init_home_volume(config, &volume_name, &prefix, image, project_id, api_key).await?;
+    if !volume_exists(rt, &volume_name)? {
+        init_home_volume(rt, config, &volume_name, &prefix, image, project_id, api_key).await?;
     }
 
     let container_name = new_container_name(workspace);
     println!("{} {}", "Starting container:".blue().bold(), container_name);
 
     let userns_arg = format!("--userns={}", userns);
-    let mut run_cmd = Command::new("podman");
+    let add_host = rt.add_host_arg();
+    let host_gw_env = format!("HOST_GATEWAY={}", rt.host_gateway());
+    let server_url_env = format!("AI_POD_SERVER_URL={}", rt.server_url());
+
+    let mut run_cmd = rt.command();
     run_cmd.args(["run", "--rm", "-it", &userns_arg]);
     run_cmd.args([
         "--name",
@@ -552,15 +578,15 @@ pub async fn launch_container(
         &format!("{}:/home/claude:z", volume_name),
         "-v",
         &format!("{}:/app:Z", workspace_str),
-        "--add-host=host.containers.internal:host-gateway",
+        &add_host,
         "-e",
-        "HOST_GATEWAY=host.containers.internal",
+        &host_gw_env,
         "-e",
         &format!("AI_POD_PROJECT_ID={}", project_id),
         "-e",
         &format!("AI_POD_API_KEY={}", api_key),
         "-e",
-        "AI_POD_SERVER_URL=http://host.containers.internal:7822",
+        &server_url_env,
     ]);
     run_cmd.args([image, "claude"]);
     run_cmd
@@ -574,6 +600,7 @@ pub async fn launch_container(
 }
 
 pub async fn run_in_container(
+    rt: &ContainerRuntime,
     config: &AppConfig,
     workspace: &Path,
     image: &str,
@@ -588,8 +615,9 @@ pub async fn run_in_container(
     let workspace_str = workspace.to_string_lossy();
 
     // Init home volume if it doesn't exist
-    if !volume_exists(&volume_name)? {
+    if !volume_exists(rt, &volume_name)? {
         init_home_volume(
+            rt,
             config,
             &volume_name,
             &container_name,
@@ -620,24 +648,23 @@ pub async fn run_in_container(
         format!("{}:/home/claude:z", volume_name),
         "-v".into(),
         format!("{}:/app:Z", workspace_str),
-        "--add-host=host.containers.internal:host-gateway".into(),
+        rt.add_host_arg(),
         "-e".into(),
-        "HOST_GATEWAY=host.containers.internal".into(),
+        format!("HOST_GATEWAY={}", rt.host_gateway()),
         "-e".into(),
         format!("AI_POD_PROJECT_ID={}", project_id),
         "-e".into(),
         format!("AI_POD_API_KEY={}", api_key),
         "-e".into(),
-        "AI_POD_SERVER_URL=http://host.containers.internal:7822".into(),
-    ]);
-    run_args.extend_from_slice(&[
+        format!("AI_POD_SERVER_URL={}", rt.server_url()),
         "--entrypoint".into(),
         command.to_string(),
         image.to_string(),
     ]);
     run_args.extend_from_slice(args);
 
-    let status = Command::new("podman")
+    let status = rt
+        .command()
         .args(&run_args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -652,8 +679,9 @@ pub async fn run_in_container(
     Ok(())
 }
 
-pub fn list_containers() -> Result<()> {
-    let output = Command::new("podman")
+pub fn list_containers(rt: &ContainerRuntime) -> Result<()> {
+    let output = rt
+        .command()
         .args([
             "ps",
             "-a",
@@ -677,9 +705,10 @@ pub fn list_containers() -> Result<()> {
     Ok(())
 }
 
-pub fn attach_container() -> Result<()> {
+pub fn attach_container(rt: &ContainerRuntime) -> Result<()> {
     // List all running claude containers with their start times
-    let output = Command::new("podman")
+    let output = rt
+        .command()
         .args([
             "ps",
             "--filter",
@@ -723,7 +752,7 @@ pub fn attach_container() -> Result<()> {
     };
 
     println!("{} {}", "Attaching to:".green(), container_name);
-    Command::new("podman")
+    rt.command()
         .args(["attach", "--detach-keys=ctrl-p,ctrl-q", &container_name])
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -734,28 +763,27 @@ pub fn attach_container() -> Result<()> {
     Ok(())
 }
 
-pub fn clean_container(workspace: &Path) -> Result<()> {
+pub fn clean_container(rt: &ContainerRuntime, workspace: &Path) -> Result<()> {
     let prefix = container_prefix(workspace);
     let volume_name = gen_volume_name(workspace);
 
-    let containers = containers_for_prefix(&prefix, false)?;
+    let containers = containers_for_prefix(rt, &prefix, false)?;
 
     if containers.is_empty() {
         println!("{}", "No containers found for this workspace.".yellow());
     } else {
         for name in &containers {
             println!("{} {}", "Removing container:".red().bold(), name);
-            let _ = Command::new("podman")
-                .args(["rm", "--force", name])
-                .status();
+            let _ = rt.command().args(["rm", "--force", name]).status();
         }
         println!("{}", "Containers removed.".green());
     }
 
     // Remove named home volume
-    if volume_exists(&volume_name)? {
+    if volume_exists(rt, &volume_name)? {
         println!("{} {}", "Removing volume:".red().bold(), volume_name);
-        let status = Command::new("podman")
+        let status = rt
+            .command()
             .args(["volume", "rm", &volume_name])
             .status()
             .context("Failed to remove volume")?;
@@ -770,9 +798,16 @@ pub fn clean_container(workspace: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::RuntimeKind;
     use crate::workspace::{container_prefix, new_container_name, volume_name};
     use std::path::Path;
     use tempfile::TempDir;
+
+    fn test_runtime() -> ContainerRuntime {
+        ContainerRuntime {
+            kind: RuntimeKind::Podman,
+        }
+    }
 
     fn make_test_config(dir: &TempDir) -> AppConfig {
         let home = dir.path().to_path_buf();
@@ -909,7 +944,8 @@ mod tests {
     fn runtime_claude_md_contains_container_preamble() {
         let dir = TempDir::new().unwrap();
         let config = make_test_config(&dir);
-        generate_runtime_claude_md(&config).unwrap();
+        let rt = test_runtime();
+        generate_runtime_claude_md(&rt, &config).unwrap();
 
         let content = std::fs::read_to_string(&config.runtime_claude_md).unwrap();
         assert!(content.contains("host.containers.internal"));
@@ -917,15 +953,30 @@ mod tests {
     }
 
     #[test]
+    fn runtime_claude_md_contains_docker_preamble() {
+        let dir = TempDir::new().unwrap();
+        let config = make_test_config(&dir);
+        let rt = ContainerRuntime {
+            kind: RuntimeKind::Docker,
+        };
+        generate_runtime_claude_md(&rt, &config).unwrap();
+
+        let content = std::fs::read_to_string(&config.runtime_claude_md).unwrap();
+        assert!(content.contains("host.docker.internal"));
+        assert!(content.contains("Docker container"));
+    }
+
+    #[test]
     fn runtime_claude_md_appends_existing_claude_md() {
         let dir = TempDir::new().unwrap();
         let config = make_test_config(&dir);
+        let rt = test_runtime();
 
         let claude_dir = config.home_dir.join(".claude");
         std::fs::create_dir_all(&claude_dir).unwrap();
         std::fs::write(config.claude_md_path(), "# My Rules\nAlways use Rust.\n").unwrap();
 
-        generate_runtime_claude_md(&config).unwrap();
+        generate_runtime_claude_md(&rt, &config).unwrap();
 
         let content = std::fs::read_to_string(&config.runtime_claude_md).unwrap();
         assert!(content.contains("host.containers.internal"));
@@ -937,7 +988,8 @@ mod tests {
     fn runtime_claude_md_without_existing_file_does_not_error() {
         let dir = TempDir::new().unwrap();
         let config = make_test_config(&dir);
-        generate_runtime_claude_md(&config).unwrap();
+        let rt = test_runtime();
+        generate_runtime_claude_md(&rt, &config).unwrap();
         assert!(config.runtime_claude_md.exists());
     }
 }

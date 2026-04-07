@@ -220,7 +220,8 @@ pub async fn cleanup_orphaned_daemons(state: &AppState) {
     for project_id in project_ids {
         // Container prefix is "claude-{project_id}" (project_id == workspace_hash)
         let filter = format!("name=^claude-{}-", project_id);
-        let output = match tokio::process::Command::new("podman")
+        let output = match state.runtime
+            .async_command()
             .args([
                 "ps",
                 "--filter",
@@ -664,6 +665,7 @@ mod tests {
             config_dir: config_dir.to_path_buf(),
             approval_lock: Arc::new(Mutex::new(())),
             daemons: Arc::new(Mutex::new(HashMap::new())),
+            runtime: crate::runtime::ContainerRuntime { kind: crate::runtime::RuntimeKind::Podman },
         }
     }
 
@@ -1210,6 +1212,7 @@ mod tests {
                 config_dir: config_dir.path().to_path_buf(),
                 approval_lock: Arc::new(Mutex::new(())),
                 daemons: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                runtime: crate::runtime::ContainerRuntime { kind: crate::runtime::RuntimeKind::Podman },
             };
 
             pre_allow(config_dir.path(), &ws1, "pwd");

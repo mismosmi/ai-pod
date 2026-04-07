@@ -4,6 +4,7 @@ mod container;
 mod credentials;
 mod daemons;
 mod image;
+mod runtime;
 mod server;
 mod update;
 mod workspace;
@@ -15,6 +16,7 @@ use std::path::Path;
 
 use cli::{AllowedAction, Cli, Command};
 use config::AppConfig;
+use runtime::ContainerRuntime;
 
 fn resolve_workspace(workdir: &Option<std::path::PathBuf>) -> Result<std::path::PathBuf> {
     match workdir {
@@ -44,7 +46,7 @@ fn init_project(workspace: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn launch_flow(cli: &Cli) -> Result<()> {
+async fn launch_flow(cli: &Cli, rt: &ContainerRuntime) -> Result<()> {
     let config = AppConfig::new()?;
     config.init()?;
 
@@ -72,7 +74,7 @@ async fn launch_flow(cli: &Cli) -> Result<()> {
 
     // 4. Build image if needed
     let image = image::image_name(&workspace);
-    image::ensure_image(&config, &dockerfile, &image, cli.rebuild)?;
+    image::ensure_image(rt, &config, &dockerfile, &image, cli.rebuild)?;
 
     // 5. Ensure shared server is running
     server::lifecycle::ensure_shared_server(&config)?;
@@ -89,6 +91,7 @@ async fn launch_flow(cli: &Cli) -> Result<()> {
 
     // 9. Launch container
     container::launch_container(
+        rt,
         &config,
         &workspace,
         cli.rebuild,
@@ -115,84 +118,12 @@ async fn main() -> Result<()> {
         .await;
     }
 
+    // Commands that don't need a container runtime
     match &cli.command {
         Some(Command::Init { workdir }) => {
             let workspace = resolve_workspace(workdir)?;
             init_project(&workspace)?;
-        }
-        Some(Command::Build) => {
-            let config = AppConfig::new()?;
-            config.init()?;
-            let workspace = resolve_workspace(&cli.workdir)?;
-            let dockerfile = workspace.join(image::DOCKERFILE_NAME);
-            if !dockerfile.exists() {
-                anyhow::bail!(
-                    "No {} found in {}.\nRun `ai-pod init` to create one.",
-                    image::DOCKERFILE_NAME,
-                    workspace.display()
-                );
-            }
-            let image = image::image_name(&workspace);
-            image::ensure_image(&config, &dockerfile, &image, cli.rebuild)?;
-        }
-        Some(Command::Serve) => {
-            let config = AppConfig::new()?;
-            config.init()?;
-            server::run_server(server::lifecycle::MCP_PORT, config).await?;
-        }
-        Some(Command::Attach) => {
-            container::attach_container()?;
-        }
-        Some(Command::List) => {
-            container::list_containers()?;
-        }
-        Some(Command::Clean { workdir }) => {
-            let workspace = resolve_workspace(workdir)?;
-            container::clean_container(&workspace)?;
-        }
-        Some(Command::Run { command, args }) => {
-            let config = AppConfig::new()?;
-            config.init()?;
-            let workspace = resolve_workspace(&cli.workdir)?;
-            let dockerfile = workspace.join(image::DOCKERFILE_NAME);
-            if !dockerfile.exists() {
-                anyhow::bail!(
-                    "No {} found in {}.\nRun `ai-pod init` to create one.",
-                    image::DOCKERFILE_NAME,
-                    workspace.display()
-                );
-            }
-            if !cli.no_credential_check {
-                if !credentials::check_credentials(&workspace, &config)? {
-                    println!("{}", "Aborted.".red());
-                    return Ok(());
-                }
-            }
-            let image = image::image_name(&workspace);
-            image::ensure_image(&config, &dockerfile, &image, cli.rebuild)?;
-
-            server::lifecycle::ensure_shared_server(&config)?;
-            server::lifecycle::check_server_version().await?;
-            let project_id = workspace::workspace_hash(&workspace);
-            let state = server::lifecycle::get_or_create_project_state(&config, &workspace)?;
-            server::lifecycle::reload_config().await?;
-
-            container::run_in_container(
-                &config,
-                &workspace,
-                &image,
-                &project_id,
-                &state.api_key,
-                command,
-                args,
-                &cli.userns,
-            )
-            .await?;
-        }
-        Some(Command::Daemons) => {
-            let config = AppConfig::new()?;
-            let workspace = resolve_workspace(&cli.workdir)?;
-            daemons::run_daemons(&config, &workspace).await?;
+            return Ok(());
         }
         Some(Command::Allowed { action }) => {
             let config = AppConfig::new()?;
@@ -226,10 +157,94 @@ async fn main() -> Result<()> {
                     println!("Removed: {}", command);
                 }
             }
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // Detect container runtime (podman preferred, docker fallback)
+    let rt = ContainerRuntime::detect()?;
+
+    match &cli.command {
+        Some(Command::Build) => {
+            let config = AppConfig::new()?;
+            config.init()?;
+            let workspace = resolve_workspace(&cli.workdir)?;
+            let dockerfile = workspace.join(image::DOCKERFILE_NAME);
+            if !dockerfile.exists() {
+                anyhow::bail!(
+                    "No {} found in {}.\nRun `ai-pod init` to create one.",
+                    image::DOCKERFILE_NAME,
+                    workspace.display()
+                );
+            }
+            let image = image::image_name(&workspace);
+            image::ensure_image(&rt, &config, &dockerfile, &image, cli.rebuild)?;
+        }
+        Some(Command::Serve) => {
+            let config = AppConfig::new()?;
+            config.init()?;
+            server::run_server(server::lifecycle::MCP_PORT, config, rt).await?;
+        }
+        Some(Command::Attach) => {
+            container::attach_container(&rt)?;
+        }
+        Some(Command::List) => {
+            container::list_containers(&rt)?;
+        }
+        Some(Command::Clean { workdir }) => {
+            let workspace = resolve_workspace(workdir)?;
+            container::clean_container(&rt, &workspace)?;
+        }
+        Some(Command::Run { command, args }) => {
+            let config = AppConfig::new()?;
+            config.init()?;
+            let workspace = resolve_workspace(&cli.workdir)?;
+            let dockerfile = workspace.join(image::DOCKERFILE_NAME);
+            if !dockerfile.exists() {
+                anyhow::bail!(
+                    "No {} found in {}.\nRun `ai-pod init` to create one.",
+                    image::DOCKERFILE_NAME,
+                    workspace.display()
+                );
+            }
+            if !cli.no_credential_check {
+                if !credentials::check_credentials(&workspace, &config)? {
+                    println!("{}", "Aborted.".red());
+                    return Ok(());
+                }
+            }
+            let image = image::image_name(&workspace);
+            image::ensure_image(&rt, &config, &dockerfile, &image, cli.rebuild)?;
+
+            server::lifecycle::ensure_shared_server(&config)?;
+            server::lifecycle::check_server_version().await?;
+            let project_id = workspace::workspace_hash(&workspace);
+            let state = server::lifecycle::get_or_create_project_state(&config, &workspace)?;
+            server::lifecycle::reload_config().await?;
+
+            container::run_in_container(
+                &rt,
+                &config,
+                &workspace,
+                &image,
+                &project_id,
+                &state.api_key,
+                command,
+                args,
+                &cli.userns,
+            )
+            .await?;
+        }
+        Some(Command::Daemons) => {
+            let config = AppConfig::new()?;
+            let workspace = resolve_workspace(&cli.workdir)?;
+            daemons::run_daemons(&config, &workspace).await?;
         }
         None => {
-            launch_flow(&cli).await?;
+            launch_flow(&cli, &rt).await?;
         }
+        _ => unreachable!(),
     }
 
     Ok(())
