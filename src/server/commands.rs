@@ -20,6 +20,19 @@ pub enum CheckResult {
     PermissionTimeout,
 }
 
+/// Build the osascript Command for requesting user approval on macOS.
+/// Not cfg-gated so that tests can verify the command structure on all platforms.
+fn build_approval_command(command: &str, project_name: &str) -> std::process::Command {
+    let script = r#"on run argv
+    set cmd to item 1 of argv
+    set projName to item 2 of argv
+    display dialog ("Run command:" & linefeed & cmd) buttons {"Allow Once", "Always Allow", "Deny"} default button "Deny" with title ("ai-pod: " & projName)
+end run"#;
+    let mut c = std::process::Command::new("osascript");
+    c.arg("-e").arg(script).arg("--").arg(command).arg(project_name);
+    c
+}
+
 pub async fn request_approval(
     state: &AppState,
     command: &str,
@@ -56,17 +69,9 @@ pub async fn request_approval(
         }
         #[cfg(target_os = "macos")]
         {
-            let script = format!(
-                r#"display dialog "Run command:\n{}" buttons {{"Allow Once","Always Allow","Deny"}} default button "Deny" with title "ai-pod: {}""#,
-                command.replace('"', "\\\""),
-                project_name.replace('"', "\\\""),
-            );
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
-                let output = std::process::Command::new("osascript")
-                    .arg("-e")
-                    .arg(&script)
-                    .output();
+                let output = build_approval_command(&command, &project_name).output();
                 let _ = tx.send(output);
             });
             match rx.recv_timeout(std::time::Duration::from_secs(60)) {
@@ -161,4 +166,69 @@ pub fn get_allowed_commands(state: &AppState, workspace: &Path) -> Vec<String> {
     let state_file = state.config_dir.join(format!("{}.json", hash));
     let project_state = ProjectState::load(&state_file);
     project_state.allowed_commands
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_command_does_not_interpolate_user_input() {
+        let cmd = build_approval_command(
+            r#"echo "injected" & do shell script "evil""#,
+            "my-project",
+        );
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(args.len(), 5);
+        assert_eq!(args[0], "-e");
+        let script = args[1].to_str().unwrap();
+        assert!(!script.contains("injected"));
+        assert!(!script.contains("evil"));
+        assert!(script.contains("on run argv"));
+        assert_eq!(args[2], "--");
+        assert_eq!(args[3], r#"echo "injected" & do shell script "evil""#);
+        assert_eq!(args[4], "my-project");
+    }
+
+    #[test]
+    fn approval_command_handles_empty_strings() {
+        let cmd = build_approval_command("", "");
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(args.len(), 5);
+        assert_eq!(args[3], "");
+        assert_eq!(args[4], "");
+    }
+
+    #[test]
+    fn approval_command_handles_backslashes_and_quotes() {
+        let cmd = build_approval_command(
+            r#"echo "hello\" & do shell script "whoami""#,
+            r#"proj\"name"#,
+        );
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        let script = args[1].to_str().unwrap();
+        assert!(!script.contains("whoami"));
+        assert!(!script.contains("hello"));
+        assert_eq!(args[3], r#"echo "hello\" & do shell script "whoami""#);
+        assert_eq!(args[4], r#"proj\"name"#);
+    }
+
+    #[test]
+    fn approval_command_handles_newlines_and_control_chars() {
+        let cmd = build_approval_command("line1\nline2", "proj\tname");
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        let script = args[1].to_str().unwrap();
+        assert!(!script.contains("line1"));
+        assert_eq!(args[3], "line1\nline2");
+        assert_eq!(args[4], "proj\tname");
+    }
+
+    #[test]
+    fn approval_command_handles_dash_prefixed_args() {
+        let cmd = build_approval_command("-e malicious_script", "--version");
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(args[2], "--");
+        assert_eq!(args[3], "-e malicious_script");
+        assert_eq!(args[4], "--version");
+    }
 }
