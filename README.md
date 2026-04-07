@@ -1,8 +1,8 @@
 # ai-pod
 
-**Claude Code inside isolated Podman containers — safe, persistent, and project-aware.**
+**Claude Code inside isolated containers — safe, persistent, and project-aware.**
 
-ai-pod manages per-workspace Podman containers that run Claude Code. Each workspace gets a dedicated container, a shared background server bridges host interaction, and your personal Claude settings follow you everywhere.
+ai-pod manages per-workspace containers that run Claude Code. It works with **Podman** (preferred) or **Docker** — whichever is available on your system. Each workspace gets a dedicated container, a shared background server bridges host interaction, and your personal Claude settings follow you everywhere.
 
 ---
 
@@ -15,14 +15,14 @@ ai-pod manages per-workspace Podman containers that run Claude Code. Each worksp
 - **Settings & CLAUDE.md merging** — your host `~/.claude/settings.json` and `CLAUDE.md` are merged with container defaults at launch
 - **Host command execution** — the bundled `host-tools` binary lets Claude run commands on the host machine; every command requires your explicit approval with a persistent allowlist
 - **Desktop notifications** — a Stop hook fires `host-tools notify-user` when a Claude session ends so you know when to come back
-- **Transparent host networking** — containers reach host services at `host.containers.internal`; no manual port mapping needed
+- **Transparent host networking** — containers reach host services at `host.containers.internal` (Podman) or `host.docker.internal` (Docker); no manual port mapping needed
 - **Auto-update checks** — silently checks for new releases on startup and notifies you when one is available
 
 ---
 
 ## Requirements
 
-- [Podman](https://podman.io/)
+- [Podman](https://podman.io/) or [Docker](https://www.docker.com/) (Podman is preferred; Docker is used as a fallback if Podman is not found)
 - Rust (to build from source)
 
 ---
