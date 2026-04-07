@@ -157,7 +157,7 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
         .route("/daemon/output", post(daemons::daemon_output_handler))
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
     println!("Shared server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
