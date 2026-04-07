@@ -18,6 +18,14 @@ pub struct Cli {
     /// Override workspace directory (default: cwd)
     #[arg(long)]
     pub workdir: Option<PathBuf>,
+
+    /// Disable --userns=keep-id (enabled by default to map host UID into container)
+    #[arg(long)]
+    pub no_userns: bool,
+
+    /// Extra arguments to pass to `podman run`
+    #[arg(long = "podman-args", value_delimiter = ' ', num_args = 1..)]
+    pub podman_args: Vec<String>,
 }
 
 #[derive(Subcommand)]
