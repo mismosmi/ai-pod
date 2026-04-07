@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use std::process::Command;
 
 use crate::config::AppConfig;
+use crate::runtime::ContainerRuntime;
 
 pub const DOCKERFILE_NAME: &str = "ai-pod.Dockerfile";
 
@@ -35,25 +35,27 @@ pub fn image_name(workspace: &Path) -> String {
     format!("{}-{}", label, short_hash)
 }
 
-fn image_exists(image: &str) -> Result<bool> {
-    let status = Command::new("podman")
+fn image_exists(rt: &ContainerRuntime, image: &str) -> Result<bool> {
+    let status = rt
+        .command()
         .args(["image", "exists", image])
         .status()
-        .context("Failed to run podman")?;
+        .context(format!("Failed to run {}", rt.cmd()))?;
     Ok(status.success())
 }
 
-pub fn needs_build(image: &str, force: bool) -> Result<bool> {
+pub fn needs_build(rt: &ContainerRuntime, image: &str, force: bool) -> Result<bool> {
     if force {
         return Ok(true);
     }
-    Ok(!image_exists(image)?)
+    Ok(!image_exists(rt, image)?)
 }
 
-pub fn build_image(config: &AppConfig, dockerfile: &Path, image: &str) -> Result<()> {
+pub fn build_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path, image: &str) -> Result<()> {
     println!("{}", "Building container image...".blue().bold());
 
-    let status = Command::new("podman")
+    let status = rt
+        .command()
         .args([
             "build",
             "-t",
@@ -63,19 +65,19 @@ pub fn build_image(config: &AppConfig, dockerfile: &Path, image: &str) -> Result
             &config.config_dir.to_string_lossy(),
         ])
         .status()
-        .context("Failed to run podman build")?;
+        .context(format!("Failed to run {} build", rt.cmd()))?;
 
     if !status.success() {
-        anyhow::bail!("podman build failed");
+        anyhow::bail!("{} build failed", rt.cmd());
     }
 
     println!("{}", "Image built successfully.".green().bold());
     Ok(())
 }
 
-pub fn ensure_image(config: &AppConfig, dockerfile: &Path, image: &str, force: bool) -> Result<()> {
-    if needs_build(image, force)? {
-        build_image(config, dockerfile, image)?;
+pub fn ensure_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path, image: &str, force: bool) -> Result<()> {
+    if needs_build(rt, image, force)? {
+        build_image(rt, config, dockerfile, image)?;
     } else {
         println!("{}", "Container image is up to date.".green());
     }
@@ -138,6 +140,8 @@ mod tests {
 
     #[test]
     fn needs_build_returns_true_when_force() {
-        assert!(needs_build("any-image", true).unwrap());
+        use crate::runtime::{ContainerRuntime, RuntimeKind};
+        let rt = ContainerRuntime { kind: RuntimeKind::Podman };
+        assert!(needs_build(&rt, "any-image", true).unwrap());
     }
 }

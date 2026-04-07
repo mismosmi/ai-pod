@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::config::AppConfig;
+use crate::runtime::ContainerRuntime;
 use daemons::DaemonEntry;
 use lifecycle::ProjectState;
 
@@ -28,6 +29,7 @@ pub struct AppState {
     pub config_dir: PathBuf,
     pub approval_lock: Arc<Mutex<()>>,
     pub daemons: Arc<Mutex<HashMap<String, DaemonEntry>>>,
+    pub runtime: ContainerRuntime,
 }
 
 async fn health_handler() -> &'static str {
@@ -68,7 +70,7 @@ async fn reload_handler(State(state): State<AppState>) -> &'static str {
     "reloaded"
 }
 
-pub async fn run_server(port: u16, config: AppConfig) -> anyhow::Result<()> {
+pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> anyhow::Result<()> {
     // Scan existing project state files to pre-populate the projects map
     let mut projects: HashMap<String, ProjectInfo> = HashMap::new();
 
@@ -104,6 +106,7 @@ pub async fn run_server(port: u16, config: AppConfig) -> anyhow::Result<()> {
         config_dir: config.config_dir.clone(),
         approval_lock: Arc::new(Mutex::new(())),
         daemons: Arc::new(Mutex::new(HashMap::new())),
+        runtime: rt,
     };
 
     // Background task: kill daemons when their project has no running containers
@@ -118,11 +121,13 @@ pub async fn run_server(port: u16, config: AppConfig) -> anyhow::Result<()> {
 
     // Background task: shut down server when all claude-* containers have stopped
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let shutdown_rt = state.runtime.clone();
     tokio::spawn(async move {
         // Grace period: allow container to start before first check
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         loop {
-            let output = tokio::process::Command::new("podman")
+            let output = shutdown_rt
+                .async_command()
                 .args(["ps", "--filter", "label=managed-by=ai-pod", "--format", "{{.Names}}"])
                 .output()
                 .await;
