@@ -514,9 +514,9 @@
                 >
             </h1>
             <p>
-                ai-pod runs Claude Code inside isolated Podman containers so
-                your AI has exactly the tools it needs — and nothing it
-                shouldn't touch.
+                ai-pod runs Claude Code inside isolated containers (Podman
+                or Docker) so your AI has exactly the tools it needs —
+                and nothing it shouldn't touch.
             </p>
             <div class="hero-actions">
                 <a href="#usage" class="btn-primary">Get started</a>
@@ -558,9 +558,9 @@
                         <div class="feature-icon">📦</div>
                         <h3>Per-workspace isolation</h3>
                         <p>
-                            Every directory gets a dedicated Podman container,
-                            named by a hash of its path. Projects can't
-                            interfere with each other.
+                            Every directory gets a dedicated container
+                            (Podman or Docker), named by a hash of its path.
+                            Projects can't interfere with each other.
                         </p>
                     </div>
 
@@ -634,9 +634,10 @@
                         <h3>Transparent host networking</h3>
                         <p>
                             Containers reach host services at
-                            <code>host.containers.internal</code>, so Claude can
-                            hit your local dev server, database, or API without
-                            any manual port mapping.
+                            <code>host.containers.internal</code> (Podman) or
+                            <code>host.docker.internal</code> (Docker), so
+                            Claude can hit your local dev server, database, or
+                            API without any manual port mapping.
                         </p>
                     </div>
 
@@ -873,9 +874,9 @@ RUN npm install -g @my-org/mcp-server</pre>
                             <div>
                                 <strong>Container-level isolation</strong>
                                 <span
-                                    >Each project lives in its own Podman
-                                    container. Compromised dependencies in one
-                                    project can't reach another.</span
+                                    >Each project lives in its own container.
+                                    Compromised dependencies in one project
+                                    can't reach another.</span
                                 >
                             </div>
                         </li>
@@ -893,11 +894,12 @@ RUN npm install -g @my-org/mcp-server</pre>
                         <li>
                             <span class="icon">✓</span>
                             <div>
-                                <strong>Rootless containers via Podman</strong>
+                                <strong>Rootless containers</strong>
                                 <span
-                                    >No daemon running as root. Podman's
-                                    rootless mode keeps the blast radius small
-                                    even if something goes wrong.</span
+                                    >Works with Podman's rootless mode out of
+                                    the box, and supports Docker too. Keeps
+                                    the blast radius small even if something
+                                    goes wrong.</span
                                 >
                             </div>
                         </li>
@@ -913,7 +915,7 @@ RUN npm install -g @my-org/mcp-server</pre>
             <div class="container">
                 <div class="section-label">Get started</div>
                 <h2>One line to install</h2>
-                <p>Works on Linux and macOS. Requires Podman.</p>
+                <p>Works on Linux and macOS. Requires Podman or Docker.</p>
                 <div class="install-box" style="margin: 0 auto 2rem">
                     <span class="prompt">$</span>
                     <code
