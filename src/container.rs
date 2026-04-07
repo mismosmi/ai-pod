@@ -510,7 +510,6 @@ pub async fn launch_container(
     project_id: &str,
     api_key: &str,
     no_userns: bool,
-    extra_podman_args: &[String],
 ) -> Result<()> {
     let prefix = container_prefix(workspace);
     let volume_name = gen_volume_name(workspace);
@@ -565,7 +564,6 @@ pub async fn launch_container(
         "-e",
         "AI_POD_SERVER_URL=http://host.containers.internal:7822",
     ]);
-    run_cmd.args(extra_podman_args);
     run_cmd.args([image, "claude"]);
     run_cmd
         .stdin(Stdio::inherit())
@@ -586,7 +584,6 @@ pub async fn run_in_container(
     command: &str,
     args: &[String],
     no_userns: bool,
-    extra_podman_args: &[String],
 ) -> Result<()> {
     let container_name = new_container_name(workspace);
     let volume_name = gen_volume_name(workspace);
@@ -637,7 +634,6 @@ pub async fn run_in_container(
         "-e".into(),
         "AI_POD_SERVER_URL=http://host.containers.internal:7822".into(),
     ]);
-    run_args.extend_from_slice(extra_podman_args);
     run_args.extend_from_slice(&[
         "--entrypoint".into(),
         command.to_string(),
