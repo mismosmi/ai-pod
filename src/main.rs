@@ -95,6 +95,8 @@ async fn launch_flow(cli: &Cli) -> Result<()> {
         &image,
         &project_id,
         &state.api_key,
+        cli.no_userns,
+        &cli.podman_args,
     )
     .await?;
 
@@ -184,6 +186,8 @@ async fn main() -> Result<()> {
                 &state.api_key,
                 command,
                 args,
+                cli.no_userns,
+                &cli.podman_args,
             )
             .await?;
         }
