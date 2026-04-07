@@ -95,6 +95,7 @@ async fn launch_flow(cli: &Cli) -> Result<()> {
         &image,
         &project_id,
         &state.api_key,
+        cli.agent,
     )
     .await?;
 
@@ -184,6 +185,7 @@ async fn main() -> Result<()> {
                 &state.api_key,
                 command,
                 args,
+                cli.agent,
             )
             .await?;
         }

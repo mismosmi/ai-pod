@@ -70,6 +70,7 @@ ai-pod --workdir /path/to/project
 | `--workdir <PATH>` | Use a specific workspace directory (default: cwd) |
 | `--rebuild` | Force a rebuild of the container image |
 | `--no-credential-check` | Skip scanning the workspace for credential files |
+| `--agent <claude\|opencode>` | Coding agent to run (default: `claude`) |
 
 ### Subcommands
 
@@ -88,6 +89,44 @@ ai-pod --workdir /path/to/project
 ai-pod run claude resume   # resume the last Claude session
 ai-pod run bash            # open a bash shell in the container
 ```
+
+---
+
+## Using a local model with OpenCode
+
+You can use [OpenCode](https://github.com/opencode-ai/opencode) instead of Claude Code to work with local or third-party models. OpenCode supports Ollama, OpenAI, Groq, and many other providers out of the box.
+
+### Example: Ollama with a local model
+
+1. Start your local model with Ollama:
+
+```sh
+ollama pull llama3
+ollama serve            # listens on localhost:11434
+```
+
+2. Launch ai-pod with OpenCode:
+
+```sh
+ai-pod --agent opencode
+```
+
+3. Inside the container, configure OpenCode to use your local model by creating `.opencode.json` in your project or at `~/.opencode.json`:
+
+```json
+{
+  "providers": {
+    "local": { "disabled": false }
+  },
+  "agents": {
+    "coder": { "model": "ollama/llama3" }
+  }
+}
+```
+
+Set `LOCAL_ENDPOINT=http://host.containers.internal:11434` as an environment variable inside the container, or configure it in `.opencode.json`. Use `host.containers.internal` instead of `localhost` to reach host services from the container.
+
+> **Note:** OpenCode is installed automatically when you use `--agent opencode`. Your workspace is mounted at `/app` just like with Claude Code, and the host-tools binary is available for host interaction.
 
 ---
 

@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::cli::Agent;
 use crate::config::AppConfig;
 use crate::workspace::{container_prefix, new_container_name, volume_name as gen_volume_name};
 
@@ -18,10 +19,17 @@ Working directory: /app
 "#;
 
 /// Setup script: installs Claude Code.
-const SETUP_SCRIPT: &str = r#"#!/bin/sh
+const SETUP_SCRIPT_CLAUDE: &str = r#"#!/bin/sh
 set -e
 export PATH="$HOME/.local/bin:$PATH"
 curl -fsSL https://claude.ai/install.sh | bash
+"#;
+
+/// Setup script: installs OpenCode.
+const SETUP_SCRIPT_OPENCODE: &str = r#"#!/bin/sh
+set -e
+export PATH="$HOME/.local/bin:$PATH"
+curl -fsSL https://raw.githubusercontent.com/opencode-ai/opencode/refs/heads/main/install | bash
 "#;
 
 const SKILL_MD: &str = r#"---
@@ -217,12 +225,13 @@ async fn ensure_host_tools_binary(config: &AppConfig) -> Result<PathBuf> {
 }
 
 /// Run the setup script inside a temporary container with the home volume mounted.
-/// Installs Claude Code.
-fn run_setup_script(volume_name: &str, image: &str) -> Result<()> {
-    println!(
-        "{}",
-        "Running setup script (installing Claude Code)...".blue()
-    );
+/// Installs the selected coding agent.
+fn run_setup_script(volume_name: &str, image: &str, agent: Agent) -> Result<()> {
+    let (label, script) = match agent {
+        Agent::Claude => ("Claude Code", SETUP_SCRIPT_CLAUDE),
+        Agent::Opencode => ("OpenCode", SETUP_SCRIPT_OPENCODE),
+    };
+    println!("{}", format!("Running setup script (installing {})...", label).blue());
 
     let mut child = Command::new("podman")
         .args([
@@ -248,7 +257,7 @@ fn run_setup_script(volume_name: &str, image: &str) -> Result<()> {
         .stdin
         .as_mut()
         .unwrap()
-        .write_all(SETUP_SCRIPT.as_bytes())
+        .write_all(script.as_bytes())
         .context("Failed to write setup script")?;
 
     let status = child.wait().context("Setup script container failed")?;
@@ -268,6 +277,7 @@ async fn init_home_volume(
     image: &str,
     project_id: &str,
     api_key: &str,
+    agent: Agent,
 ) -> Result<()> {
     println!(
         "{} {}",
@@ -381,8 +391,8 @@ async fn init_home_volume(
         .args(["rm", &init_container])
         .status();
 
-    // 7. Run setup script — installs Claude
-    run_setup_script(volume_name, image)?;
+    // 7. Run setup script — installs the selected agent
+    run_setup_script(volume_name, image, agent)?;
 
     let _ = (project_id, api_key); // used via env vars at runtime
 
@@ -400,6 +410,7 @@ async fn reseed_home_volume(
     image: &str,
     project_id: &str,
     api_key: &str,
+    agent: Agent,
 ) -> Result<()> {
     println!(
         "{} {}",
@@ -492,8 +503,8 @@ async fn reseed_home_volume(
         .args(["rm", &init_container])
         .status();
 
-    // 5. Run setup script — updates Claude
-    run_setup_script(volume_name, image)?;
+    // 5. Run setup script — updates the selected agent
+    run_setup_script(volume_name, image, agent)?;
 
     let _ = (project_id, api_key); // used via env vars at runtime
 
@@ -509,6 +520,7 @@ pub async fn launch_container(
     image: &str,
     project_id: &str,
     api_key: &str,
+    agent: Agent,
 ) -> Result<()> {
     let prefix = container_prefix(workspace);
     let volume_name = gen_volume_name(workspace);
@@ -527,16 +539,21 @@ pub async fn launch_container(
                 .status();
         }
         if volume_exists(&volume_name)? {
-            reseed_home_volume(config, &volume_name, &prefix, image, project_id, api_key).await?;
+            reseed_home_volume(config, &volume_name, &prefix, image, project_id, api_key, agent)
+                .await?;
         }
     }
 
     // Init home volume if it doesn't exist
     if !volume_exists(&volume_name)? {
-        init_home_volume(config, &volume_name, &prefix, image, project_id, api_key).await?;
+        init_home_volume(config, &volume_name, &prefix, image, project_id, api_key, agent).await?;
     }
 
     let container_name = new_container_name(workspace);
+    let entrypoint = match agent {
+        Agent::Claude => "claude",
+        Agent::Opencode => "opencode",
+    };
     println!("{} {}", "Starting container:".blue().bold(), container_name);
 
     Command::new("podman")
@@ -562,7 +579,7 @@ pub async fn launch_container(
             "-e",
             "AI_POD_SERVER_URL=http://host.containers.internal:7822",
             image,
-            "claude",
+            entrypoint,
         ])
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -581,6 +598,7 @@ pub async fn run_in_container(
     api_key: &str,
     command: &str,
     args: &[String],
+    agent: Agent,
 ) -> Result<()> {
     let container_name = new_container_name(workspace);
     let volume_name = gen_volume_name(workspace);
@@ -595,6 +613,7 @@ pub async fn run_in_container(
             image,
             project_id,
             api_key,
+            agent,
         )
         .await?;
     }

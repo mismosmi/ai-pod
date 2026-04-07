@@ -1,5 +1,15 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
+
+/// Which coding agent to run inside the container.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum Agent {
+    /// Claude Code (default)
+    #[default]
+    Claude,
+    /// OpenCode — supports local and third-party models
+    Opencode,
+}
 
 #[derive(Parser)]
 #[command(name = "claude-container", about = "Run Claude Code inside Podman containers")]
@@ -18,6 +28,10 @@ pub struct Cli {
     /// Override workspace directory (default: cwd)
     #[arg(long)]
     pub workdir: Option<PathBuf>,
+
+    /// Coding agent to run: claude (default) or opencode
+    #[arg(long, value_enum, default_value_t = Agent::Claude)]
+    pub agent: Agent,
 }
 
 #[derive(Subcommand)]
