@@ -488,9 +488,94 @@
                 border-top: 1px solid var(--border);
                 margin: 0;
             }
+
+            /* ── ANNOUNCEMENT BANNER ── */
+            .announce-banner {
+                background: linear-gradient(90deg, #1a1040 0%, #0d2a3a 50%, #1a1040 100%);
+                border-bottom: 1px solid var(--border);
+                padding: 0.55rem 2rem;
+                text-align: center;
+                font-size: 0.85rem;
+                font-weight: 600;
+                color: var(--text);
+                overflow: hidden;
+                position: relative;
+            }
+
+            .announce-banner::before {
+                content: "";
+                position: absolute;
+                top: 0;
+                left: -100%;
+                width: 60%;
+                height: 100%;
+                background: linear-gradient(
+                    90deg,
+                    transparent,
+                    rgba(124, 106, 247, 0.12),
+                    rgba(94, 234, 212, 0.10),
+                    transparent
+                );
+                animation: shimmer 3.5s ease-in-out infinite;
+            }
+
+            @keyframes shimmer {
+                0% { left: -100%; }
+                100% { left: 200%; }
+            }
+
+            .announce-inner {
+                display: inline-flex;
+                align-items: center;
+                gap: 0.6rem;
+                animation: slideUp 0.6s ease-out both;
+            }
+
+            @keyframes slideUp {
+                from {
+                    opacity: 0;
+                    transform: translateY(12px);
+                }
+                to {
+                    opacity: 1;
+                    transform: translateY(0);
+                }
+            }
+
+            .announce-new {
+                display: inline-block;
+                background: linear-gradient(135deg, var(--accent), var(--accent2));
+                color: #0d0f14;
+                font-size: 0.68rem;
+                font-weight: 800;
+                letter-spacing: 0.08em;
+                text-transform: uppercase;
+                padding: 0.15rem 0.55rem;
+                border-radius: 4px;
+            }
+
+            .docker-icon {
+                display: inline-block;
+                font-size: 1.1rem;
+                animation: bobFloat 2s ease-in-out infinite;
+            }
+
+            @keyframes bobFloat {
+                0%, 100% { transform: translateY(0); }
+                50% { transform: translateY(-3px); }
+            }
         </style>
     </head>
     <body>
+        <!-- ANNOUNCEMENT BANNER -->
+        <div class="announce-banner">
+            <span class="announce-inner">
+                <span class="announce-new">New</span>
+                <span class="docker-icon">🐳</span>
+                Now also supports Docker — Podman or Docker, your choice
+            </span>
+        </div>
+
         <!-- NAV -->
         <nav>
             <span class="nav-logo"><span>ai</span>-pod</span>
