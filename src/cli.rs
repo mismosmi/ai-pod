@@ -19,9 +19,9 @@ pub struct Cli {
     #[arg(long)]
     pub workdir: Option<PathBuf>,
 
-    /// Disable --userns=keep-id (enabled by default to map host UID into container)
-    #[arg(long)]
-    pub no_userns: bool,
+    /// Value for --userns passed to podman run (default: keep-id)
+    #[arg(long, default_value = "keep-id")]
+    pub userns: String,
 }
 
 #[derive(Subcommand)]

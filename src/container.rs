@@ -509,7 +509,7 @@ pub async fn launch_container(
     image: &str,
     project_id: &str,
     api_key: &str,
-    no_userns: bool,
+    userns: &str,
 ) -> Result<()> {
     let prefix = container_prefix(workspace);
     let volume_name = gen_volume_name(workspace);
@@ -540,11 +540,9 @@ pub async fn launch_container(
     let container_name = new_container_name(workspace);
     println!("{} {}", "Starting container:".blue().bold(), container_name);
 
+    let userns_arg = format!("--userns={}", userns);
     let mut run_cmd = Command::new("podman");
-    run_cmd.args(["run", "--rm", "-it"]);
-    if !no_userns {
-        run_cmd.args(["--userns=keep-id"]);
-    }
+    run_cmd.args(["run", "--rm", "-it", &userns_arg]);
     run_cmd.args([
         "--name",
         &container_name,
@@ -583,7 +581,7 @@ pub async fn run_in_container(
     api_key: &str,
     command: &str,
     args: &[String],
-    no_userns: bool,
+    userns: &str,
 ) -> Result<()> {
     let container_name = new_container_name(workspace);
     let volume_name = gen_volume_name(workspace);
@@ -613,10 +611,8 @@ pub async fn run_in_container(
         "run".into(),
         "--rm".into(),
         "-it".into(),
+        format!("--userns={}", userns),
     ];
-    if !no_userns {
-        run_args.push("--userns=keep-id".into());
-    }
     run_args.extend_from_slice(&[
         "--label".into(),
         "managed-by=ai-pod".into(),
