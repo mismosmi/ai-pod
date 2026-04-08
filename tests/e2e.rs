@@ -22,12 +22,21 @@ use std::sync::Mutex;
 static BUILD_LOCK: Mutex<()> = Mutex::new(());
 
 fn build_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path, tag: &str) {
-    let _guard = BUILD_LOCK.lock().unwrap();
+    // Recover from a poisoned lock (caused by a previous build panicking) so
+    // the cascade of PoisonError failures is broken and each test gets its own
+    // real error message.
+    let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Prune stale build containers left by a previous build.  Podman sometimes
+    // fails to fully unmount intermediate build containers, leaving overlay
+    // layers in a corrupted state that makes the *next* build fail when it
+    // tries to reuse those cached layers.  Pruning first ensures a clean slate.
+    let _ = rt.command().args(["builder", "prune", "-f"]).output();
     image::build_image(rt, config, dockerfile, tag).unwrap();
 }
 
 fn ensure_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path, tag: &str, force: bool) {
-    let _guard = BUILD_LOCK.lock().unwrap();
+    let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = rt.command().args(["builder", "prune", "-f"]).output();
     image::ensure_image(rt, config, dockerfile, tag, force).unwrap();
 }
 
