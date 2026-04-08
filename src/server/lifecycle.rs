@@ -3,6 +3,9 @@ use colored::Colorize;
 
 const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 use serde::{Deserialize, Serialize};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -37,9 +40,17 @@ impl ProjectState {
 
     pub fn save(&self, path: &Path) -> Result<()> {
         let json = serde_json::to_string_pretty(self)?;
-        // Atomic write via temp file
+        // Atomic write via temp file with restrictive permissions (owner read/write only)
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, json).context("Failed to write state file")?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .context("Failed to write state file")?;
+        file.write_all(json.as_bytes())
+            .context("Failed to write state file contents")?;
         std::fs::rename(&tmp, path).context("Failed to rename state file")?;
         Ok(())
     }
@@ -110,7 +121,15 @@ pub fn ensure_shared_server(config: &AppConfig) -> Result<()> {
     let pid = child.id();
     let new_state = ServerState { pid: Some(pid) };
     let json = serde_json::to_string_pretty(&new_state)?;
-    std::fs::write(&state_path, json).context("Failed to write server state")?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&state_path)
+        .context("Failed to write server state")?;
+    file.write_all(json.as_bytes())
+        .context("Failed to write server state contents")?;
 
     // Wait briefly for server to start
     std::thread::sleep(std::time::Duration::from_millis(500));
@@ -226,6 +245,26 @@ mod tests {
         let state = ProjectState::default();
         assert!(state.api_key.is_empty());
         assert!(state.allowed_commands.is_empty());
+    }
+
+    #[test]
+    fn project_state_save_sets_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.json");
+        let state = ProjectState {
+            workspace: "/home/user/project".into(),
+            allowed_commands: vec![],
+            api_key: "secret".into(),
+            ignored_credential_files: vec![],
+        };
+        state.save(&path).unwrap();
+        let perms = std::fs::metadata(&path).unwrap().permissions();
+        assert_eq!(
+            perms.mode() & 0o777,
+            0o600,
+            "state file must be owner read/write only (0600)"
+        );
     }
 
     #[test]
