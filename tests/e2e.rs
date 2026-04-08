@@ -26,18 +26,36 @@ fn build_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path, tag
     // the cascade of PoisonError failures is broken and each test gets its own
     // real error message.
     let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // Prune stale build containers left by a previous build.  Podman sometimes
-    // fails to fully unmount intermediate build containers, leaving overlay
-    // layers in a corrupted state that makes the *next* build fail when it
-    // tries to reuse those cached layers.  Pruning first ensures a clean slate.
-    let _ = rt.command().args(["builder", "prune", "-f"]).output();
-    image::build_image(rt, config, dockerfile, tag).unwrap();
+    // Use --no-cache to prevent podman overlay layer corruption on GH Actions runners.
+    //
+    // Without --no-cache, podman reuses cached layers from the previous build.
+    // After that build finishes, podman unmounts those intermediate layers; the
+    // overlay "merged" directory is torn down.  When the next build tries to resume
+    // from the same cached layer it finds the merged directory missing and panics:
+    //   "chdir .../overlay/<hash>/merged: no such file or directory"
+    // Building without cache means every build starts from a fresh layer stack and
+    // never tries to mount a layer that was unmounted by a sibling build.
+    let status = rt
+        .command()
+        .args([
+            "build",
+            "--no-cache",
+            "-t",
+            tag,
+            "-f",
+            &dockerfile.to_string_lossy(),
+            &config.config_dir.to_string_lossy(),
+        ])
+        .status()
+        .expect("failed to spawn container build");
+    assert!(status.success(), "{} build failed for tag {tag}", rt.cmd());
 }
 
 fn ensure_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path, tag: &str, force: bool) {
-    let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = rt.command().args(["builder", "prune", "-f"]).output();
-    image::ensure_image(rt, config, dockerfile, tag, force).unwrap();
+    // Use the same build lock and --no-cache logic as build_image.
+    if force || image::needs_build(rt, tag, false).unwrap() {
+        build_image(rt, config, dockerfile, tag);
+    }
 }
 
 // ---------------------------------------------------------------------------
