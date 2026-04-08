@@ -10,6 +10,25 @@ use ai_pod::runtime::ContainerRuntime;
 use ai_pod::workspace;
 
 use std::path::Path;
+use std::sync::Mutex;
+
+/// Global lock to prevent concurrent `podman/docker build` calls.
+///
+/// Multiple parallel builds sharing the same overlay layer cache cause
+/// storage corruption errors (e.g. "layer not known", "image not known").
+/// Serialising builds avoids this while still letting non-build tests run
+/// in parallel.
+static BUILD_LOCK: Mutex<()> = Mutex::new(());
+
+fn build_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path, tag: &str) {
+    let _guard = BUILD_LOCK.lock().unwrap();
+    image::build_image(rt, config, dockerfile, tag).unwrap();
+}
+
+fn ensure_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path, tag: &str, force: bool) {
+    let _guard = BUILD_LOCK.lock().unwrap();
+    image::ensure_image(rt, config, dockerfile, tag, force).unwrap();
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -105,7 +124,7 @@ fn e2e_build_image() {
     let (_dir, config) = make_test_config();
     let tag = "ai-pod-e2e-build:test";
 
-    image::build_image(&rt, &config, &dockerfile, tag).unwrap();
+    build_image(&rt, &config, &dockerfile, tag);
 
     // Verify image exists via the runtime
     let status = rt
@@ -130,7 +149,7 @@ fn e2e_needs_build_false_after_build() {
     // Before build: needs_build should be true
     assert!(image::needs_build(&rt, tag, false).unwrap());
 
-    image::build_image(&rt, &config, &dockerfile, tag).unwrap();
+    build_image(&rt, &config, &dockerfile, tag);
 
     // After build: needs_build should be false
     assert!(!image::needs_build(&rt, tag, false).unwrap());
@@ -150,11 +169,11 @@ fn e2e_ensure_image_is_idempotent() {
     let tag = "ai-pod-e2e-ensure:test";
 
     // First call builds
-    image::ensure_image(&rt, &config, &dockerfile, tag, false).unwrap();
+    ensure_image(&rt, &config, &dockerfile, tag, false);
     assert!(!image::needs_build(&rt, tag, false).unwrap());
 
     // Second call should succeed without rebuilding
-    image::ensure_image(&rt, &config, &dockerfile, tag, false).unwrap();
+    ensure_image(&rt, &config, &dockerfile, tag, false);
 
     cleanup_image(&rt, tag);
 }
@@ -169,7 +188,7 @@ fn e2e_image_name_produces_valid_tag() {
     let ws_path = _ws.path();
     let tag = image::image_name(ws_path);
 
-    image::build_image(&rt, &config, &dockerfile, &tag).unwrap();
+    build_image(&rt, &config, &dockerfile, &tag);
     assert!(!image::needs_build(&rt, &tag, false).unwrap());
 
     cleanup_image(&rt, &tag);
@@ -231,7 +250,7 @@ fn e2e_containers_for_prefix() {
     let (_dir, config) = make_test_config();
     let tag = "ai-pod-e2e-prefix:test";
 
-    image::build_image(&rt, &config, &dockerfile, tag).unwrap();
+    build_image(&rt, &config, &dockerfile, tag);
 
     let ws = tempfile::TempDir::new().unwrap();
     let prefix = workspace::container_prefix(ws.path());
@@ -275,7 +294,7 @@ fn e2e_clean_container_removes_all() {
     let (_dir, config) = make_test_config();
     let tag = "ai-pod-e2e-clean:test";
 
-    image::build_image(&rt, &config, &dockerfile, tag).unwrap();
+    build_image(&rt, &config, &dockerfile, tag);
 
     let ws = tempfile::TempDir::new().unwrap();
     let prefix = workspace::container_prefix(ws.path());
@@ -322,7 +341,7 @@ fn e2e_container_user_is_claude() {
     let (_dir, config) = make_test_config();
     let tag = "ai-pod-e2e-user:test";
 
-    image::build_image(&rt, &config, &dockerfile, tag).unwrap();
+    build_image(&rt, &config, &dockerfile, tag);
 
     let output = rt
         .command()
@@ -348,7 +367,7 @@ fn e2e_container_workdir_is_app() {
     let (_dir, config) = make_test_config();
     let tag = "ai-pod-e2e-workdir:test";
 
-    image::build_image(&rt, &config, &dockerfile, tag).unwrap();
+    build_image(&rt, &config, &dockerfile, tag);
 
     let output = rt
         .command()

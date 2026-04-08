@@ -27,6 +27,9 @@ pub fn image_name(workspace: &Path) -> String {
         })
         .collect::<String>();
     let label = label.trim_matches('-');
+    // Docker/Podman tags must start with an alphanumeric character (e.g. temp dirs
+    // like `.tmpXXX` would otherwise produce an invalid tag).
+    let label = label.trim_start_matches(|c: char| !c.is_ascii_alphanumeric());
     let label = if label.is_empty() { "project" } else { label };
 
     let hash = Sha256::digest(workspace.to_string_lossy().as_bytes());
@@ -116,6 +119,14 @@ mod tests {
         let hash_part = name.split('-').last().unwrap();
         assert_eq!(hash_part.len(), 6);
         assert!(hash_part.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn image_name_strips_leading_dot() {
+        // Temp dirs like /tmp/.tmpXXX must produce a valid (non-dot-prefixed) tag.
+        let name = image_name(Path::new("/tmp/.tmpfoo123"));
+        assert!(!name.starts_with('.'), "tag must not start with dot: {name}");
+        assert!(name.chars().next().map_or(false, |c| c.is_ascii_alphanumeric()));
     }
 
     #[test]
