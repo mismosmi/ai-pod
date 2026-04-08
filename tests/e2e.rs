@@ -7,6 +7,7 @@ use ai_pod::config::AppConfig;
 use ai_pod::container;
 use ai_pod::image;
 use ai_pod::runtime::ContainerRuntime;
+use ai_pod::server;
 use ai_pod::workspace;
 
 use std::path::Path;
@@ -382,5 +383,116 @@ fn e2e_container_workdir_is_app() {
         "WORKDIR should be /app"
     );
 
+    cleanup_image(&rt, tag);
+}
+
+// ---------------------------------------------------------------------------
+// Async helpers
+// ---------------------------------------------------------------------------
+
+/// Bind to port 0, let the OS assign a free port, return it.
+/// The listener is dropped immediately so the server can bind to it.
+fn find_free_port() -> u16 {
+    std::net::TcpListener::bind("0.0.0.0:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+// ---------------------------------------------------------------------------
+// Async tests (server)
+// ---------------------------------------------------------------------------
+
+/// The production HTTP server is reachable from inside a container via the
+/// host gateway (`host.docker.internal` / `host.containers.internal`).
+///
+/// Exercises: `server::run_server()`, `rt.add_host_arg()`, `rt.host_gateway()`.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_server_reachable_from_container() {
+    let rt = match try_runtime() {
+        Some(rt) => rt,
+        None => {
+            eprintln!("SKIPPED: no container runtime (docker/podman) available");
+            return;
+        }
+    };
+
+    // Build image (claude.Dockerfile has curl)
+    let (_ws, dockerfile) = make_test_workspace();
+    let (_dir, config) = make_test_config();
+    let tag = "ai-pod-e2e-server:test";
+    build_image(&rt, &config, &dockerfile, tag);
+
+    // Start the production server on a free port
+    let port = find_free_port();
+    let server_rt = rt.clone();
+    let (_server_dir, server_config) = make_test_config();
+    let server_handle = tokio::spawn(async move {
+        let _ = server::run_server(port, server_config, server_rt).await;
+    });
+
+    // Wait for the server to become ready
+    let client = reqwest::Client::new();
+    let health_url = format!("http://127.0.0.1:{}/health", port);
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if client.get(&health_url).send().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(ready.is_ok(), "server did not become ready within 5s");
+
+    // --- /health from inside the container ---
+    let add_host = rt.add_host_arg();
+    let container_health_url = format!("http://{}:{}/health", rt.host_gateway(), port);
+
+    let output = rt
+        .command()
+        .args([
+            "run", "--rm", &add_host, tag, "curl", "-sf", &container_health_url,
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "curl /health from container failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "ok",
+        "/health should return 'ok'"
+    );
+
+    // --- /version from inside the container ---
+    let container_version_url = format!("http://{}:{}/version", rt.host_gateway(), port);
+
+    let output = rt
+        .command()
+        .args([
+            "run", "--rm", &add_host, tag, "curl", "-sf", &container_version_url,
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "curl /version from container failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        body.contains("version"),
+        "/version response should contain 'version': got {}",
+        body
+    );
+
+    // Cleanup
+    server_handle.abort();
     cleanup_image(&rt, tag);
 }
