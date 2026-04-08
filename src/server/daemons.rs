@@ -11,6 +11,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+use subtle::ConstantTimeEq;
+
 use super::AppState;
 
 // ──── Types ─────────────────────────────────────────────────────────────────
@@ -143,10 +145,12 @@ async fn authenticate(
     let map = state.projects.lock().await;
     match map.get(project_id) {
         None => Err((StatusCode::NOT_FOUND, "Unknown project")),
-        Some(info) if info.api_key != provided_key => {
-            Err((StatusCode::UNAUTHORIZED, "Invalid API key"))
+        Some(info) => {
+            if !bool::from(info.api_key.as_bytes().ct_eq(provided_key.as_bytes())) {
+                return Err((StatusCode::UNAUTHORIZED, "Invalid API key"));
+            }
+            Ok(())
         }
-        Some(_) => Ok(()),
     }
 }
 

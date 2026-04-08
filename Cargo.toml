@@ -24,6 +24,7 @@ notify-rust = "4"
 tempfile = "3"
 tokio-stream = "0.1"
 futures-util = "0.3"
+subtle = "2"
 
 [[bin]]
 name = "host-tools"
