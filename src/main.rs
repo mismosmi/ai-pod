@@ -175,7 +175,7 @@ async fn main() -> Result<()> {
         Some(Command::Serve) => {
             let config = AppConfig::new()?;
             config.init()?;
-            server::run_server(server::lifecycle::MCP_PORT, config, rt).await?;
+            server::run_server(server::lifecycle::MCP_PORT, std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), config, rt).await?;
         }
         Some(Command::Attach) => {
             container::attach_container(&rt)?;

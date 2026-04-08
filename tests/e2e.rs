@@ -430,7 +430,7 @@ async fn e2e_server_reachable_from_container() {
     let server_rt = rt.clone();
     let (_server_dir, server_config) = make_test_config();
     let server_handle = tokio::spawn(async move {
-        let _ = server::run_server(port, server_config, server_rt).await;
+        let _ = server::run_server(port, std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), server_config, server_rt).await;
     });
 
     // Wait for the server to become ready

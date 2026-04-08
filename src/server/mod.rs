@@ -70,7 +70,7 @@ async fn reload_handler(State(state): State<AppState>) -> &'static str {
     "reloaded"
 }
 
-pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> anyhow::Result<()> {
+pub async fn run_server(port: u16, bind_ip: std::net::IpAddr, config: AppConfig, rt: ContainerRuntime) -> anyhow::Result<()> {
     // Scan existing project state files to pre-populate the projects map
     let mut projects: HashMap<String, ProjectInfo> = HashMap::new();
 
@@ -157,7 +157,7 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
         .route("/daemon/output", post(daemons::daemon_output_handler))
         .with_state(state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = SocketAddr::new(bind_ip, port);
     println!("Shared server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
