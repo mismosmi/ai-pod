@@ -27,5 +27,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Run tests
-        run: cargo test
+      - name: Run unit tests
+        run: cargo test --lib
+
+      - name: Run e2e tests
+        run: cargo test --test e2e

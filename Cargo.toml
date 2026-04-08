@@ -4,6 +4,10 @@ version = "0.7.0"
 edition = "2024"
 default-run = "ai-pod"
 
+[lib]
+name = "ai_pod"
+path = "src/lib.rs"
+
 [dependencies]
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking", "stream"], default-features = false }
 clap = { version = "4", features = ["derive"] }
