@@ -22,12 +22,12 @@ use std::sync::Mutex;
 static BUILD_LOCK: Mutex<()> = Mutex::new(());
 
 fn build_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path, tag: &str) {
-    let _guard = BUILD_LOCK.lock().unwrap();
+    let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     image::build_image(rt, config, dockerfile, tag).unwrap();
 }
 
 fn ensure_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path, tag: &str, force: bool) {
-    let _guard = BUILD_LOCK.lock().unwrap();
+    let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     image::ensure_image(rt, config, dockerfile, tag, force).unwrap();
 }
 
@@ -91,6 +91,7 @@ fn make_test_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
 }
 
 fn cleanup_image(rt: &ContainerRuntime, tag: &str) {
+    let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _ = rt.command().args(["rmi", "-f", tag]).output();
 }
 
@@ -393,7 +394,7 @@ fn e2e_container_workdir_is_app() {
 /// Bind to port 0, let the OS assign a free port, return it.
 /// The listener is dropped immediately so the server can bind to it.
 fn find_free_port() -> u16 {
-    std::net::TcpListener::bind("0.0.0.0:0")
+    std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
