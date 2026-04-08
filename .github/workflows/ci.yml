@@ -28,7 +28,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Run unit tests
-        run: cargo test --bins
+        run: cargo test --lib
 
       - name: Run e2e tests
         run: cargo test --test e2e

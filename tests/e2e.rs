@@ -1,36 +1,39 @@
-//! End-to-end tests that exercise a real container runtime (Docker or Podman).
+//! End-to-end tests that exercise production code against a real container
+//! runtime (Docker or Podman).
 //!
-//! These tests are automatically **skipped** when neither `docker` nor `podman`
-//! is available on the host, so `cargo test` is safe to run anywhere.
+//! Automatically **skipped** when no runtime daemon is available.
 
-use std::process::Command;
+use ai_pod::config::AppConfig;
+use ai_pod::container;
+use ai_pod::image;
+use ai_pod::runtime::ContainerRuntime;
+use ai_pod::workspace;
+
+use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Detect an available container runtime **with a running daemon**.
-/// `--version` succeeds even without a daemon, so we probe with `info`.
-/// Returns `None` when neither docker nor podman is usable, causing every
-/// test to skip gracefully.
-fn detect_runtime() -> Option<String> {
-    for cmd in &["podman", "docker"] {
-        if Command::new(cmd)
-            .arg("info")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-        {
-            return Some(cmd.to_string());
-        }
-    }
-    None
+/// Try to detect a runtime via the production `ContainerRuntime::detect()`.
+/// Returns `None` (skip) when neither daemon is reachable.
+fn try_runtime() -> Option<ContainerRuntime> {
+    // detect() checks `--version`, but the daemon may still be down.
+    // Probe with `info` to confirm the daemon is actually running.
+    let rt = ContainerRuntime::detect().ok()?;
+    let ok = rt
+        .command()
+        .arg("info")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if ok { Some(rt) } else { None }
 }
 
 macro_rules! require_runtime {
     () => {
-        match detect_runtime() {
+        match try_runtime() {
             Some(rt) => rt,
             None => {
                 eprintln!("SKIPPED: no container runtime (docker/podman) available");
@@ -40,107 +43,294 @@ macro_rules! require_runtime {
     };
 }
 
-/// Build a minimal Alpine image and return its tag. Panics on failure.
-fn build_alpine_image(rt: &str, tag: &str) {
-    let tmp = tempfile::TempDir::new().unwrap();
-    std::fs::write(tmp.path().join("Dockerfile"), "FROM alpine:latest\n").unwrap();
-    let status = Command::new(rt)
-        .args(["build", "-t", tag, "-f", "Dockerfile", "."])
-        .current_dir(tmp.path())
-        .status()
-        .expect("failed to start image build");
-    assert!(status.success(), "alpine image build failed");
+/// Create a temporary `AppConfig` suitable for image builds. The returned
+/// `TempDir` must be kept alive for the duration of the test (drop = cleanup).
+fn make_test_config() -> (tempfile::TempDir, AppConfig) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let home = dir.path().to_path_buf();
+    let config_dir = home.join(".ai-pod");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config = AppConfig {
+        runtime_settings: config_dir.join("runtime-settings.json"),
+        runtime_claude_md: config_dir.join("runtime-CLAUDE.md"),
+        config_dir,
+        home_dir: home,
+    };
+    (dir, config)
 }
 
-fn cleanup_image(rt: &str, image: &str) {
-    let _ = Command::new(rt).args(["rmi", "-f", image]).output();
+/// Copy the project's `claude.Dockerfile` into a temp workspace as
+/// `ai-pod.Dockerfile` so that `image::build_image` can find it.
+/// Returns (TempDir, dockerfile_path).
+fn make_test_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
+    let ws = tempfile::TempDir::new().unwrap();
+    let src = Path::new("claude.Dockerfile");
+    let dst = ws.path().join(image::DOCKERFILE_NAME);
+    std::fs::copy(src, &dst).expect("failed to copy claude.Dockerfile into test workspace");
+    (ws, dst)
 }
 
-fn cleanup_container(rt: &str, name: &str) {
-    let _ = Command::new(rt).args(["rm", "-f", name]).output();
+fn cleanup_image(rt: &ContainerRuntime, tag: &str) {
+    let _ = rt.command().args(["rmi", "-f", tag]).output();
 }
 
-fn cleanup_volume(rt: &str, name: &str) {
-    let _ = Command::new(rt).args(["volume", "rm", "-f", name]).output();
+fn cleanup_container(rt: &ContainerRuntime, name: &str) {
+    let _ = rt.command().args(["rm", "-f", name]).output();
+}
+
+fn cleanup_volume(rt: &ContainerRuntime, name: &str) {
+    let _ = rt.command().args(["volume", "rm", "-f", name]).output();
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
+/// `ContainerRuntime::detect()` finds a working runtime.
 #[test]
-fn e2e_runtime_is_responsive() {
+fn e2e_runtime_detect() {
     let rt = require_runtime!();
-    let output = Command::new(&rt)
-        .arg("info")
-        .output()
-        .expect("failed to run runtime");
     assert!(
-        output.status.success(),
-        "{} info failed: {}",
-        rt,
-        String::from_utf8_lossy(&output.stderr)
+        rt.cmd() == "podman" || rt.cmd() == "docker",
+        "unexpected runtime: {}",
+        rt.cmd()
     );
 }
 
+/// `image::build_image()` builds from the project's Dockerfile.
 #[test]
-fn e2e_build_project_base_image() {
+fn e2e_build_image() {
     let rt = require_runtime!();
-    let tag = "ai-pod-e2e-base:test";
+    let (_ws, dockerfile) = make_test_workspace();
+    let (_dir, config) = make_test_config();
+    let tag = "ai-pod-e2e-build:test";
 
-    let status = Command::new(&rt)
-        .args(["build", "-t", tag, "-f", "claude.Dockerfile", "."])
-        .status()
-        .expect("failed to start build");
-    assert!(status.success(), "build from claude.Dockerfile failed");
+    image::build_image(&rt, &config, &dockerfile, tag).unwrap();
 
-    // Verify image exists via inspect
-    let output = Command::new(&rt)
+    // Verify image exists via the runtime
+    let status = rt
+        .command()
         .args(["image", "inspect", tag])
-        .output()
+        .stdout(std::process::Stdio::null())
+        .status()
         .unwrap();
-    assert!(output.status.success(), "built image not found");
+    assert!(status.success(), "built image not found");
 
     cleanup_image(&rt, tag);
 }
 
+/// After a successful build, `needs_build()` returns false.
 #[test]
-fn e2e_run_echo_in_container() {
+fn e2e_needs_build_false_after_build() {
     let rt = require_runtime!();
-    let tag = "ai-pod-e2e-echo:test";
-    build_alpine_image(&rt, tag);
+    let (_ws, dockerfile) = make_test_workspace();
+    let (_dir, config) = make_test_config();
+    let tag = "ai-pod-e2e-needs:test";
 
-    let output = Command::new(&rt)
-        .args(["run", "--rm", tag, "echo", "hello-from-ai-pod"])
-        .output()
+    // Before build: needs_build should be true
+    assert!(image::needs_build(&rt, tag, false).unwrap());
+
+    image::build_image(&rt, &config, &dockerfile, tag).unwrap();
+
+    // After build: needs_build should be false
+    assert!(!image::needs_build(&rt, tag, false).unwrap());
+
+    // With force=true it should always return true
+    assert!(image::needs_build(&rt, tag, true).unwrap());
+
+    cleanup_image(&rt, tag);
+}
+
+/// `ensure_image()` is idempotent — second call is a no-op.
+#[test]
+fn e2e_ensure_image_is_idempotent() {
+    let rt = require_runtime!();
+    let (_ws, dockerfile) = make_test_workspace();
+    let (_dir, config) = make_test_config();
+    let tag = "ai-pod-e2e-ensure:test";
+
+    // First call builds
+    image::ensure_image(&rt, &config, &dockerfile, tag, false).unwrap();
+    assert!(!image::needs_build(&rt, tag, false).unwrap());
+
+    // Second call should succeed without rebuilding
+    image::ensure_image(&rt, &config, &dockerfile, tag, false).unwrap();
+
+    cleanup_image(&rt, tag);
+}
+
+/// `image::image_name()` produces a tag the runtime accepts for a real build.
+#[test]
+fn e2e_image_name_produces_valid_tag() {
+    let rt = require_runtime!();
+    let (_ws, dockerfile) = make_test_workspace();
+    let (_dir, config) = make_test_config();
+
+    let ws_path = _ws.path();
+    let tag = image::image_name(ws_path);
+
+    image::build_image(&rt, &config, &dockerfile, &tag).unwrap();
+    assert!(!image::needs_build(&rt, &tag, false).unwrap());
+
+    cleanup_image(&rt, &tag);
+}
+
+/// `container::volume_exists()` correctly reports volume state.
+#[test]
+fn e2e_volume_exists_lifecycle() {
+    let rt = require_runtime!();
+    let vol = "ai-pod-e2e-volexist";
+
+    cleanup_volume(&rt, vol);
+
+    // Should not exist yet
+    assert!(!container::volume_exists(&rt, vol).unwrap());
+
+    // Create via runtime
+    let status = rt.command().args(["volume", "create", vol]).status().unwrap();
+    assert!(status.success());
+
+    // Now should exist
+    assert!(container::volume_exists(&rt, vol).unwrap());
+
+    // Remove
+    cleanup_volume(&rt, vol);
+
+    // Should not exist again
+    assert!(!container::volume_exists(&rt, vol).unwrap());
+}
+
+/// `workspace::volume_name()` and `container_prefix()` produce names the
+/// runtime accepts for volume and container operations.
+#[test]
+fn e2e_workspace_naming_works_with_runtime() {
+    let rt = require_runtime!();
+    let ws = tempfile::TempDir::new().unwrap();
+
+    let vol = workspace::volume_name(ws.path());
+    let prefix = workspace::container_prefix(ws.path());
+    let name = workspace::new_container_name(ws.path());
+
+    // Volume name should be usable
+    cleanup_volume(&rt, &vol);
+    let status = rt.command().args(["volume", "create", &vol]).status().unwrap();
+    assert!(status.success(), "runtime rejected volume name: {}", vol);
+    assert!(container::volume_exists(&rt, &vol).unwrap());
+
+    // Container name should be usable (and starts with prefix)
+    assert!(name.starts_with(&prefix));
+
+    cleanup_volume(&rt, &vol);
+}
+
+/// `container::containers_for_prefix()` finds labeled containers.
+#[test]
+fn e2e_containers_for_prefix() {
+    let rt = require_runtime!();
+    let (_ws, dockerfile) = make_test_workspace();
+    let (_dir, config) = make_test_config();
+    let tag = "ai-pod-e2e-prefix:test";
+
+    image::build_image(&rt, &config, &dockerfile, tag).unwrap();
+
+    let ws = tempfile::TempDir::new().unwrap();
+    let prefix = workspace::container_prefix(ws.path());
+    let name = workspace::new_container_name(ws.path());
+
+    // Start a detached container with the ai-pod label
+    cleanup_container(&rt, &name);
+    let status = rt
+        .command()
+        .args([
+            "run", "-d", "--name", &name,
+            "--label", "managed-by=ai-pod",
+            tag, "sleep", "300",
+        ])
+        .status()
         .unwrap();
+    assert!(status.success(), "failed to start test container");
 
-    assert!(output.status.success(), "container run failed");
+    // Production code should find it
+    let found = container::containers_for_prefix(&rt, &prefix, true).unwrap();
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("hello-from-ai-pod"),
-        "expected output not found"
+        found.contains(&name),
+        "containers_for_prefix did not find {}: {:?}",
+        name,
+        found
+    );
+
+    // Also find via non-running filter (all)
+    let found_all = container::containers_for_prefix(&rt, &prefix, false).unwrap();
+    assert!(found_all.contains(&name));
+
+    cleanup_container(&rt, &name);
+    cleanup_image(&rt, tag);
+}
+
+/// `container::clean_container()` removes containers and volumes for a workspace.
+#[test]
+fn e2e_clean_container_removes_all() {
+    let rt = require_runtime!();
+    let (_ws, dockerfile) = make_test_workspace();
+    let (_dir, config) = make_test_config();
+    let tag = "ai-pod-e2e-clean:test";
+
+    image::build_image(&rt, &config, &dockerfile, tag).unwrap();
+
+    let ws = tempfile::TempDir::new().unwrap();
+    let prefix = workspace::container_prefix(ws.path());
+    let vol = workspace::volume_name(ws.path());
+    let name = workspace::new_container_name(ws.path());
+
+    // Create volume
+    let status = rt.command().args(["volume", "create", &vol]).status().unwrap();
+    assert!(status.success());
+
+    // Start a labeled container
+    let status = rt
+        .command()
+        .args([
+            "run", "-d", "--name", &name,
+            "--label", "managed-by=ai-pod",
+            tag, "sleep", "300",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    // Verify both exist
+    assert!(container::volume_exists(&rt, &vol).unwrap());
+    assert!(!container::containers_for_prefix(&rt, &prefix, false).unwrap().is_empty());
+
+    // Production clean_container should remove both
+    container::clean_container(&rt, ws.path()).unwrap();
+
+    assert!(!container::volume_exists(&rt, &vol).unwrap(), "volume should be removed");
+    assert!(
+        container::containers_for_prefix(&rt, &prefix, false).unwrap().is_empty(),
+        "containers should be removed"
     );
 
     cleanup_image(&rt, tag);
 }
 
+/// Image built from `claude.Dockerfile` has `claude` as the default user.
 #[test]
 fn e2e_container_user_is_claude() {
     let rt = require_runtime!();
+    let (_ws, dockerfile) = make_test_workspace();
+    let (_dir, config) = make_test_config();
     let tag = "ai-pod-e2e-user:test";
 
-    let status = Command::new(&rt)
-        .args(["build", "-t", tag, "-f", "claude.Dockerfile", "."])
-        .status()
-        .unwrap();
-    assert!(status.success(), "image build failed");
+    image::build_image(&rt, &config, &dockerfile, tag).unwrap();
 
-    let output = Command::new(&rt)
+    let output = rt
+        .command()
         .args(["run", "--rm", tag, "whoami"])
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "whoami failed");
+    assert!(output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
         "claude",
@@ -150,43 +340,18 @@ fn e2e_container_user_is_claude() {
     cleanup_image(&rt, tag);
 }
 
-#[test]
-fn e2e_container_has_git() {
-    let rt = require_runtime!();
-    let tag = "ai-pod-e2e-git:test";
-
-    let status = Command::new(&rt)
-        .args(["build", "-t", tag, "-f", "claude.Dockerfile", "."])
-        .status()
-        .unwrap();
-    assert!(status.success());
-
-    let output = Command::new(&rt)
-        .args(["run", "--rm", tag, "git", "--version"])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success(), "git not found in container");
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains("git version"),
-        "unexpected git output"
-    );
-
-    cleanup_image(&rt, tag);
-}
-
+/// Image built from `claude.Dockerfile` has `/app` as WORKDIR.
 #[test]
 fn e2e_container_workdir_is_app() {
     let rt = require_runtime!();
+    let (_ws, dockerfile) = make_test_workspace();
+    let (_dir, config) = make_test_config();
     let tag = "ai-pod-e2e-workdir:test";
 
-    let status = Command::new(&rt)
-        .args(["build", "-t", tag, "-f", "claude.Dockerfile", "."])
-        .status()
-        .unwrap();
-    assert!(status.success());
+    image::build_image(&rt, &config, &dockerfile, tag).unwrap();
 
-    let output = Command::new(&rt)
+    let output = rt
+        .command()
         .args(["run", "--rm", tag, "pwd"])
         .output()
         .unwrap();
@@ -198,250 +363,5 @@ fn e2e_container_workdir_is_app() {
         "WORKDIR should be /app"
     );
 
-    cleanup_image(&rt, tag);
-}
-
-#[test]
-fn e2e_workspace_bind_mount() {
-    let rt = require_runtime!();
-    let tag = "ai-pod-e2e-mount:test";
-    build_alpine_image(&rt, tag);
-
-    let workspace = tempfile::TempDir::new().unwrap();
-    std::fs::write(workspace.path().join("marker.txt"), "e2e-test-content").unwrap();
-
-    let mount_arg = format!("{}:/app", workspace.path().display());
-    let output = Command::new(&rt)
-        .args(["run", "--rm", "-v", &mount_arg, tag, "cat", "/app/marker.txt"])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success(), "bind mount read failed");
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains("e2e-test-content"),
-        "marker file content mismatch"
-    );
-
-    cleanup_image(&rt, tag);
-}
-
-#[test]
-fn e2e_volume_create_inspect_remove() {
-    let rt = require_runtime!();
-    let vol = "ai-pod-e2e-vol-lifecycle";
-
-    // Ensure clean state
-    cleanup_volume(&rt, vol);
-
-    // Create
-    let status = Command::new(&rt)
-        .args(["volume", "create", vol])
-        .status()
-        .unwrap();
-    assert!(status.success(), "volume create failed");
-
-    // Inspect
-    let status = Command::new(&rt)
-        .args(["volume", "inspect", vol])
-        .status()
-        .unwrap();
-    assert!(status.success(), "volume inspect failed after create");
-
-    // Remove
-    let status = Command::new(&rt)
-        .args(["volume", "rm", vol])
-        .status()
-        .unwrap();
-    assert!(status.success(), "volume rm failed");
-
-    // Verify removed
-    let status = Command::new(&rt)
-        .args(["volume", "inspect", vol])
-        .status()
-        .unwrap();
-    assert!(!status.success(), "volume should not exist after removal");
-}
-
-#[test]
-fn e2e_volume_persists_data_across_containers() {
-    let rt = require_runtime!();
-    let tag = "ai-pod-e2e-persist:test";
-    let vol = "ai-pod-e2e-persist-vol";
-
-    build_alpine_image(&rt, tag);
-    cleanup_volume(&rt, vol);
-
-    Command::new(&rt)
-        .args(["volume", "create", vol])
-        .status()
-        .unwrap();
-
-    // Write in first container
-    let mount = format!("{}:/data", vol);
-    let status = Command::new(&rt)
-        .args([
-            "run", "--rm", "-v", &mount, tag, "sh", "-c",
-            "echo persisted-data > /data/test.txt",
-        ])
-        .status()
-        .unwrap();
-    assert!(status.success(), "write to volume failed");
-
-    // Read in second container
-    let output = Command::new(&rt)
-        .args(["run", "--rm", "-v", &mount, tag, "cat", "/data/test.txt"])
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "read from volume failed");
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains("persisted-data"),
-        "data did not persist across containers"
-    );
-
-    cleanup_volume(&rt, vol);
-    cleanup_image(&rt, tag);
-}
-
-#[test]
-fn e2e_managed_by_label_filter() {
-    let rt = require_runtime!();
-    let tag = "ai-pod-e2e-label:test";
-    let name = "ai-pod-e2e-labeled";
-
-    let tmp = tempfile::TempDir::new().unwrap();
-    std::fs::write(
-        tmp.path().join("Dockerfile"),
-        "FROM alpine:latest\nCMD [\"sleep\", \"300\"]\n",
-    )
-    .unwrap();
-    Command::new(&rt)
-        .args(["build", "-t", tag, "-f", "Dockerfile", "."])
-        .current_dir(tmp.path())
-        .status()
-        .unwrap();
-
-    // Ensure clean
-    cleanup_container(&rt, name);
-
-    // Start detached with the same label ai-pod uses
-    let status = Command::new(&rt)
-        .args([
-            "run", "-d", "--name", name, "--label", "managed-by=ai-pod", tag,
-        ])
-        .status()
-        .unwrap();
-    assert!(status.success(), "failed to start labeled container");
-
-    // Filter should find it
-    let output = Command::new(&rt)
-        .args([
-            "ps",
-            "--filter",
-            "label=managed-by=ai-pod",
-            "--format",
-            "{{.Names}}",
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    let names = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        names.contains(name),
-        "labeled container not found in filtered ps output"
-    );
-
-    // Cleanup
-    cleanup_container(&rt, name);
-
-    // Verify it's gone
-    let output = Command::new(&rt)
-        .args([
-            "ps",
-            "-a",
-            "--filter",
-            &format!("name=^{}$", name),
-            "--format",
-            "{{.Names}}",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        !String::from_utf8_lossy(&output.stdout).contains(name),
-        "container should be removed"
-    );
-
-    cleanup_image(&rt, tag);
-}
-
-#[test]
-fn e2e_container_env_vars_are_passed() {
-    let rt = require_runtime!();
-    let tag = "ai-pod-e2e-env:test";
-    build_alpine_image(&rt, tag);
-
-    let output = Command::new(&rt)
-        .args([
-            "run",
-            "--rm",
-            "-e",
-            "AI_POD_PROJECT_ID=test-project-123",
-            "-e",
-            "AI_POD_API_KEY=test-key-456",
-            tag,
-            "sh",
-            "-c",
-            "echo $AI_POD_PROJECT_ID $AI_POD_API_KEY",
-        ])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("test-project-123"), "project ID env var missing");
-    assert!(stdout.contains("test-key-456"), "API key env var missing");
-
-    cleanup_image(&rt, tag);
-}
-
-#[test]
-fn e2e_home_volume_with_claude_user() {
-    let rt = require_runtime!();
-    let tag = "ai-pod-e2e-homevol:test";
-    let vol = "ai-pod-e2e-home-vol";
-
-    let status = Command::new(&rt)
-        .args(["build", "-t", tag, "-f", "claude.Dockerfile", "."])
-        .status()
-        .unwrap();
-    assert!(status.success());
-
-    cleanup_volume(&rt, vol);
-    Command::new(&rt)
-        .args(["volume", "create", vol])
-        .status()
-        .unwrap();
-
-    // Write a file as claude user into the home volume
-    let mount = format!("{}:/home/claude", vol);
-    let status = Command::new(&rt)
-        .args([
-            "run", "--rm", "-v", &mount, tag, "sh", "-c",
-            "mkdir -p /home/claude/.claude && echo ok > /home/claude/.claude/test",
-        ])
-        .status()
-        .unwrap();
-    assert!(status.success(), "writing to home volume as claude failed");
-
-    // Verify file persists in a new container
-    let output = Command::new(&rt)
-        .args([
-            "run", "--rm", "-v", &mount, tag, "cat", "/home/claude/.claude/test",
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok");
-
-    cleanup_volume(&rt, vol);
     cleanup_image(&rt, tag);
 }

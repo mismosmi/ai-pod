@@ -87,7 +87,7 @@ Manage long-running background processes on the host.
 YOU MUST NOT end daemon commands with | head or | tail. This is rejected by the server.
 "#;
 
-fn containers_for_prefix(rt: &ContainerRuntime, prefix: &str, running_only: bool) -> Result<Vec<String>> {
+pub fn containers_for_prefix(rt: &ContainerRuntime, prefix: &str, running_only: bool) -> Result<Vec<String>> {
     let filter = format!("name=^{}-", prefix);
     let mut cmd = rt.command();
     cmd.arg("ps");
@@ -104,10 +104,12 @@ fn containers_for_prefix(rt: &ContainerRuntime, prefix: &str, running_only: bool
     Ok(names)
 }
 
-fn volume_exists(rt: &ContainerRuntime, name: &str) -> Result<bool> {
+pub fn volume_exists(rt: &ContainerRuntime, name: &str) -> Result<bool> {
     let status = rt
         .command()
-        .args(["volume", "exists", name])
+        .args(["volume", "inspect", name])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .context("Failed to check if volume exists")?;
     Ok(status.success())

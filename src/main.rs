@@ -1,13 +1,4 @@
-mod cli;
-mod config;
-mod container;
-mod credentials;
-mod daemons;
-mod image;
-mod runtime;
-mod server;
-mod update;
-mod workspace;
+use ai_pod::{cli, config, container, credentials, daemons, image, runtime, server, update, workspace};
 
 use anyhow::{Context, Result};
 use clap::Parser;
