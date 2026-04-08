@@ -40,6 +40,8 @@ impl<S: Stream + Unpin> Stream for GuardedStream<S> {
     }
 }
 
+use subtle::ConstantTimeEq;
+
 use super::AppState;
 use super::commands;
 use super::notify;
@@ -94,10 +96,12 @@ async fn authenticate(
     let map = state.projects.lock().await;
     match map.get(project_id) {
         None => Err((StatusCode::NOT_FOUND, "Unknown project")),
-        Some(info) if info.api_key != provided_key => {
-            Err((StatusCode::UNAUTHORIZED, "Invalid API key"))
+        Some(info) => {
+            if !bool::from(info.api_key.as_bytes().ct_eq(provided_key.as_bytes())) {
+                return Err((StatusCode::UNAUTHORIZED, "Invalid API key"));
+            }
+            Ok(info.workspace.clone())
         }
-        Some(info) => Ok(info.workspace.clone()),
     }
 }
 
