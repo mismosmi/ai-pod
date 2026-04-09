@@ -57,12 +57,15 @@ pub fn needs_build(rt: &ContainerRuntime, image: &str, force: bool) -> Result<bo
 pub fn build_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path, image: &str, no_cache: bool) -> Result<()> {
     println!("{}", "Building container image...".blue().bold());
 
+    let version_arg = format!("AI_POD_VERSION={}", env!("CARGO_PKG_VERSION"));
     let mut cmd = rt.command();
     cmd.arg("build");
     if no_cache {
         cmd.arg("--no-cache");
     }
     cmd.args([
+        "--build-arg",
+        &version_arg,
         "-t",
         image,
         "-f",
