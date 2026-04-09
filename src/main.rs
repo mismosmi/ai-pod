@@ -90,8 +90,7 @@ async fn launch_flow(cli: &Cli, rt: &ContainerRuntime) -> Result<()> {
         &project_id,
         &state.api_key,
         &cli.userns,
-    )
-    .await?;
+    )?;
 
     Ok(())
 }
@@ -224,8 +223,7 @@ async fn main() -> Result<()> {
                 command,
                 args,
                 &cli.userns,
-            )
-            .await?;
+            )?;
         }
         Some(Command::Daemons) => {
             let config = AppConfig::new()?;

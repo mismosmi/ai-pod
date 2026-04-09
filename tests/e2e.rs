@@ -106,14 +106,21 @@ fn make_test_config() -> (tempfile::TempDir, AppConfig) {
     (dir, config)
 }
 
-/// Copy the project's `claude.Dockerfile` into a temp workspace as
-/// `ai-pod.Dockerfile` so that `image::build_image` can find it.
+/// Create a minimal test Dockerfile (no agent install, no host-tools download).
 /// Returns (TempDir, dockerfile_path).
 fn make_test_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
     let ws = tempfile::TempDir::new().unwrap();
-    let src = Path::new("claude.Dockerfile");
     let dst = ws.path().join(image::DOCKERFILE_NAME);
-    std::fs::copy(src, &dst).expect("failed to copy claude.Dockerfile into test workspace");
+    std::fs::write(&dst, r#"FROM ubuntu:latest
+RUN apt-get update && apt-get install -y curl git vim
+WORKDIR /app
+RUN useradd -ms /bin/bash claude && chown -R claude /app
+RUN git config --system user.email "claude@ai-pod" && \
+    git config --system user.name "claude"
+USER claude
+ENV PATH="/home/claude/.local/bin:${PATH}"
+ENV EDITOR=vim
+"#).expect("failed to write test Dockerfile");
     (ws, dst)
 }
 
@@ -521,5 +528,104 @@ async fn e2e_server_reachable_from_container() {
 
     // Cleanup
     server_handle.abort();
+    cleanup_image(&rt, tag);
+}
+
+/// Build an image with `host-tools install claude` (multi-stage, builds
+/// host-tools from source) and verify that `claude doctor` succeeds.
+///
+/// This is the equivalent of `ai-pod init && ai-pod run claude doctor`.
+///
+/// Ignored by default because it is slow (compiles host-tools inside the
+/// container and downloads Claude Code on first run).
+#[test]
+#[ignore]
+fn e2e_claude_doctor() {
+    let rt = require_runtime!();
+    let tag = "ai-pod-e2e-doctor:test";
+    let vol = "ai-pod-e2e-doctor-home";
+
+    // Clean up any leftover state from a previous run
+    cleanup_image(&rt, tag);
+    cleanup_volume(&rt, vol);
+
+    // Write a multi-stage Dockerfile that builds host-tools from source,
+    // installs the claude stub, and sets up the container exactly like
+    // the production claude.Dockerfile would.
+    let ws = tempfile::TempDir::new().unwrap();
+    let dockerfile = ws.path().join("Dockerfile");
+    std::fs::write(&dockerfile, r#"FROM rust:latest AS builder
+COPY . /build
+WORKDIR /build
+RUN cargo build --release --bin host-tools
+
+FROM ubuntu:latest
+RUN apt-get update && apt-get install -y curl git vim
+COPY --from=builder /build/target/release/host-tools /usr/local/bin/host-tools
+RUN host-tools install claude
+WORKDIR /app
+RUN useradd -ms /bin/bash claude && chown -R claude /app
+RUN git config --system user.email "claude@ai-pod" && \
+    git config --system user.name "claude"
+USER claude
+ENV PATH="/home/claude/.local/bin:${PATH}"
+ENV EDITOR=vim
+CMD ["claude"]
+"#).unwrap();
+
+    // Build with project root as context (so COPY . /build gets the source)
+    let project_root = std::env::current_dir().unwrap();
+    let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let status = rt
+        .command()
+        .args([
+            "build",
+            "--no-cache",
+            "-t",
+            tag,
+            "-f",
+            &dockerfile.to_string_lossy(),
+            &project_root.to_string_lossy(),
+        ])
+        .status()
+        .expect("failed to spawn image build");
+    assert!(status.success(), "image build failed");
+    drop(_guard);
+
+    // Create a volume to simulate persistent home directory
+    let status = rt
+        .command()
+        .args(["volume", "create", vol])
+        .status()
+        .unwrap();
+    assert!(status.success(), "volume create failed");
+
+    // Run `claude doctor` — first run triggers the lazy install stub
+    let output = rt
+        .command()
+        .args([
+            "run",
+            "--rm",
+            "-v",
+            &format!("{}:/home/claude:z", vol),
+            tag,
+            "claude",
+            "doctor",
+        ])
+        .output()
+        .expect("failed to run claude doctor");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "claude doctor failed (exit {}).\nstdout: {}\nstderr: {}",
+        output.status,
+        stdout,
+        stderr,
+    );
+
+    // Cleanup
+    cleanup_volume(&rt, vol);
     cleanup_image(&rt, tag);
 }
