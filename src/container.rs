@@ -1,8 +1,7 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
 use dialoguer;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 
 use crate::config::AppConfig;
@@ -25,21 +24,14 @@ Working directory: /app
     )
 }
 
-/// Setup script: installs Claude Code.
-const SETUP_SCRIPT: &str = r#"#!/bin/sh
-set -e
-export PATH="$HOME/.local/bin:$PATH"
-curl -fsSL https://claude.ai/install.sh | bash
-"#;
-
 const SKILL_MD: &str = r#"---
 name: ai-pod
-description: This skill should be used when the user asks to run a command on the host machine, open an application on the host, send a desktop notification to the user, list previously approved host commands, or manage long-running background processes (daemons) on the host. Provides the host-tools binary at /home/claude/.local/bin/host-tools.
+description: This skill should be used when the user asks to run a command on the host machine, open an application on the host, send a desktop notification to the user, list previously approved host commands, or manage long-running background processes (daemons) on the host. Provides the host-tools binary at /usr/local/bin/host-tools.
 version: 0.1.0
 ---
 # host-tools — Host Interaction
 
-`/home/claude/.local/bin/host-tools` interacts with the host machine from inside this container.
+`/usr/local/bin/host-tools` interacts with the host machine from inside this container.
 
 ## run-command
 
@@ -145,7 +137,7 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
         "matcher": "*",
         "hooks": [{
             "type": "command",
-            "command": "/home/claude/.local/bin/host-tools daemon stop-all || true; /home/claude/.local/bin/host-tools notify-user \"Task completed\" || true"
+            "command": "/usr/local/bin/host-tools daemon stop-all || true; /usr/local/bin/host-tools notify-user \"Task completed\" || true"
         }]
     }]);
 
@@ -153,7 +145,7 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
         "matcher": "*",
         "hooks": [{
             "type": "command",
-            "command": "/home/claude/.local/bin/host-tools notify-user \"Claude needs your approval\" || true"
+            "command": "/usr/local/bin/host-tools notify-user \"Claude needs your approval\" || true"
         }]
     }]);
 
@@ -184,97 +176,8 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
-async fn ensure_host_tools_binary(config: &AppConfig) -> Result<PathBuf> {
-    let cache_path = config
-        .config_dir
-        .join(format!("host-tools-v{}", env!("CARGO_PKG_VERSION")));
-    if cache_path.exists() {
-        return Ok(cache_path);
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    let arch = "x86_64";
-    #[cfg(target_arch = "aarch64")]
-    let arch = "aarch64";
-
-    let url = format!(
-        "https://github.com/mismosmi/ai-pod/releases/download/v{}/host-tools-linux-{}",
-        env!("CARGO_PKG_VERSION"),
-        arch
-    );
-
-    let response = reqwest::get(&url)
-        .await
-        .context("Failed to download host-tools binary")?;
-
-    if !response.status().is_success() {
-        anyhow::bail!("Failed to download host-tools: HTTP {}", response.status());
-    }
-
-    let bytes = response
-        .bytes()
-        .await
-        .context("Failed to read host-tools binary")?;
-    std::fs::write(&cache_path, &bytes).context("Failed to write host-tools binary")?;
-
-    // chmod 755
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&cache_path, std::fs::Permissions::from_mode(0o755))?;
-    }
-
-    Ok(cache_path)
-}
-
-/// Run the setup script inside a temporary container with the home volume mounted.
-/// Installs Claude Code.
-fn run_setup_script(rt: &ContainerRuntime, volume_name: &str, image: &str) -> Result<()> {
-    println!(
-        "{}",
-        "Running setup script (installing Claude Code)...".blue()
-    );
-
-    let add_host = rt.add_host_arg();
-    let mut child = rt
-        .command()
-        .args([
-            "run",
-            "--rm",
-            "--user",
-            "claude",
-            "--label",
-            "managed-by=ai-pod",
-            "-v",
-            &format!("{}:/home/claude:z", volume_name),
-            &add_host,
-            "-i",
-            image,
-            "sh",
-            "-s",
-        ])
-        .stdin(Stdio::piped())
-        .spawn()
-        .context("Failed to spawn setup script container")?;
-
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(SETUP_SCRIPT.as_bytes())
-        .context("Failed to write setup script")?;
-
-    let status = child.wait().context("Setup script container failed")?;
-    if !status.success() {
-        anyhow::bail!("Setup script exited with non-zero status");
-    }
-
-    println!("{}", "Setup complete.".green());
-    Ok(())
-}
-
 /// Initialize a named home volume for the first time.
-async fn init_home_volume(
+fn init_home_volume(
     rt: &ContainerRuntime,
     config: &AppConfig,
     volume_name: &str,
@@ -310,7 +213,7 @@ async fn init_home_volume(
             "-v",
             &format!("{}:/home/claude", volume_name),
             image,
-            "claude",
+            "true",
         ])
         .status()
         .context("Failed to create init container")?;
@@ -346,7 +249,6 @@ async fn init_home_volume(
             "-p",
             "/home/claude/.claude",
             "/home/claude/.claude/skills/ai-pod",
-            "/home/claude/.local/bin",
         ])
         .status();
 
@@ -372,18 +274,7 @@ async fn init_home_volume(
         ])
         .status();
 
-    // 5. Copy host-tools binary and skill
-    if let Ok(host_tools) = ensure_host_tools_binary(config).await {
-        let _ = rt
-            .command()
-            .args([
-                "cp",
-                host_tools.to_str().unwrap(),
-                &format!("{}:/home/claude/.local/bin/host-tools", init_container),
-            ])
-            .status();
-    }
-
+    // 5. Copy skill file
     let skill_path = config.config_dir.join("skill.md");
     std::fs::write(&skill_path, SKILL_MD)?;
     let _ = rt
@@ -401,9 +292,6 @@ async fn init_home_volume(
     // 6. Remove init container
     let _ = rt.command().args(["rm", &init_container]).status();
 
-    // 7. Run setup script — installs Claude
-    run_setup_script(rt, volume_name, image)?;
-
     let _ = (project_id, api_key); // used via env vars at runtime
 
     println!("{}", "Home volume initialised.".green());
@@ -411,9 +299,9 @@ async fn init_home_volume(
     Ok(())
 }
 
-/// Re-apply runtime config and re-run setup after a rebuild.
+/// Re-apply runtime config after a rebuild.
 /// Does NOT wipe the volume — auth state is preserved.
-async fn reseed_home_volume(
+fn reseed_home_volume(
     rt: &ContainerRuntime,
     config: &AppConfig,
     volume_name: &str,
@@ -439,7 +327,7 @@ async fn reseed_home_volume(
             "-v",
             &format!("{}:/home/claude", volume_name),
             image,
-            "claude",
+            "true",
         ])
         .status()
         .context("Failed to create init container for reseed")?;
@@ -462,7 +350,6 @@ async fn reseed_home_volume(
             "-p",
             "/home/claude/.claude",
             "/home/claude/.claude/skills/ai-pod",
-            "/home/claude/.local/bin",
         ])
         .status();
 
@@ -488,18 +375,7 @@ async fn reseed_home_volume(
         ])
         .status();
 
-    // 3. Copy host-tools binary and skill
-    if let Ok(host_tools) = ensure_host_tools_binary(config).await {
-        let _ = rt
-            .command()
-            .args([
-                "cp",
-                host_tools.to_str().unwrap(),
-                &format!("{}:/home/claude/.local/bin/host-tools", init_container),
-            ])
-            .status();
-    }
-
+    // 3. Copy skill file
     let skill_path = config.config_dir.join("skill.md");
     std::fs::write(&skill_path, SKILL_MD)?;
     let _ = rt
@@ -517,9 +393,6 @@ async fn reseed_home_volume(
     // 4. Remove init container
     let _ = rt.command().args(["rm", &init_container]).status();
 
-    // 5. Run setup script — updates Claude
-    run_setup_script(rt, volume_name, image)?;
-
     let _ = (project_id, api_key); // used via env vars at runtime
 
     println!("{}", "Home volume reseeded.".green());
@@ -527,7 +400,7 @@ async fn reseed_home_volume(
     Ok(())
 }
 
-pub async fn launch_container(
+pub fn launch_container(
     rt: &ContainerRuntime,
     config: &AppConfig,
     workspace: &Path,
@@ -552,13 +425,13 @@ pub async fn launch_container(
             let _ = rt.command().args(["rm", "--force", &name]).status();
         }
         if volume_exists(rt, &volume_name)? {
-            reseed_home_volume(rt, config, &volume_name, &prefix, image, project_id, api_key).await?;
+            reseed_home_volume(rt, config, &volume_name, &prefix, image, project_id, api_key)?;
         }
     }
 
     // Init home volume if it doesn't exist
     if !volume_exists(rt, &volume_name)? {
-        init_home_volume(rt, config, &volume_name, &prefix, image, project_id, api_key).await?;
+        init_home_volume(rt, config, &volume_name, &prefix, image, project_id, api_key)?;
     }
 
     let container_name = new_container_name(workspace);
@@ -590,7 +463,7 @@ pub async fn launch_container(
         "-e",
         &server_url_env,
     ]);
-    run_cmd.args([image, "claude"]);
+    run_cmd.arg(image);
     run_cmd
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -601,7 +474,7 @@ pub async fn launch_container(
     Ok(())
 }
 
-pub async fn run_in_container(
+pub fn run_in_container(
     rt: &ContainerRuntime,
     config: &AppConfig,
     workspace: &Path,
@@ -626,8 +499,7 @@ pub async fn run_in_container(
             image,
             project_id,
             api_key,
-        )
-        .await?;
+        )?;
     }
 
     println!(

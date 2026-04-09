@@ -11,6 +11,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Install an AI coding agent system-wide (for use in Dockerfiles)
+    Install {
+        /// The agent to install (claude, opencode)
+        agent: String,
+    },
     /// Run a shell command on the host machine
     RunCommand {
         /// List previously approved commands
@@ -129,6 +134,9 @@ fn main() {
         .unwrap_or_else(|_| "http://host.containers.internal:7822".to_string());
 
     match cli.command {
+        Command::Install { agent } => {
+            install_agent(&agent);
+        }
         Command::RunCommand { list, command } => {
             if list {
                 run_list_commands(&project_id, &api_key, &server_url);
@@ -571,6 +579,56 @@ fn format_status(status: &serde_json::Value) -> String {
         return format!("finished({})", code);
     }
     serde_json::to_string(status).unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn install_agent(agent: &str) {
+    match agent {
+        "claude" => install_stub(
+            "claude",
+            "https://claude.ai/install.sh",
+        ),
+        "opencode" => install_stub(
+            "opencode",
+            "https://opencode.ai/install.sh",
+        ),
+        _ => {
+            eprintln!("Unknown agent: {}", agent);
+            eprintln!("Available agents: claude, opencode");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Write a stub script to /usr/local/bin/<name> that lazy-installs the agent
+/// on first run. After install, the real binary at ~/.local/bin/<name> takes
+/// priority in PATH, so the stub is never hit again.
+fn install_stub(name: &str, install_url: &str) {
+    let script = format!(
+        r#"#!/bin/sh
+set -e
+curl -fsSL {url} | bash
+exec "$HOME/.local/bin/{name}" "$@"
+"#,
+        url = install_url,
+        name = name,
+    );
+
+    let path = format!("/usr/local/bin/{}", name);
+    if let Err(e) = std::fs::write(&path, &script) {
+        eprintln!("Failed to write {}: {}", path, e);
+        std::process::exit(1);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)) {
+            eprintln!("Failed to chmod {}: {}", path, e);
+            std::process::exit(1);
+        }
+    }
+
+    eprintln!("Installed {} stub at {} (will install on first run)", name, path);
 }
 
 fn format_unix_time(secs: u64) -> String {
