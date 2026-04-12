@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use askama::Template;
 use colored::Colorize;
 use dialoguer;
 use std::io::Write;
@@ -9,83 +10,25 @@ use crate::config::AppConfig;
 use crate::runtime::ContainerRuntime;
 use crate::workspace::{container_prefix, new_container_name, volume_name as gen_volume_name};
 
+#[derive(Template)]
+#[template(path = "container_claude_md.txt")]
+struct ContainerClaudeMd<'a> {
+    display_name: &'a str,
+    host_gateway: &'a str,
+}
+
 fn container_claude_md(rt: &ContainerRuntime) -> String {
-    format!(
-        r#"# Container Environment
-You are running inside a {} container. To reach services on the host machine,
-use `{}` instead of `localhost`.
-
-For example: `curl http://{}:3000`
-
-Working directory: /app
-"#,
-        rt.display_name(),
-        rt.host_gateway(),
-        rt.host_gateway(),
-    )
+    let tmpl = ContainerClaudeMd {
+        display_name: rt.display_name(),
+        host_gateway: rt.host_gateway(),
+    };
+    tmpl.render().expect("failed to render container CLAUDE.md template")
 }
 
 /// Setup script: installs Claude Code.
-const SETUP_SCRIPT: &str = r#"#!/bin/sh
-set -e
-export PATH="$HOME/.local/bin:$PATH"
-curl -fsSL https://claude.ai/install.sh | bash
-"#;
+const SETUP_SCRIPT: &str = include_str!("../templates/setup_script.sh");
 
-const SKILL_MD: &str = r#"---
-name: ai-pod
-description: This skill should be used when the user asks to run a command on the host machine, open an application on the host, send a desktop notification to the user, list previously approved host commands, or manage long-running background processes (daemons) on the host. Provides the host-tools binary at /home/claude/.local/bin/host-tools.
-version: 0.1.0
----
-# host-tools — Host Interaction
-
-`/home/claude/.local/bin/host-tools` interacts with the host machine from inside this container.
-
-## run-command
-
-Run a shell command on the host. The host user is prompted to approve commands not previously allowed. Output streams back in real time.
-
-    host-tools run-command <shell command and args>
-
-Examples:
-- `host-tools run-command ls ~/Desktop`
-- `host-tools run-command open https://example.com`
-
-YOU MUST NOT TRIM OUTPUT ON THE HOST.
-do not use `host-tools run-command 'command | head -n 10'` to trim output.
-ALWAYS use head or tail this in the container instead: `host-tools run-command 'command' | head -n 10`
-host-tools run-command forwards all output (stdout and stderr).
-
-List previously approved commands:
-
-    host-tools run-command --list
-
-If a command is in the list, always run it on the host.
-If a command is not in the list, prefer to run it inside the container.
-
-## notify-user
-
-Send a desktop notification to the host user. The notification title is set automatically to the project name.
-
-    host-tools notify-user "<message>"
-
-Example: `host-tools notify-user "Build finished successfully"`
-
-A Stop hook already calls this automatically when the session ends.
-
-## daemon
-
-Manage long-running background processes on the host.
-
-    host-tools daemon start <shell command>   # returns daemon ID
-    host-tools daemon list                    # show all daemons for this project
-    host-tools daemon output <daemon-id>      # print log and exit
-    host-tools daemon status <daemon-id>      # running/finished, exit code
-    host-tools daemon stop <daemon-id>
-    host-tools daemon stop-all
-
-YOU MUST NOT end daemon commands with | head or | tail. This is rejected by the server.
-"#;
+const SKILL_MD: &str = include_str!("../templates/skill.md");
 
 pub fn containers_for_prefix(rt: &ContainerRuntime, prefix: &str, running_only: bool) -> Result<Vec<String>> {
     let filter = format!("name=^{}-", prefix);

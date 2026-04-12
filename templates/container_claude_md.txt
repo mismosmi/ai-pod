@@ -1,0 +1,7 @@
+# Container Environment
+You are running inside a {{ display_name }} container. To reach services on the host machine,
+use `{{ host_gateway }}` instead of `localhost`.
+
+For example: `curl http://{{ host_gateway }}:3000`
+
+Working directory: /app
