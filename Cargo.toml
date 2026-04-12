@@ -29,6 +29,8 @@ tempfile = "3"
 tokio-stream = "0.1"
 futures-util = "0.3"
 subtle = "2"
+askama = "0.13"
+regex = "1"
 
 [[bin]]
 name = "host-tools"

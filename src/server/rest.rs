@@ -118,12 +118,12 @@ pub async fn run_command_handler(
     };
 
     match commands::run_host_command(&state, &req.command, &workspace).await {
-        commands::ApprovalOutcome::PipeRejected => {
-            return (
-                StatusCode::BAD_REQUEST,
-                r#"{"error":"Command must not end with | head or | tail — pipe those inside the container instead"}"#,
-            )
-                .into_response();
+        commands::ApprovalOutcome::Rejected => {
+            let pattern = commands::COMMAND_REJECT_RE.as_str();
+            let body = serde_json::json!({
+                "error": format!("Command rejected — it matches the forbidden pattern: {pattern}. Do not use `cd /` or `| head` / `| tail` in daemon commands."),
+            });
+            return (StatusCode::BAD_REQUEST, body.to_string()).into_response();
         }
         commands::ApprovalOutcome::Denied => {
             return (

@@ -1,8 +1,17 @@
 use std::path::Path;
+use std::sync::LazyLock;
+
+use regex::Regex;
 
 use super::AppState;
 use super::lifecycle::ProjectState;
 use crate::workspace::workspace_hash;
+
+/// Regex that rejects dangerous command patterns:
+///   - commands starting with `cd /` (working directory is already set)
+///   - commands ending with `| head` or `| tail` (trim output inside the container instead)
+pub static COMMAND_REJECT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(^\s*cd\s+/)|([|]\s*(head|tail)(\s[^|]*)?\s*$)").unwrap());
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApprovalDecision {
@@ -23,13 +32,13 @@ pub enum CheckResult {
 /// Build the osascript Command for requesting user approval on macOS.
 /// Not cfg-gated so that tests can verify the command structure on all platforms.
 fn build_approval_command(command: &str, project_name: &str) -> std::process::Command {
-    let script = r#"on run argv
-    set cmd to item 1 of argv
-    set projName to item 2 of argv
-    display dialog ("Run command:" & linefeed & cmd) buttons {"Allow Once", "Always Allow", "Deny"} default button "Deny" with title ("ai-pod: " & projName)
-end run"#;
+    let script = include_str!("../../templates/approval_dialog.applescript");
     let mut c = std::process::Command::new("osascript");
-    c.arg("-e").arg(script).arg("--").arg(command).arg(project_name);
+    c.arg("-e")
+        .arg(script)
+        .arg("--")
+        .arg(command)
+        .arg(project_name);
     c
 }
 
@@ -126,7 +135,12 @@ pub enum ApprovalOutcome {
     AlwaysAllow,
     Denied,
     Timeout,
-    PipeRejected,
+    Rejected,
+}
+
+/// Check whether a command matches the rejection regex.
+pub fn check_command_rejected(cmd: &str) -> bool {
+    COMMAND_REJECT_RE.is_match(cmd)
 }
 
 pub async fn run_host_command(
@@ -134,8 +148,8 @@ pub async fn run_host_command(
     command: &str,
     workspace: &Path,
 ) -> ApprovalOutcome {
-    if ends_with_pipe_to_head_or_tail(command) {
-        return ApprovalOutcome::PipeRejected;
+    if check_command_rejected(command) {
+        return ApprovalOutcome::Rejected;
     }
     match check_approval(state, command, workspace).await {
         CheckResult::PreApproved => ApprovalOutcome::Approved,
@@ -152,15 +166,6 @@ pub async fn run_host_command(
     }
 }
 
-pub fn ends_with_pipe_to_head_or_tail(cmd: &str) -> bool {
-    if let Some(pipe_pos) = cmd.trim_end().rfind('|') {
-        let after = cmd[pipe_pos + 1..].trim_start();
-        let word = &after[..after.find(|c: char| c.is_whitespace()).unwrap_or(after.len())];
-        return word == "head" || word == "tail";
-    }
-    false
-}
-
 pub fn get_allowed_commands(state: &AppState, workspace: &Path) -> Vec<String> {
     let hash = workspace_hash(workspace);
     let state_file = state.config_dir.join(format!("{}.json", hash));
@@ -174,10 +179,8 @@ mod tests {
 
     #[test]
     fn approval_command_does_not_interpolate_user_input() {
-        let cmd = build_approval_command(
-            r#"echo "injected" & do shell script "evil""#,
-            "my-project",
-        );
+        let cmd =
+            build_approval_command(r#"echo "injected" & do shell script "evil""#, "my-project");
         let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
         assert_eq!(args.len(), 5);
         assert_eq!(args[0], "-e");
@@ -230,5 +233,51 @@ mod tests {
         assert_eq!(args[2], "--");
         assert_eq!(args[3], "-e malicious_script");
         assert_eq!(args[4], "--version");
+    }
+
+    #[test]
+    fn cd_slash_is_rejected() {
+        assert!(check_command_rejected("cd /home/user && ls"));
+        assert!(check_command_rejected("cd /tmp && make"));
+        assert!(check_command_rejected("  cd /some/path && echo hi"));
+    }
+
+    #[test]
+    fn cd_relative_is_not_rejected() {
+        assert!(!check_command_rejected("cd subdir && ls"));
+    }
+
+    #[test]
+    fn pipe_to_head_or_tail_is_rejected() {
+        assert!(check_command_rejected("ls | head"));
+        assert!(check_command_rejected("ls | head -n 10"));
+        assert!(check_command_rejected("ls | tail"));
+        assert!(check_command_rejected("ls | tail -5"));
+        assert!(check_command_rejected("ls |  head"));
+        assert!(check_command_rejected("ls |  tail -n 5"));
+        assert!(check_command_rejected("ls | head   "));
+    }
+
+    #[test]
+    fn pipe_to_head_in_middle_of_pipeline_is_allowed() {
+        assert!(!check_command_rejected("cat file | head | cat"));
+        assert!(!check_command_rejected("ls | head | wc -l"));
+    }
+
+    #[test]
+    fn normal_commands_not_rejected() {
+        assert!(!check_command_rejected("ls"));
+        assert!(!check_command_rejected("echo cd /foo"));
+        assert!(!check_command_rejected("cat file | grep foo"));
+        assert!(!check_command_rejected("echo hello"));
+        assert!(!check_command_rejected("make build"));
+        assert!(!check_command_rejected(""));
+    }
+
+    #[test]
+    fn words_starting_with_head_or_tail_not_rejected() {
+        assert!(!check_command_rejected("ls | headroom"));
+        assert!(!check_command_rejected("ls | tailored"));
+        assert!(!check_command_rejected("ls | heading"));
     }
 }

@@ -224,7 +224,8 @@ pub async fn cleanup_orphaned_daemons(state: &AppState) {
     for project_id in project_ids {
         // Container prefix is "claude-{project_id}" (project_id == workspace_hash)
         let filter = format!("name=^claude-{}-", project_id);
-        let output = match state.runtime
+        let output = match state
+            .runtime
             .async_command()
             .args([
                 "ps",
@@ -275,12 +276,12 @@ pub async fn start_daemon_handler(
     };
 
     match super::commands::run_host_command(&state, &req.command, &workspace).await {
-        super::commands::ApprovalOutcome::PipeRejected => {
-            return (
-                StatusCode::BAD_REQUEST,
-                r#"{"error":"Command must not end with | head or | tail"}"#,
-            )
-                .into_response();
+        super::commands::ApprovalOutcome::Rejected => {
+            let pattern = super::commands::COMMAND_REJECT_RE.as_str();
+            let body = serde_json::json!({
+                "error": format!("Command rejected — it matches the forbidden pattern: {pattern}. Do not use `cd /` or `| head` / `| tail` in daemon commands."),
+            });
+            return (StatusCode::BAD_REQUEST, body.to_string()).into_response();
         }
         super::commands::ApprovalOutcome::Denied => {
             return (
@@ -622,7 +623,7 @@ pub async fn daemon_output_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::commands::ends_with_pipe_to_head_or_tail;
+    use crate::server::commands::check_command_rejected;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -669,54 +670,56 @@ mod tests {
             config_dir: config_dir.to_path_buf(),
             approval_lock: Arc::new(Mutex::new(())),
             daemons: Arc::new(Mutex::new(HashMap::new())),
-            runtime: crate::runtime::ContainerRuntime { kind: crate::runtime::RuntimeKind::Podman },
+            runtime: crate::runtime::ContainerRuntime {
+                kind: crate::runtime::RuntimeKind::Podman,
+            },
         }
     }
 
-    // ── ends_with_pipe_to_head_or_tail ────────────────────────────────────────
+    // ── check_command_rejected ────────────────────────────────────────
 
     #[test]
     fn pipe_to_head_is_rejected() {
-        assert!(ends_with_pipe_to_head_or_tail("ls | head"));
-        assert!(ends_with_pipe_to_head_or_tail("ls | head -n 10"));
-        assert!(ends_with_pipe_to_head_or_tail("ls | tail"));
-        assert!(ends_with_pipe_to_head_or_tail("ls | tail -5"));
+        assert!(check_command_rejected("ls | head"));
+        assert!(check_command_rejected("ls | head -n 10"));
+        assert!(check_command_rejected("ls | tail"));
+        assert!(check_command_rejected("ls | tail -5"));
     }
 
     #[test]
     fn normal_commands_not_rejected() {
-        assert!(!ends_with_pipe_to_head_or_tail("ls"));
-        assert!(!ends_with_pipe_to_head_or_tail("cat file | grep foo"));
-        assert!(!ends_with_pipe_to_head_or_tail("echo hello"));
+        assert!(!check_command_rejected("ls"));
+        assert!(!check_command_rejected("cat file | grep foo"));
+        assert!(!check_command_rejected("echo hello"));
     }
 
     #[test]
     fn pipe_head_with_extra_whitespace() {
-        assert!(ends_with_pipe_to_head_or_tail("ls |  head"));
-        assert!(ends_with_pipe_to_head_or_tail("ls |  tail -n 5"));
+        assert!(check_command_rejected("ls |  head"));
+        assert!(check_command_rejected("ls |  tail -n 5"));
     }
 
     #[test]
     fn pipe_to_head_in_middle_of_pipeline_is_allowed() {
-        assert!(!ends_with_pipe_to_head_or_tail("cat file | head | cat"));
-        assert!(!ends_with_pipe_to_head_or_tail("ls | head | wc -l"));
+        assert!(!check_command_rejected("cat file | head | cat"));
+        assert!(!check_command_rejected("ls | head | wc -l"));
     }
 
     #[test]
     fn empty_command_not_rejected() {
-        assert!(!ends_with_pipe_to_head_or_tail(""));
+        assert!(!check_command_rejected(""));
     }
 
     #[test]
     fn command_with_word_starting_with_head_or_tail_not_rejected() {
-        assert!(!ends_with_pipe_to_head_or_tail("ls | headroom"));
-        assert!(!ends_with_pipe_to_head_or_tail("ls | tailored"));
-        assert!(!ends_with_pipe_to_head_or_tail("ls | heading"));
+        assert!(!check_command_rejected("ls | headroom"));
+        assert!(!check_command_rejected("ls | tailored"));
+        assert!(!check_command_rejected("ls | heading"));
     }
 
     #[test]
     fn trailing_whitespace_after_head_is_rejected() {
-        assert!(ends_with_pipe_to_head_or_tail("ls | head   "));
+        assert!(check_command_rejected("ls | head   "));
     }
 
     // ── DaemonMeta::from_entry ────────────────────────────────────────────────
@@ -1163,8 +1166,8 @@ mod tests {
             assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
             let text = to_text(resp).await;
             assert!(
-                text.contains("must not end with"),
-                "error should mention the restriction"
+                text.contains("forbidden pattern"),
+                "error should include the regex pattern"
             );
         }
 
@@ -1184,6 +1187,29 @@ mod tests {
                 .unwrap();
 
             assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn start_daemon_rejects_cd_slash() {
+            let dir = TempDir::new().unwrap();
+            let state = make_state(dir.path());
+            let router = make_router(state);
+
+            let resp = router
+                .oneshot(json_req(
+                    "/daemon/start",
+                    "key1",
+                    serde_json::json!({"project_id": "proj1", "command": "cd /tmp && make"}),
+                ))
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+            let text = to_text(resp).await;
+            assert!(
+                text.contains("forbidden pattern"),
+                "error should include the regex pattern"
+            );
         }
 
         #[tokio::test]
@@ -1216,7 +1242,9 @@ mod tests {
                 config_dir: config_dir.path().to_path_buf(),
                 approval_lock: Arc::new(Mutex::new(())),
                 daemons: Arc::new(Mutex::new(std::collections::HashMap::new())),
-                runtime: crate::runtime::ContainerRuntime { kind: crate::runtime::RuntimeKind::Podman },
+                runtime: crate::runtime::ContainerRuntime {
+                    kind: crate::runtime::RuntimeKind::Podman,
+                },
             };
 
             pre_allow(config_dir.path(), &ws1, "pwd");
