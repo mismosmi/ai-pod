@@ -7,7 +7,7 @@ use super::AppState;
 use super::lifecycle::ProjectState;
 use crate::workspace::workspace_hash;
 
-/// Regex that rejects dangerous command patterns:
+/// Regex that rejects annoying command patterns:
 ///   - commands starting with `cd /` (working directory is already set)
 ///   - commands ending with `| head` or `| tail` (trim output inside the container instead)
 pub static COMMAND_REJECT_RE: LazyLock<Regex> =
