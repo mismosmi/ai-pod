@@ -581,9 +581,11 @@
             <span class="nav-logo"><span>ai</span>-pod</span>
             <ul>
                 <li><a href="#features">Features</a></li>
+                <li><a href="#get-started">Get started</a></li>
                 <li><a href="#how-it-works">How it works</a></li>
                 <li><a href="#usage">Usage</a></li>
                 <li><a href="#security">Security</a></li>
+                <li><a href="#troubleshooting">Troubleshooting</a></li>
             </ul>
             <a href="https://github.com/mismosmi/ai-pod" class="nav-cta"
                 >GitHub</a
@@ -744,6 +746,65 @@
                             — dev servers, file watchers, build pipelines — and
                             track them by ID. Daemons are stopped automatically
                             when the session ends.
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <hr class="divider" />
+
+        <!-- GET STARTED -->
+        <section id="get-started">
+            <div class="container">
+                <div class="section-label">Get started</div>
+                <h2>From zero to Claude in a container</h2>
+                <p class="section-intro">
+                    Four steps. Two commands. One minute from install to your
+                    first session.
+                </p>
+
+                <div class="steps">
+                    <div class="step">
+                        <h3>Install ai-pod</h3>
+                        <p>
+                            You'll need <a href="https://podman.io">Podman</a>
+                            or Docker already installed. Then grab ai-pod with
+                            the one-line install script at the top of this
+                            page.
+                        </p>
+                    </div>
+                    <div class="step">
+                        <h3>Create a project Dockerfile</h3>
+                        <p>
+                            <code>cd</code> into your project and run
+                            <code>ai-pod init</code>. This drops an
+                            <code>ai-pod.Dockerfile</code> in the workspace
+                            that you can edit — pick your base image, install
+                            the tools Claude should have, and add any MCP
+                            servers. See the
+                            <a href="#usage">example in Usage</a>.
+                        </p>
+                    </div>
+                    <div class="step">
+                        <h3>Launch the container</h3>
+                        <p>
+                            Run <code>ai-pod</code>. It scans the workspace
+                            for credentials, builds the image, starts the
+                            shared background server, and drops you into a
+                            Claude Code session inside the container. The
+                            first run takes a minute; later runs are instant
+                            unless the Dockerfile changed.
+                        </p>
+                    </div>
+                    <div class="step">
+                        <h3>Come back any time</h3>
+                        <p>
+                            Next time, just run <code>ai-pod</code> again from
+                            the same directory. Use
+                            <code>ai-pod run claude resume</code> to pick up
+                            your last session, or <code>ai-pod run bash</code>
+                            to poke around inside the container.
                         </p>
                     </div>
                 </div>
@@ -989,6 +1050,153 @@ RUN npm install -g @my-org/mcp-server</pre>
                             </div>
                         </li>
                     </ul>
+                </div>
+            </div>
+        </section>
+
+        <hr class="divider" />
+
+        <!-- TROUBLESHOOTING -->
+        <section id="troubleshooting">
+            <div class="container">
+                <div class="section-label">Troubleshooting</div>
+                <h2>When something goes wrong</h2>
+                <p class="section-intro">
+                    Known issues and how to work around them. If you hit
+                    something that isn't here, open an issue on GitHub.
+                </p>
+
+                <div class="feature-grid">
+                    <div class="feature-card">
+                        <div class="feature-icon">🔑</div>
+                        <h3>Permission denied on workspace files</h3>
+                        <p>
+                            Your workspace is bind-mounted into the container
+                            at <code>/app</code>. The <code>claude</code> user
+                            inside the container has its own uid, and if that
+                            uid doesn't line up with the host uid that owns
+                            the files, Claude can't write to
+                            <code>/app</code> — or new files end up with an
+                            owner you can't edit on the host.
+                        </p>
+                        <p style="margin-top: 1rem">
+                            There are three independent knobs for fixing this.
+                            Pick the one that matches where you want the fix
+                            to live: per-project, per-run, or globally.
+                        </p>
+
+                        <h4 style="margin-top: 1.5rem; font-size: 0.95rem; color: var(--text);">
+                            1. Pin the uid in your Dockerfile
+                        </h4>
+                        <p>
+                            Pass <code>-u &lt;uid&gt;</code> to
+                            <code>useradd</code> so the <code>claude</code>
+                            user is built with a specific uid instead of the
+                            distro default. Check your host uid first with
+                            <code>id -u</code>. Most surgical fix — stays
+                            inside the one project.
+                        </p>
+                        <div class="code-block" style="margin-top: 0.75rem">
+                            <div class="code-block-header">
+                                <span class="dot"></span>
+                                ai-pod.Dockerfile
+                            </div>
+                            <pre><span class="cmd">RUN</span> useradd <span class="flag">-u</span> 1000 <span class="flag">-ms</span> /bin/bash claude \
+    &amp;&amp; chown -R claude /app</pre>
+                        </div>
+
+                        <h4 style="margin-top: 1.5rem; font-size: 0.95rem; color: var(--text);">
+                            2. Change the user-namespace mode with <code>--userns</code>
+                        </h4>
+                        <p>
+                            ai-pod forwards <code>--userns</code> straight
+                            through to <code>podman run</code>. The default
+                            is <code>keep-id</code>, which maps the container
+                            user's uid back to your host uid so bind-mounted
+                            files stay owned by you. When the default mapping
+                            picks the wrong uid, pin it explicitly with
+                            <code>keep-id:uid=X,gid=Y</code>.
+                        </p>
+                        <div class="code-block" style="margin-top: 0.75rem">
+                            <div class="code-block-header">
+                                <span class="dot"></span>
+                                --userns modes
+                            </div>
+                            <pre><span class="comment"># Explicit mapping — force claude's uid → your host uid</span>
+<span class="cmd">ai-pod</span> <span class="flag">--userns</span>=keep-id:uid=1000,gid=1000
+
+<span class="comment"># Let Podman pick an isolated uid range from /etc/subuid</span>
+<span class="cmd">ai-pod</span> <span class="flag">--userns</span>=auto
+
+<span class="comment"># Share the host namespace directly — no remapping</span>
+<span class="cmd">ai-pod</span> <span class="flag">--userns</span>=host</pre>
+                        </div>
+                        <p style="margin-top: 0.75rem">
+                            <code>keep-id</code> is the default and usually
+                            what you want. <code>keep-id:uid=...,gid=...</code>
+                            is the fix when the default mapping produces the
+                            wrong uid inside the container.
+                            <code>auto</code> gives the container its own
+                            isolated uid range — good for sandboxing but
+                            usually causes exactly this permission problem on
+                            bind mounts. <code>host</code> skips remapping
+                            entirely; use sparingly.
+                        </p>
+
+                        <h4 style="margin-top: 1.5rem; font-size: 0.95rem; color: var(--text);">
+                            3. Set <code>PODMAN_USERNS</code> globally
+                        </h4>
+                        <p>
+                            <code>PODMAN_USERNS</code> is a standard Podman
+                            environment variable. When set, it becomes the
+                            default <code>--userns</code> value for every
+                            <code>podman run</code> — including the ones
+                            ai-pod makes. Use this if you want a default
+                            across every project without passing the flag
+                            each time.
+                        </p>
+                        <div class="code-block" style="margin-top: 0.75rem">
+                            <div class="code-block-header">
+                                <span class="dot"></span>
+                                ~/.bashrc or ~/.zshrc
+                            </div>
+                            <pre><span class="cmd">export</span> PODMAN_USERNS=keep-id:uid=1000,gid=1000</pre>
+                        </div>
+                        <p style="margin-top: 0.75rem">
+                            Precedence: <code>ai-pod --userns=...</code> on
+                            the command line wins over
+                            <code>PODMAN_USERNS</code>, which wins over
+                            Podman's built-in default.
+                        </p>
+
+                        <h4 style="margin-top: 1.5rem; font-size: 0.95rem; color: var(--text);">
+                            Debugging uid mismatches
+                        </h4>
+                        <p>
+                            To see exactly where the mismatch is, compare the
+                            host view and the container view:
+                        </p>
+                        <div class="code-block" style="margin-top: 0.75rem">
+                            <div class="code-block-header">
+                                <span class="dot"></span>
+                                Diagnose
+                            </div>
+                            <pre><span class="comment"># On the host</span>
+<span class="cmd">id</span> <span class="flag">-u</span>                     <span class="comment"># your host uid</span>
+<span class="cmd">ls</span> <span class="flag">-ln</span> ai-pod.Dockerfile  <span class="comment"># numeric owner of your files</span>
+
+<span class="comment"># Inside the container</span>
+<span class="cmd">ai-pod run</span> bash
+<span class="cmd">id</span>                        <span class="comment"># uid/gid of the claude user</span>
+<span class="cmd">ls</span> <span class="flag">-ln</span> /app               <span class="comment"># what the container sees as owner</span></pre>
+                        </div>
+                        <p style="margin-top: 0.75rem">
+                            If the uid from <code>id</code> inside the
+                            container doesn't match the numeric owner of
+                            <code>/app</code>, that's the gap — apply one of
+                            the three fixes above.
+                        </p>
+                    </div>
                 </div>
             </div>
         </section>
