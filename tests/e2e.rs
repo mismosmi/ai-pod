@@ -627,7 +627,6 @@ CMD ["claude"]
 
     // Build with project root as context (so COPY . /build gets the source)
     let project_root = std::env::current_dir().unwrap();
-    let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let status = rt
         .command()
         .args([
@@ -642,7 +641,6 @@ CMD ["claude"]
         .status()
         .expect("failed to spawn image build");
     assert!(status.success(), "image build failed");
-    drop(_guard);
 
     // Create a volume to simulate persistent home directory
     let status = rt
