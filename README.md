@@ -1,5 +1,7 @@
 # ai-pod
 
+[Read the docs](https://ai-pod.apps.farbenmeer.de)
+
 **Claude Code inside isolated containers — safe, persistent, and project-aware.**
 
 ai-pod manages per-workspace containers that run Claude Code. It works with **Podman** (preferred) or **Docker** — whichever is available on your system. Each workspace gets a dedicated container, a shared background server bridges host interaction, and your personal Claude settings follow you everywhere.
