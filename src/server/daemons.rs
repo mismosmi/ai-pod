@@ -253,6 +253,20 @@ pub async fn cleanup_orphaned_daemons(state: &AppState) {
     }
 }
 
+// ──── File helpers ───────────────────────────────────────────────────────────
+
+/// Open a daemon log file for append with owner-only permissions (0o600).
+/// Daemon logs capture full stdout/stderr of approved host commands and must
+/// not be readable by other local users.
+async fn open_daemon_log(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
+    tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+        .await
+}
+
 // ──── Handlers ───────────────────────────────────────────────────────────────
 
 pub async fn start_daemon_handler(
@@ -365,12 +379,7 @@ pub async fn start_daemon_handler(
     let daemon_id_clone = daemon_id.clone();
     let state_clone = state.clone();
     tokio::spawn(async move {
-        let log_file = match tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .await
-        {
+        let log_file = match open_daemon_log(&log_path).await {
             Ok(f) => f,
             Err(_) => return,
         };
@@ -628,6 +637,20 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::sync::Mutex;
+
+    #[tokio::test]
+    async fn daemon_log_file_has_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("daemon.log");
+        let _file = open_daemon_log(&path).await.unwrap();
+        let perms = std::fs::metadata(&path).unwrap().permissions();
+        assert_eq!(
+            perms.mode() & 0o777,
+            0o600,
+            "daemon log must be owner read/write only (0600)"
+        );
+    }
 
     // ── Shared helpers ────────────────────────────────────────────────────────
 
