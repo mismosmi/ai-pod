@@ -36,11 +36,15 @@ fi
 # Update version in Cargo.toml
 sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml && rm Cargo.toml.bak
 
+# Fetch agent install scripts to embed in host-tools binary
+curl -fsSL --retry 3 https://claude.ai/install.sh -o src/install_scripts/claude_install.sh
+curl -fsSL --retry 3 https://opencode.ai/install -o src/install_scripts/opencode_install.sh
+
 # Run tests
 cargo test
 
-# Commit version bump
-git add Cargo.toml Cargo.lock
+# Commit version bump and refreshed install scripts
+git add Cargo.toml Cargo.lock src/install_scripts/
 git commit -m "chore: bump version to $VERSION"
 
 # Push

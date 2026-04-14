@@ -583,7 +583,7 @@ async fn e2e_server_reachable_from_container() {
     cleanup_image(&rt, tag);
 }
 
-/// Build an image with `host-tools install claude` (multi-stage, builds
+/// Build an image with `host-tools install` (multi-stage, builds
 /// host-tools from source) and verify that `claude doctor` succeeds.
 ///
 /// This is the equivalent of `ai-pod init && ai-pod run claude doctor`.
@@ -614,7 +614,7 @@ RUN cargo build --release --bin host-tools
 FROM ubuntu:latest
 RUN apt-get update && apt-get install -y curl git vim
 COPY --from=builder /build/target/release/host-tools /usr/local/bin/host-tools
-RUN host-tools install claude
+RUN host-tools install
 WORKDIR /app
 RUN useradd -ms /bin/bash claude && chown -R claude /app
 RUN git config --system user.email "claude@ai-pod" && \

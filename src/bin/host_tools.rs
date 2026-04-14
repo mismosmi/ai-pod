@@ -11,11 +11,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Install an AI coding agent system-wide (for use in Dockerfiles)
-    Install {
-        /// The agent to install (claude, opencode)
-        agent: String,
-    },
+    /// Install all AI coding agents system-wide (for use in Dockerfiles)
+    Install,
     /// Run a shell command on the host machine
     RunCommand {
         /// List previously approved commands
@@ -134,8 +131,8 @@ fn main() {
         .unwrap_or_else(|_| "http://host.containers.internal:7822".to_string());
 
     match cli.command {
-        Command::Install { agent } => {
-            install_agent(&agent);
+        Command::Install => {
+            install_all_agents();
         }
         Command::RunCommand { list, command } => {
             if list {
@@ -581,40 +578,35 @@ fn format_status(status: &serde_json::Value) -> String {
     serde_json::to_string(status).unwrap_or_else(|_| "unknown".to_string())
 }
 
-fn install_agent(agent: &str) {
-    match agent {
-        "claude" => install_stub(
-            "claude",
-            "https://claude.ai/install.sh",
-        ),
-        "opencode" => install_stub(
-            "opencode",
-            "https://opencode.ai/install.sh",
-        ),
-        _ => {
-            eprintln!("Unknown agent: {}", agent);
-            eprintln!("Available agents: claude, opencode");
-            std::process::exit(1);
-        }
+const CLAUDE_INSTALL_SCRIPT: &[u8] =
+    include_bytes!("../install_scripts/claude_install.sh");
+const OPENCODE_INSTALL_SCRIPT: &[u8] =
+    include_bytes!("../install_scripts/opencode_install.sh");
+
+fn install_all_agents() {
+    let agents: &[(&str, &[u8])] = &[
+        ("claude", CLAUDE_INSTALL_SCRIPT),
+        ("opencode", OPENCODE_INSTALL_SCRIPT),
+    ];
+    for (name, script) in agents {
+        install_stub(name, script);
     }
 }
 
-/// Write a stub script to /usr/local/bin/<name> that lazy-installs the agent
-/// on first run. After install, the real binary at ~/.local/bin/<name> takes
-/// priority in PATH, so the stub is never hit again.
-fn install_stub(name: &str, install_url: &str) {
+/// Write an install script to /usr/local/bin/<name> that runs the embedded
+/// installer on first invocation, then hands off to the real binary.
+fn install_stub(name: &str, install_script: &[u8]) {
+    // Wrap the embedded installer in a one-shot launcher: run it once, then
+    // exec the real binary that the installer placed in ~/.local/bin.
+    let inner = std::str::from_utf8(install_script).unwrap_or_default();
     let script = format!(
-        r#"#!/bin/sh
-set -e
-curl -fsSL {url} | bash
-exec "$HOME/.local/bin/{name}" "$@"
-"#,
-        url = install_url,
+        "#!/bin/sh\nset -e\n{inner}\nexec \"$HOME/.local/bin/{name}\" \"$@\"\n",
+        inner = inner,
         name = name,
     );
 
     let path = format!("/usr/local/bin/{}", name);
-    if let Err(e) = std::fs::write(&path, &script) {
+    if let Err(e) = std::fs::write(&path, script.as_bytes()) {
         eprintln!("Failed to write {}: {}", path, e);
         std::process::exit(1);
     }
@@ -628,7 +620,7 @@ exec "$HOME/.local/bin/{name}" "$@"
         }
     }
 
-    eprintln!("Installed {} stub at {} (will install on first run)", name, path);
+    eprintln!("Installed {} at {}", name, path);
 }
 
 fn format_unix_time(secs: u64) -> String {
