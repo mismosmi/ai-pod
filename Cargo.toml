@@ -36,3 +36,4 @@ path = "src/bin/host_tools.rs"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+lazy_static = "1"
