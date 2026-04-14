@@ -4,7 +4,7 @@ RUN apt-get update && apt-get install -y curl git vim
 
 WORKDIR /app
 
-RUN useradd -ms /bin/bash claude && chown -R claude /app
+RUN useradd -u 1000 -ms /bin/bash claude && chown -R claude /app
 
 # System-level git identity
 RUN git config --system user.email "claude@ai-pod" && \
