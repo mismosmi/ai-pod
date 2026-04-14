@@ -11,13 +11,13 @@ RUN host-tools install
 
 WORKDIR /app
 
-# System-level git identity
-RUN git config --system user.email "claude@ai-pod" && \
-    git config --system user.name "claude"
+# System-level git identity (fallback when no host identity is provided)
+RUN git config --system user.email "{{AGENT}}@ai-pod" && \
+    git config --system user.name "{{AGENT}}"
 
 USER ubuntu
 
-ENV PATH="/home/claude/.local/bin:${PATH}"
+ENV PATH="/home/ubuntu/.local/bin:${PATH}"
 ENV EDITOR=vim
 
-CMD ["claude"]
+CMD ["{{AGENT}}"]

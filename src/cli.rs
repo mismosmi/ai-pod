@@ -1,5 +1,11 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
+
+#[derive(ValueEnum, Clone, Debug)]
+pub enum Agent {
+    Claude,
+    Opencode,
+}
 
 #[derive(Parser)]
 #[command(name = "claude-container", about = "Run Claude Code inside Podman containers")]
@@ -37,6 +43,10 @@ pub enum Command {
         /// Workspace path (default: cwd)
         #[arg(long)]
         workdir: Option<PathBuf>,
+
+        /// Default agent to start in the container (default: claude)
+        #[arg(long, value_enum, default_value = "claude")]
+        agent: Agent,
     },
 
     /// Attach to a running claude container session

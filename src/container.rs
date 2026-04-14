@@ -126,6 +126,64 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
+/// Detect the home directory of the default user in a container image.
+fn detect_container_home(rt: &ContainerRuntime, image: &str) -> String {
+    rt.command()
+        .args(["run", "--rm", image, "sh", "-c", "echo $HOME"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/root".to_string())
+}
+
+fn read_git_global(key: &str) -> Option<String> {
+    std::process::Command::new("git")
+        .args(["config", "--global", key])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Copy the host user's git identity into the container volume as ~/.gitconfig.
+/// This overrides the system-level git config set in the Dockerfile.
+fn write_gitconfig_to_volume(
+    rt: &ContainerRuntime,
+    config: &AppConfig,
+    init_container: &str,
+    home_dir: &str,
+) -> Result<()> {
+    let name = read_git_global("user.name");
+    let email = read_git_global("user.email");
+    if name.is_none() && email.is_none() {
+        return Ok(());
+    }
+
+    let mut lines = vec!["[user]".to_string()];
+    if let Some(n) = name {
+        lines.push(format!("\tname = {}", n));
+    }
+    if let Some(e) = email {
+        lines.push(format!("\temail = {}", e));
+    }
+
+    let tmp = config.config_dir.join("gitconfig.tmp");
+    std::fs::write(&tmp, lines.join("\n") + "\n")?;
+    let _ = rt
+        .command()
+        .args([
+            "cp",
+            tmp.to_str().unwrap(),
+            &format!("{}:{}/.gitconfig", init_container, home_dir),
+        ])
+        .status();
+    Ok(())
+}
+
 /// Initialize a named home volume for the first time.
 fn init_home_volume(
     rt: &ContainerRuntime,
@@ -135,6 +193,7 @@ fn init_home_volume(
     image: &str,
     project_id: &str,
     api_key: &str,
+    home_dir: &str,
 ) -> Result<()> {
     println!(
         "{} {}",
@@ -161,7 +220,7 @@ fn init_home_volume(
             "--name",
             &init_container,
             "-v",
-            &format!("{}:/home/claude", volume_name),
+            &format!("{}:{}", volume_name, home_dir),
             image,
             "true",
         ])
@@ -179,7 +238,7 @@ fn init_home_volume(
             .args([
                 "cp",
                 &claude_json.to_string_lossy(),
-                &format!("{}:/home/claude/", init_container),
+                &format!("{}:{}/", init_container, home_dir),
             ])
             .status();
     }
@@ -190,15 +249,14 @@ fn init_home_volume(
         .args([
             "run",
             "--rm",
-            "--user",
-            "claude",
             "-v",
-            &format!("{}:/home/claude:z", volume_name),
+            &format!("{}:{}:z", volume_name, home_dir),
             image,
             "mkdir",
             "-p",
-            "/home/claude/.claude",
-            "/home/claude/.claude/skills/ai-pod",
+            &format!("{}/.claude", home_dir),
+            &format!("{}/.claude/skills/ai-pod", home_dir),
+            &format!("{}/.config", home_dir),
         ])
         .status();
 
@@ -211,7 +269,7 @@ fn init_home_volume(
         .args([
             "cp",
             &config.runtime_settings.to_string_lossy(),
-            &format!("{}:/home/claude/.claude/settings.json", init_container),
+            &format!("{}:{}/.claude/settings.json", init_container, home_dir),
         ])
         .status();
 
@@ -220,7 +278,7 @@ fn init_home_volume(
         .args([
             "cp",
             &config.runtime_claude_md.to_string_lossy(),
-            &format!("{}:/home/claude/.claude/CLAUDE.md", init_container),
+            &format!("{}:{}/.claude/CLAUDE.md", init_container, home_dir),
         ])
         .status();
 
@@ -233,13 +291,29 @@ fn init_home_volume(
             "cp",
             skill_path.to_str().unwrap(),
             &format!(
-                "{}:/home/claude/.claude/skills/ai-pod/SKILL.md",
-                init_container
+                "{}:{}/.claude/skills/ai-pod/SKILL.md",
+                init_container, home_dir
             ),
         ])
         .status();
 
-    // 6. Remove init container
+    // 6. Copy opencode config if present on host
+    let opencode_config = config.home_dir.join(".config").join("opencode");
+    if opencode_config.exists() {
+        let _ = rt
+            .command()
+            .args([
+                "cp",
+                &opencode_config.to_string_lossy(),
+                &format!("{}:{}/.config/", init_container, home_dir),
+            ])
+            .status();
+    }
+
+    // 7. Copy host git identity into the volume
+    write_gitconfig_to_volume(rt, config, &init_container, home_dir)?;
+
+    // 8. Remove init container
     let _ = rt.command().args(["rm", &init_container]).status();
 
     let _ = (project_id, api_key); // used via env vars at runtime
@@ -259,6 +333,7 @@ fn reseed_home_volume(
     image: &str,
     project_id: &str,
     api_key: &str,
+    home_dir: &str,
 ) -> Result<()> {
     println!(
         "{} {}",
@@ -275,7 +350,7 @@ fn reseed_home_volume(
             "--name",
             &init_container,
             "-v",
-            &format!("{}:/home/claude", volume_name),
+            &format!("{}:{}", volume_name, home_dir),
             image,
             "true",
         ])
@@ -291,15 +366,14 @@ fn reseed_home_volume(
         .args([
             "run",
             "--rm",
-            "--user",
-            "claude",
             "-v",
-            &format!("{}:/home/claude:z", volume_name),
+            &format!("{}:{}:z", volume_name, home_dir),
             image,
             "mkdir",
             "-p",
-            "/home/claude/.claude",
-            "/home/claude/.claude/skills/ai-pod",
+            &format!("{}/.claude", home_dir),
+            &format!("{}/.claude/skills/ai-pod", home_dir),
+            &format!("{}/.config", home_dir),
         ])
         .status();
 
@@ -312,7 +386,7 @@ fn reseed_home_volume(
         .args([
             "cp",
             &config.runtime_settings.to_string_lossy(),
-            &format!("{}:/home/claude/.claude/settings.json", init_container),
+            &format!("{}:{}/.claude/settings.json", init_container, home_dir),
         ])
         .status();
 
@@ -321,7 +395,7 @@ fn reseed_home_volume(
         .args([
             "cp",
             &config.runtime_claude_md.to_string_lossy(),
-            &format!("{}:/home/claude/.claude/CLAUDE.md", init_container),
+            &format!("{}:{}/.claude/CLAUDE.md", init_container, home_dir),
         ])
         .status();
 
@@ -334,13 +408,29 @@ fn reseed_home_volume(
             "cp",
             skill_path.to_str().unwrap(),
             &format!(
-                "{}:/home/claude/.claude/skills/ai-pod/SKILL.md",
-                init_container
+                "{}:{}/.claude/skills/ai-pod/SKILL.md",
+                init_container, home_dir
             ),
         ])
         .status();
 
-    // 4. Remove init container
+    // 4. Copy opencode config if present on host
+    let opencode_config = config.home_dir.join(".config").join("opencode");
+    if opencode_config.exists() {
+        let _ = rt
+            .command()
+            .args([
+                "cp",
+                &opencode_config.to_string_lossy(),
+                &format!("{}:{}/.config/", init_container, home_dir),
+            ])
+            .status();
+    }
+
+    // 5. Copy host git identity into the volume
+    write_gitconfig_to_volume(rt, config, &init_container, home_dir)?;
+
+    // 6. Remove init container
     let _ = rt.command().args(["rm", &init_container]).status();
 
     let _ = (project_id, api_key); // used via env vars at runtime
@@ -363,6 +453,7 @@ pub fn launch_container(
     let prefix = container_prefix(workspace);
     let volume_name = gen_volume_name(workspace);
     let workspace_str = workspace.to_string_lossy();
+    let home_dir = detect_container_home(rt, image);
 
     // On rebuild: stop all existing containers for this workspace and reseed the volume
     if rebuild {
@@ -375,13 +466,13 @@ pub fn launch_container(
             let _ = rt.command().args(["rm", "--force", &name]).status();
         }
         if volume_exists(rt, &volume_name)? {
-            reseed_home_volume(rt, config, &volume_name, &prefix, image, project_id, api_key)?;
+            reseed_home_volume(rt, config, &volume_name, &prefix, image, project_id, api_key, &home_dir)?;
         }
     }
 
     // Init home volume if it doesn't exist
     if !volume_exists(rt, &volume_name)? {
-        init_home_volume(rt, config, &volume_name, &prefix, image, project_id, api_key)?;
+        init_home_volume(rt, config, &volume_name, &prefix, image, project_id, api_key, &home_dir)?;
     }
 
     let container_name = new_container_name(workspace);
@@ -400,7 +491,7 @@ pub fn launch_container(
         "--label",
         "managed-by=ai-pod",
         "-v",
-        &format!("{}:/home/claude:z", volume_name),
+        &format!("{}:{}:z", volume_name, home_dir),
         "-v",
         &format!("{}:/app:Z", workspace_str),
         &add_host,
@@ -438,6 +529,7 @@ pub fn run_in_container(
     let container_name = new_container_name(workspace);
     let volume_name = gen_volume_name(workspace);
     let workspace_str = workspace.to_string_lossy();
+    let home_dir = detect_container_home(rt, image);
 
     // Init home volume if it doesn't exist
     if !volume_exists(rt, &volume_name)? {
@@ -449,6 +541,7 @@ pub fn run_in_container(
             image,
             project_id,
             api_key,
+            &home_dir,
         )?;
     }
 
@@ -469,7 +562,7 @@ pub fn run_in_container(
         "--label".into(),
         "managed-by=ai-pod".into(),
         "-v".into(),
-        format!("{}:/home/claude:z", volume_name),
+        format!("{}:{}:z", volume_name, home_dir),
         "-v".into(),
         format!("{}:/app:Z", workspace_str),
         rt.add_host_arg(),
