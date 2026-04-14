@@ -85,6 +85,18 @@ fn is_process_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
+/// Create the shared server log file with owner-only permissions (0o600).
+/// Truncates any existing file, matching `File::create` semantics, so each
+/// shared-server start gets a fresh log.
+fn create_server_log(path: &Path) -> std::io::Result<std::fs::File> {
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+}
+
 #[allow(dead_code)]
 pub fn state_file_for(config: &AppConfig, workspace: &Path) -> PathBuf {
     let hash = workspace_hash(workspace);
@@ -107,7 +119,7 @@ pub fn ensure_shared_server(config: &AppConfig) -> Result<()> {
 
     let exe = std::env::current_exe().context("Failed to get current executable path")?;
     let log_path = config.config_dir.join("server.log");
-    let log = std::fs::File::create(&log_path).context("Failed to create server log file")?;
+    let log = create_server_log(&log_path).context("Failed to create server log file")?;
     let log_err = log.try_clone()?;
 
     let child = Command::new(&exe)
@@ -264,6 +276,20 @@ mod tests {
             perms.mode() & 0o777,
             0o600,
             "state file must be owner read/write only (0600)"
+        );
+    }
+
+    #[test]
+    fn server_log_file_has_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("server.log");
+        let _file = create_server_log(&path).unwrap();
+        let perms = std::fs::metadata(&path).unwrap().permissions();
+        assert_eq!(
+            perms.mode() & 0o777,
+            0o600,
+            "server log must be owner read/write only (0600)"
         );
     }
 
