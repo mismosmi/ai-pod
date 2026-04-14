@@ -24,6 +24,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "hex",
+ "lazy_static",
  "libc",
  "notify-rust",
  "regex",

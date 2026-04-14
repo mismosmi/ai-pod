@@ -10,36 +10,41 @@ use ai_pod::runtime::ContainerRuntime;
 use ai_pod::server;
 use ai_pod::workspace;
 
+use lazy_static::lazy_static;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
-/// Global lock to prevent concurrent `podman/docker build` calls.
-///
-/// Multiple parallel builds sharing the same overlay layer cache cause
-/// storage corruption errors (e.g. "layer not known", "image not known").
-/// Serialising builds avoids this while still letting non-build tests run
-/// in parallel.
-static BUILD_LOCK: Mutex<()> = Mutex::new(());
+lazy_static! {
+    /// Shared container runtime, lazily detected on first access. Wrapped in a
+    /// Mutex so every test serialises *all* runtime operations — not just
+    /// `build`. Parallel podman commands sharing the overlay cache corrupt
+    /// each other ("layer not known", missing `merged` dir), which is why
+    /// builds previously had to pass --no-cache. Locking the whole runtime
+    /// lets us keep the layer cache enabled so ubuntu and apt aren't
+    /// re-fetched for every test.
+    ///
+    /// `None` means no runtime is available on this machine; tests that
+    /// require one skip via `try_runtime()`.
+    static ref RT: Option<Mutex<ContainerRuntime>> = {
+        let rt = ContainerRuntime::detect().ok()?;
+        // detect() only checks `--version`; probe `info` to confirm the
+        // daemon is actually running.
+        let ok = rt
+            .command()
+            .arg("info")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        ok.then(|| Mutex::new(rt))
+    };
+}
 
 fn build_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path, tag: &str) {
-    // Recover from a poisoned lock (caused by a previous build panicking) so
-    // the cascade of PoisonError failures is broken and each test gets its own
-    // real error message.
-    let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // Use --no-cache to prevent podman overlay layer corruption on GH Actions runners.
-    //
-    // Without --no-cache, podman reuses cached layers from the previous build.
-    // After that build finishes, podman unmounts those intermediate layers; the
-    // overlay "merged" directory is torn down.  When the next build tries to resume
-    // from the same cached layer it finds the merged directory missing and panics:
-    //   "chdir .../overlay/<hash>/merged: no such file or directory"
-    // Building without cache means every build starts from a fresh layer stack and
-    // never tries to mount a layer that was unmounted by a sibling build.
     let status = rt
         .command()
         .args([
             "build",
-            "--no-cache",
             "-t",
             tag,
             "-f",
@@ -51,8 +56,13 @@ fn build_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path, tag
     assert!(status.success(), "{} build failed for tag {tag}", rt.cmd());
 }
 
-fn ensure_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path, tag: &str, force: bool) {
-    // Use the same build lock and --no-cache logic as build_image.
+fn ensure_image(
+    rt: &ContainerRuntime,
+    config: &AppConfig,
+    dockerfile: &Path,
+    tag: &str,
+    force: bool,
+) {
     if force || image::needs_build(rt, tag, false).unwrap() {
         build_image(rt, config, dockerfile, tag);
     }
@@ -62,20 +72,17 @@ fn ensure_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path, ta
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Try to detect a runtime via the production `ContainerRuntime::detect()`.
-/// Returns `None` (skip) when neither daemon is reachable.
-fn try_runtime() -> Option<ContainerRuntime> {
-    // detect() checks `--version`, but the daemon may still be down.
-    // Probe with `info` to confirm the daemon is actually running.
-    let rt = ContainerRuntime::detect().ok()?;
-    let ok = rt
-        .command()
-        .arg("info")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if ok { Some(rt) } else { None }
+/// Returns `None` (skip) when no container runtime is available. On success,
+/// the returned guard holds the global runtime lock for its lifetime, so each
+/// test sees exclusive access to the container runtime.
+fn try_runtime() -> Option<MutexGuard<'static, ContainerRuntime>> {
+    // Recover from a poisoned lock so one panicking test doesn't cascade into
+    // PoisonError failures for every subsequent test.
+    Some(
+        RT.as_ref()?
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    )
 }
 
 macro_rules! require_runtime {
@@ -234,7 +241,11 @@ fn e2e_volume_exists_lifecycle() {
     assert!(!container::volume_exists(&rt, vol).unwrap());
 
     // Create via runtime
-    let status = rt.command().args(["volume", "create", vol]).status().unwrap();
+    let status = rt
+        .command()
+        .args(["volume", "create", vol])
+        .status()
+        .unwrap();
     assert!(status.success());
 
     // Now should exist
@@ -260,7 +271,11 @@ fn e2e_workspace_naming_works_with_runtime() {
 
     // Volume name should be usable
     cleanup_volume(&rt, &vol);
-    let status = rt.command().args(["volume", "create", &vol]).status().unwrap();
+    let status = rt
+        .command()
+        .args(["volume", "create", &vol])
+        .status()
+        .unwrap();
     assert!(status.success(), "runtime rejected volume name: {}", vol);
     assert!(container::volume_exists(&rt, &vol).unwrap());
 
@@ -289,9 +304,15 @@ fn e2e_containers_for_prefix() {
     let status = rt
         .command()
         .args([
-            "run", "-d", "--name", &name,
-            "--label", "managed-by=ai-pod",
-            tag, "sleep", "300",
+            "run",
+            "-d",
+            "--name",
+            &name,
+            "--label",
+            "managed-by=ai-pod",
+            tag,
+            "sleep",
+            "300",
         ])
         .status()
         .unwrap();
@@ -330,16 +351,26 @@ fn e2e_clean_container_removes_all() {
     let name = workspace::new_container_name(ws.path());
 
     // Create volume
-    let status = rt.command().args(["volume", "create", &vol]).status().unwrap();
+    let status = rt
+        .command()
+        .args(["volume", "create", &vol])
+        .status()
+        .unwrap();
     assert!(status.success());
 
     // Start a labeled container
     let status = rt
         .command()
         .args([
-            "run", "-d", "--name", &name,
-            "--label", "managed-by=ai-pod",
-            tag, "sleep", "300",
+            "run",
+            "-d",
+            "--name",
+            &name,
+            "--label",
+            "managed-by=ai-pod",
+            tag,
+            "sleep",
+            "300",
         ])
         .status()
         .unwrap();
@@ -347,23 +378,32 @@ fn e2e_clean_container_removes_all() {
 
     // Verify both exist
     assert!(container::volume_exists(&rt, &vol).unwrap());
-    assert!(!container::containers_for_prefix(&rt, &prefix, false).unwrap().is_empty());
+    assert!(
+        !container::containers_for_prefix(&rt, &prefix, false)
+            .unwrap()
+            .is_empty()
+    );
 
     // Production clean_container should remove both
     container::clean_container(&rt, ws.path()).unwrap();
 
-    assert!(!container::volume_exists(&rt, &vol).unwrap(), "volume should be removed");
     assert!(
-        container::containers_for_prefix(&rt, &prefix, false).unwrap().is_empty(),
+        !container::volume_exists(&rt, &vol).unwrap(),
+        "volume should be removed"
+    );
+    assert!(
+        container::containers_for_prefix(&rt, &prefix, false)
+            .unwrap()
+            .is_empty(),
         "containers should be removed"
     );
 
     cleanup_image(&rt, tag);
 }
 
-/// Image built from `claude.Dockerfile` has `claude` as the default user.
+/// Image built from `claude.Dockerfile` has `ubuntu` as the default user.
 #[test]
-fn e2e_container_user_is_claude() {
+fn e2e_container_default_user() {
     let rt = require_runtime!();
     let (_ws, dockerfile) = make_test_workspace();
     let (_dir, config) = make_test_config();
@@ -380,8 +420,8 @@ fn e2e_container_user_is_claude() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        "claude",
-        "default user should be claude"
+        "ubuntu",
+        "default user should be ubuntu"
     );
 
     cleanup_image(&rt, tag);
@@ -480,7 +520,13 @@ async fn e2e_server_reachable_from_container() {
     let output = rt
         .command()
         .args([
-            "run", "--rm", &add_host, tag, "curl", "-sf", &container_health_url,
+            "run",
+            "--rm",
+            &add_host,
+            tag,
+            "curl",
+            "-sf",
+            &container_health_url,
         ])
         .output()
         .unwrap();
@@ -502,7 +548,13 @@ async fn e2e_server_reachable_from_container() {
     let output = rt
         .command()
         .args([
-            "run", "--rm", &add_host, tag, "curl", "-sf", &container_version_url,
+            "run",
+            "--rm",
+            &add_host,
+            tag,
+            "curl",
+            "-sf",
+            &container_version_url,
         ])
         .output()
         .unwrap();
