@@ -4,13 +4,21 @@ pub mod lifecycle;
 pub mod notify;
 pub mod rest;
 
-use axum::{Json, Router, extract::State, routing::{get, post}};
+use axum::{
+    Json, Router,
+    extract::{Request, State},
+    http::{StatusCode, header},
+    middleware::{self, Next},
+    response::Response,
+    routing::{get, post},
+};
 use serde_json::json;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 
 use crate::config::AppConfig;
 use crate::runtime::ContainerRuntime;
@@ -38,6 +46,73 @@ async fn health_handler() -> &'static str {
 
 async fn version_handler() -> Json<serde_json::Value> {
     Json(json!({ "version": env!("CARGO_PKG_VERSION") }))
+}
+
+/// Middleware that translates tower_governor's non-standard
+/// `x-ratelimit-after` header into the standard `Retry-After` header on 429
+/// responses, per RFC 7231 §7.1.3.
+async fn add_retry_after_header(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    if response.status() == StatusCode::TOO_MANY_REQUESTS
+        && !response.headers().contains_key(header::RETRY_AFTER)
+    {
+        if let Some(wait) = response.headers().get("x-ratelimit-after").cloned() {
+            response.headers_mut().insert(header::RETRY_AFTER, wait);
+        }
+    }
+    response
+}
+
+/// Build the Axum router with the rate-limiting middleware applied.
+///
+/// The returned router still needs to be served via
+/// `into_make_service_with_connect_info::<SocketAddr>()` so that
+/// `PeerIpKeyExtractor` can read the client peer address.
+///
+/// Exposed so integration tests can exercise the real middleware stack.
+pub fn build_app(state: AppState) -> Router {
+    // Rate limiting: token-bucket (GCRA) per peer IP. A 50-token burst with
+    // 1 token/second refill covers the bursty MCP workload (several file reads
+    // in quick succession) while blocking sustained brute-force of API keys
+    // and flooding of /run_command (which forks a subprocess per request).
+    // Returns HTTP 429 with Retry-After when exceeded.
+    let governor_conf = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second(1)
+            .burst_size(50)
+            .finish()
+            .expect("valid governor config"),
+    );
+
+    // Periodically trim the governor's per-IP state map so it does not grow
+    // unbounded across long-lived server runs.
+    let governor_limiter = governor_conf.limiter().clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            governor_limiter.retain_recent();
+        }
+    });
+
+    Router::new()
+        .route("/health", get(health_handler))
+        .route("/version", get(version_handler))
+        .route("/reload", post(reload_handler))
+        .route("/run_command", post(rest::run_command_handler))
+        .route("/notify_user", post(rest::notify_user_handler))
+        .route("/list_allowed_commands", post(rest::list_allowed_commands_handler))
+        .route("/daemon/start", post(daemons::start_daemon_handler))
+        .route("/daemon/stop", post(daemons::stop_daemon_handler))
+        .route("/daemon/stop-all", post(daemons::stop_all_daemons_handler))
+        .route("/daemon/list", post(daemons::list_daemons_handler))
+        .route("/daemon/status", post(daemons::daemon_status_handler))
+        .route("/daemon/output", post(daemons::daemon_output_handler))
+        .layer(GovernorLayer { config: governor_conf })
+        // Applied after GovernorLayer so it sees the 429 response and can
+        // rewrite the header.
+        .layer(middleware::from_fn(add_retry_after_header))
+        .with_state(state)
 }
 
 async fn reload_handler(State(state): State<AppState>) -> &'static str {
@@ -142,28 +217,20 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
         }
     });
 
-    let app = Router::new()
-        .route("/health", get(health_handler))
-        .route("/version", get(version_handler))
-        .route("/reload", post(reload_handler))
-        .route("/run_command", post(rest::run_command_handler))
-        .route("/notify_user", post(rest::notify_user_handler))
-        .route("/list_allowed_commands", post(rest::list_allowed_commands_handler))
-        .route("/daemon/start", post(daemons::start_daemon_handler))
-        .route("/daemon/stop", post(daemons::stop_daemon_handler))
-        .route("/daemon/stop-all", post(daemons::stop_all_daemons_handler))
-        .route("/daemon/list", post(daemons::list_daemons_handler))
-        .route("/daemon/status", post(daemons::daemon_status_handler))
-        .route("/daemon/output", post(daemons::daemon_output_handler))
-        .with_state(state);
+    let app = build_app(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     println!("Shared server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async { shutdown_rx.await.ok(); })
-        .await?;
+    // into_make_service_with_connect_info is required so the governor layer's
+    // PeerIpKeyExtractor can read ConnectInfo<SocketAddr>.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async { shutdown_rx.await.ok(); })
+    .await?;
 
     Ok(())
 }
