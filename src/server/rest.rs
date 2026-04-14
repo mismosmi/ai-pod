@@ -4,41 +4,12 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
-use futures_util::{Stream, StreamExt};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
-
-struct KillOnDrop(Option<u32>);
-
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        if let Some(pid) = self.0 {
-            if pid > 0 {
-                // Kill the entire process group to catch children of sh
-                unsafe {
-                    libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
-                }
-            }
-        }
-    }
-}
-
-struct GuardedStream<S: Unpin> {
-    inner: S,
-    _guard: KillOnDrop,
-}
-
-impl<S: Stream + Unpin> Stream for GuardedStream<S> {
-    type Item = S::Item;
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.inner).poll_next(cx)
-    }
-}
 
 use subtle::ConstantTimeEq;
 
@@ -160,7 +131,6 @@ pub async fn run_command_handler(
         }
     };
 
-    let pid = child.id();
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
 
@@ -205,22 +175,48 @@ pub async fn run_command_handler(
     });
 
     tokio::spawn(async move {
-        let exit_code = match child.wait().await {
-            Ok(status) => status.code().unwrap_or(-1),
-            Err(_) => -1,
+        // Own `child` throughout. The kernel cannot recycle the PID
+        // until `Child::wait()` returns, so `child.id()` in the
+        // client-disconnect branch is guaranteed to still reference our
+        // process group. This eliminates the PID-reuse TOCTOU that
+        // motivated issue #29.
+        let exit_code = tokio::select! {
+            res = child.wait() => {
+                match res {
+                    Ok(status) => status.code().unwrap_or(-1),
+                    Err(_) => -1,
+                }
+            }
+            // Resolves when the axum response body (and hence the mpsc
+            // Receiver held by ReceiverStream) is dropped — client
+            // disconnect or early cancel. `closed()` is cancel-safe.
+            _ = tx.closed() => {
+                if let Some(pid) = child.id()
+                    && pid > 0
+                {
+                    // Kill the whole process group (see
+                    // `.process_group(0)` on spawn) so children of
+                    // `sh` are caught too.
+                    unsafe {
+                        libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
+                    }
+                }
+                match child.wait().await {
+                    Ok(status) => status.code().unwrap_or(-1),
+                    Err(_) => -1,
+                }
+            }
         };
         // Wait for both reader tasks to finish before sending Exit,
         // ensuring Exit is always the last message in the channel.
         let _ = stdout_done_rx.await;
         let _ = stderr_done_rx.await;
         let msg = serde_json::to_string(&Message::Exit(exit_code)).unwrap() + "\n";
+        // On the client-disconnect path, tx.send will Err and we move on.
         let _ = tx.send(msg).await;
     });
 
-    let stream = GuardedStream {
-        inner: ReceiverStream::new(rx).map(|s| Ok::<_, std::convert::Infallible>(s)),
-        _guard: KillOnDrop(pid),
-    };
+    let stream = ReceiverStream::new(rx).map(|s| Ok::<_, std::convert::Infallible>(s));
     axum::body::Body::from_stream(stream).into_response()
 }
 

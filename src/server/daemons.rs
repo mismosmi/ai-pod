@@ -31,7 +31,12 @@ pub struct DaemonEntry {
     pub command: String,
     pub started_at: std::time::SystemTime,
     pub status: DaemonStatus,
-    pub pid: Option<u32>,
+    /// Oneshot to ask the reaper task (which owns `Child`) to terminate
+    /// the daemon. Sending is safe from PID reuse because the reaper
+    /// cannot have called `child.wait()` yet — the kernel therefore has
+    /// not recycled the PID. `None` means the sender has already been
+    /// consumed by a prior stop call; sending is a no-op either way.
+    pub kill_tx: Option<tokio::sync::oneshot::Sender<()>>,
     pub log_path: PathBuf,
 }
 
@@ -177,7 +182,7 @@ async fn gc_old_daemon_logs(state: AppState) {
 }
 
 async fn stop_all_daemons_for_project(state: &AppState, project_id: &str) -> usize {
-    let mut pids: Vec<u32> = Vec::new();
+    let mut kill_txs: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
     let mut count = 0;
     {
         let mut daemons = state.daemons.lock().await;
@@ -185,18 +190,17 @@ async fn stop_all_daemons_for_project(state: &AppState, project_id: &str) -> usi
             if entry.project_id == project_id && entry.status == DaemonStatus::Running {
                 entry.status = DaemonStatus::Killed;
                 count += 1;
-                if let Some(pid) = entry.pid {
-                    pids.push(pid);
+                if let Some(tx) = entry.kill_tx.take() {
+                    kill_txs.push(tx);
                 }
             }
         }
     }
-    for pid in pids {
-        if pid > 0 {
-            unsafe {
-                libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
-            }
-        }
+    for tx in kill_txs {
+        // Err means the reaper has already finished (child exited naturally).
+        // Status was set to Killed above and the reaper's status-update guard
+        // preserves it, so this is a graceful no-op.
+        let _ = tx.send(());
     }
     count
 }
@@ -354,9 +358,16 @@ pub async fn start_daemon_handler(
         }
     };
 
-    let pid = child.id();
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
+
+    // Oneshot used by stop_daemon_handler / stop_all_daemons_for_project to
+    // ask the reaper task (which owns `child` and therefore pins the PID)
+    // to send SIGTERM. Routing kill requests through the reaper eliminates
+    // the PID-reuse TOCTOU: the kernel cannot recycle the child's PID
+    // until `Child::wait()` returns, and the reaper only calls `wait()`
+    // after either seeing a natural exit or performing the kill itself.
+    let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
 
     // Insert entry before spawning reaper
     {
@@ -369,7 +380,7 @@ pub async fn start_daemon_handler(
                 command: req.command.clone(),
                 started_at: std::time::SystemTime::now(),
                 status: DaemonStatus::Running,
-                pid,
+                kill_tx: Some(kill_tx),
                 log_path: log_path.clone(),
             },
         );
@@ -436,10 +447,35 @@ pub async fn start_daemon_handler(
             writer
         });
 
-        // Wait for child to exit
-        let exit_code = match child.wait().await {
-            Ok(status) => status.code().unwrap_or(-1),
-            Err(_) => -1,
+        // Wait for child to exit OR for a kill request from the stop
+        // handlers. Because this task owns `child`, the kernel cannot
+        // recycle the PID until we call `child.wait()` to completion —
+        // so `child.id()` in the kill branch is guaranteed to still
+        // reference this daemon's process group. This closes the
+        // PID-reuse TOCTOU that motivated issue #29.
+        let exit_code = tokio::select! {
+            res = child.wait() => {
+                match res {
+                    Ok(status) => status.code().unwrap_or(-1),
+                    Err(_) => -1,
+                }
+            }
+            _ = kill_rx => {
+                if let Some(pid) = child.id()
+                    && pid > 0
+                {
+                    // Kill the whole process group (see
+                    // `.process_group(0)` on spawn) so children of
+                    // `sh` are caught too.
+                    unsafe {
+                        libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
+                    }
+                }
+                match child.wait().await {
+                    Ok(status) => status.code().unwrap_or(-1),
+                    Err(_) => -1,
+                }
+            }
         };
 
         // Wait for both I/O pumps to finish
@@ -479,7 +515,7 @@ pub async fn stop_daemon_handler(
         return (status, msg.to_string()).into_response();
     }
 
-    let pid = {
+    let kill_tx = {
         let mut daemons = state.daemons.lock().await;
         match daemons.get_mut(&req.daemon_id) {
             None => return (StatusCode::NOT_FOUND, "Unknown daemon").into_response(),
@@ -491,17 +527,16 @@ pub async fn stop_daemon_handler(
             }
             Some(entry) => {
                 entry.status = DaemonStatus::Killed;
-                entry.pid
+                entry.kill_tx.take()
             }
         }
     };
 
-    if let Some(pid) = pid {
-        if pid > 0 {
-            unsafe {
-                libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
-            }
-        }
+    if let Some(tx) = kill_tx {
+        // Err means the reaper has already finished (child exited naturally).
+        // Status was set to Killed above and the reaper's status-update guard
+        // preserves it, so this is a graceful no-op.
+        let _ = tx.send(());
     }
 
     Json(serde_json::json!({"ok": true})).into_response()
@@ -666,7 +701,7 @@ mod tests {
             command: "test-command".to_string(),
             started_at: std::time::SystemTime::now(),
             status,
-            pid: None,
+            kill_tx: None,
             log_path,
         }
     }
@@ -756,7 +791,7 @@ mod tests {
             command: "sleep 10".to_string(),
             started_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1000),
             status: DaemonStatus::Running,
-            pid: Some(1234),
+            kill_tx: None,
             log_path: PathBuf::from("/tmp/test.log"),
         };
         let meta = DaemonMeta::from_entry(&entry);
@@ -816,7 +851,7 @@ mod tests {
             command: "cmd".to_string(),
             started_at: std::time::UNIX_EPOCH,
             status: DaemonStatus::Running,
-            pid: None,
+            kill_tx: None,
             log_path: PathBuf::from("/tmp/d1.log"),
         };
         let meta = DaemonMeta::from_entry(&entry);
@@ -869,7 +904,7 @@ mod tests {
                 command: "true".to_string(),
                 started_at: std::time::UNIX_EPOCH, // ancient
                 status: DaemonStatus::Finished { exit_code: 0 },
-                pid: None,
+                kill_tx: None,
                 log_path: log_path.clone(),
             },
         );
@@ -898,7 +933,7 @@ mod tests {
                 command: "sleep 9999".to_string(),
                 started_at: std::time::UNIX_EPOCH,
                 status: DaemonStatus::Killed,
-                pid: None,
+                kill_tx: None,
                 log_path: log_path.clone(),
             },
         );
@@ -946,7 +981,7 @@ mod tests {
                 command: "echo hi".to_string(),
                 started_at: std::time::SystemTime::now(), // just started
                 status: DaemonStatus::Finished { exit_code: 0 },
-                pid: None,
+                kill_tx: None,
                 log_path: log_path.clone(),
             },
         );
@@ -1500,6 +1535,116 @@ mod tests {
             assert_eq!(daemons[&daemon_id].status, DaemonStatus::Killed);
         }
 
+        #[tokio::test]
+        async fn stop_terminates_long_running_child() {
+            // Proves the oneshot-routed kill signal reaches the reaper and
+            // the child actually terminates (no PID-reuse TOCTOU).
+            let dir = TempDir::new().unwrap();
+            let state = make_state(dir.path());
+            pre_allow(dir.path(), dir.path(), "sleep 60");
+            let router = make_router(state.clone());
+
+            let start_resp = router
+                .oneshot(json_req(
+                    "/daemon/start",
+                    "key1",
+                    serde_json::json!({"project_id": "proj1", "command": "sleep 60"}),
+                ))
+                .await
+                .unwrap();
+            let daemon_id = to_json(start_resp).await["daemon_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+
+            let stop_resp = make_router(state.clone())
+                .oneshot(json_req(
+                    "/daemon/stop",
+                    "key1",
+                    serde_json::json!({"project_id": "proj1", "daemon_id": daemon_id.clone()}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(stop_resp.status(), axum::http::StatusCode::OK);
+
+            // After a stop request the reaper should:
+            //   1. receive the oneshot kill signal,
+            //   2. send SIGTERM to the process group,
+            //   3. call child.wait() which reaps the child,
+            //   4. consume the DaemonEntry.kill_tx (already taken by the stop handler),
+            //   5. leave status == Killed (preserved by the Running-guard).
+            // The entry's status is already Killed (set synchronously), but
+            // we need to confirm the reaper actually ran and didn't hang.
+            for _ in 0..400 {
+                let reaped = {
+                    let daemons = state.daemons.lock().await;
+                    let entry = &daemons[&daemon_id];
+                    // kill_tx was taken by the stop handler; the reaper then
+                    // consumed the receiver and exited. There is no direct
+                    // "reaper finished" flag, but the child log file will
+                    // have the Exit message written after wait() returns.
+                    entry.kill_tx.is_none() && entry.status == DaemonStatus::Killed
+                };
+                if reaped {
+                    // Extra: briefly confirm the log file now contains an Exit line.
+                    let log_path = {
+                        let daemons = state.daemons.lock().await;
+                        daemons[&daemon_id].log_path.clone()
+                    };
+                    for _ in 0..200 {
+                        if let Ok(bytes) = tokio::fs::read(&log_path).await
+                            && String::from_utf8_lossy(&bytes).contains("\"Exit\"")
+                        {
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    }
+                    panic!("reaper ran but never wrote Exit to the log file");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            panic!("daemon '{}' kill_tx was never consumed", daemon_id);
+        }
+
+        #[tokio::test]
+        async fn stop_running_daemon_is_idempotent() {
+            // Calling /daemon/stop twice on the same daemon must not panic
+            // and must keep returning 200 OK. The second call finds the
+            // daemon in status Killed and short-circuits to ok:true.
+            let dir = TempDir::new().unwrap();
+            let state = make_state(dir.path());
+            pre_allow(dir.path(), dir.path(), "sleep 60");
+            let router = make_router(state.clone());
+
+            let start_resp = router
+                .oneshot(json_req(
+                    "/daemon/start",
+                    "key1",
+                    serde_json::json!({"project_id": "proj1", "command": "sleep 60"}),
+                ))
+                .await
+                .unwrap();
+            let daemon_id = to_json(start_resp).await["daemon_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+
+            for _ in 0..2 {
+                let resp = make_router(state.clone())
+                    .oneshot(json_req(
+                        "/daemon/stop",
+                        "key1",
+                        serde_json::json!({
+                            "project_id": "proj1",
+                            "daemon_id": daemon_id.clone(),
+                        }),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            }
+        }
+
         // ── POST /daemon/stop-all ─────────────────────────────────────────────
 
         #[tokio::test]
@@ -1772,7 +1917,7 @@ mod tests {
                     command: "my-command".to_string(),
                     started_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(5000),
                     status: DaemonStatus::Finished { exit_code: 2 },
-                    pid: None,
+                    kill_tx: None,
                     log_path: dir.path().join("d1.log"),
                 },
             );

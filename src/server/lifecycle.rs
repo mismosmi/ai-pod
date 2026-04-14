@@ -18,6 +18,14 @@ pub const MCP_PORT: u16 = 7822;
 #[derive(Serialize, Deserialize, Default)]
 struct ServerState {
     pub pid: Option<u32>,
+    /// Path of the executable that was spawned for this server.
+    /// Used to verify (on Linux via /proc/<pid>/exe) that the PID we
+    /// loaded from disk still references our binary and has not been
+    /// recycled by the kernel to an unrelated process. Optional for
+    /// backwards compatibility with server state files written by
+    /// prior versions.
+    #[serde(default)]
+    pub exe_path: Option<String>,
 }
 
 /// Per-project state stored in ~/.ai-pod/{hash}.json
@@ -85,6 +93,43 @@ fn is_process_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
+/// Verify that the process at `pid` is still the same binary we spawned.
+///
+/// Returns true if the process is alive AND (on Linux) its `/proc/<pid>/exe`
+/// symlink target matches `expected_exe`. On non-Linux platforms, or when
+/// `expected_exe` is `None` (e.g. loaded from a server.json file written by
+/// a prior CLI version), falls back to a plain liveness check.
+///
+/// This closes a PID-reuse correctness gap in `ensure_shared_server`: after
+/// the shared server exits, a stale PID in `server.json` could otherwise
+/// pass `kill(pid, 0)` if the kernel recycled the PID to an unrelated
+/// process, causing us to skip the restart. No signals are sent here.
+fn is_server_process_alive(pid: u32, expected_exe: Option<&str>) -> bool {
+    if !is_process_alive(pid) {
+        return false;
+    }
+    let expected = match expected_exe {
+        Some(p) => p,
+        None => return true, // backwards-compat: no identity info stored
+    };
+
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_link(format!("/proc/{}/exe", pid)) {
+            Ok(target) => target.to_string_lossy() == expected,
+            Err(_) => false, // /proc entry gone → process is dead or inaccessible
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = expected;
+        // macOS has no /proc. Fall back to liveness-only; this is a
+        // correctness gap, not a security one, since no signal is sent.
+        true
+    }
+}
+
 /// Create the shared server log file with owner-only permissions (0o600).
 /// Truncates any existing file, matching `File::create` semantics, so each
 /// shared-server start gets a fresh log.
@@ -111,10 +156,10 @@ pub fn ensure_shared_server(config: &AppConfig) -> Result<()> {
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    if let Some(pid) = state.pid {
-        if is_process_alive(pid) {
-            return Ok(());
-        }
+    if let Some(pid) = state.pid
+        && is_server_process_alive(pid, state.exe_path.as_deref())
+    {
+        return Ok(());
     }
 
     let exe = std::env::current_exe().context("Failed to get current executable path")?;
@@ -131,7 +176,10 @@ pub fn ensure_shared_server(config: &AppConfig) -> Result<()> {
         .context("Failed to spawn shared server")?;
 
     let pid = child.id();
-    let new_state = ServerState { pid: Some(pid) };
+    let new_state = ServerState {
+        pid: Some(pid),
+        exe_path: Some(exe.to_string_lossy().to_string()),
+    };
     let json = serde_json::to_string_pretty(&new_state)?;
     let mut file = OpenOptions::new()
         .write(true)
