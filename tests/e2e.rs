@@ -408,7 +408,7 @@ fn e2e_clean_container_removes_all() {
     cleanup_image(&rt, tag);
 }
 
-/// Image built from `claude.Dockerfile` has `ubuntu` as the default user.
+/// Image built from `claude.Dockerfile` has `claude` as the default user.
 #[test]
 fn e2e_container_default_user() {
     let rt = require_runtime!();
@@ -427,8 +427,8 @@ fn e2e_container_default_user() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        "ubuntu",
-        "default user should be ubuntu"
+        "claude",
+        "default user should be claude"
     );
 
     cleanup_image(&rt, tag);

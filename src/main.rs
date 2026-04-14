@@ -16,7 +16,7 @@ fn resolve_workspace(workdir: &Option<std::path::PathBuf>) -> Result<std::path::
     }
 }
 
-fn init_project(workspace: &Path) -> Result<()> {
+fn init_project(workspace: &Path, agent: &str) -> Result<()> {
     let dockerfile = workspace.join(image::DOCKERFILE_NAME);
 
     if dockerfile.exists() {
@@ -28,7 +28,7 @@ fn init_project(workspace: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let default = include_str!("../claude.Dockerfile");
+    let default = include_str!("../templates/Dockerfile").replace("{{AGENT}}", agent);
     std::fs::write(&dockerfile, default).context("Failed to write ai-pod.Dockerfile")?;
 
     println!("{} {}", "Created:".green().bold(), dockerfile.display());
@@ -110,9 +110,13 @@ async fn main() -> Result<()> {
 
     // Commands that don't need a container runtime
     match &cli.command {
-        Some(Command::Init { workdir }) => {
+        Some(Command::Init { workdir, agent }) => {
             let workspace = resolve_workspace(workdir)?;
-            init_project(&workspace)?;
+            let agent_str = match agent {
+                cli::Agent::Claude => "claude",
+                cli::Agent::Opencode => "opencode",
+            };
+            init_project(&workspace, agent_str)?;
             return Ok(());
         }
         Some(Command::Allowed { action }) => {
