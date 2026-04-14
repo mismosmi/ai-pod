@@ -78,11 +78,7 @@ fn ensure_image(
 fn try_runtime() -> Option<MutexGuard<'static, ContainerRuntime>> {
     // Recover from a poisoned lock so one panicking test doesn't cascade into
     // PoisonError failures for every subsequent test.
-    Some(
-        RT.as_ref()?
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()),
-    )
+    Some(RT.as_ref()?.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 macro_rules! require_runtime {
@@ -118,7 +114,9 @@ fn make_test_config() -> (tempfile::TempDir, AppConfig) {
 fn make_test_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
     let ws = tempfile::TempDir::new().unwrap();
     let dst = ws.path().join(image::DOCKERFILE_NAME);
-    std::fs::write(&dst, r#"FROM ubuntu:latest
+    std::fs::write(
+        &dst,
+        r#"FROM ubuntu:latest
 RUN apt-get update && apt-get install -y curl git vim
 WORKDIR /app
 RUN useradd -ms /bin/bash claude && chown -R claude /app
@@ -127,7 +125,9 @@ RUN git config --system user.email "claude@ai-pod" && \
 USER claude
 ENV PATH="/home/claude/.local/bin:${PATH}"
 ENV EDITOR=vim
-"#).expect("failed to write test Dockerfile");
+"#,
+    )
+    .expect("failed to write test Dockerfile");
     (ws, dst)
 }
 
@@ -606,7 +606,9 @@ fn e2e_claude_doctor() {
     // the production claude.Dockerfile would.
     let ws = tempfile::TempDir::new().unwrap();
     let dockerfile = ws.path().join("Dockerfile");
-    std::fs::write(&dockerfile, r#"FROM rust:latest AS builder
+    std::fs::write(
+        &dockerfile,
+        r#"FROM rust:latest AS builder
 COPY . /build
 WORKDIR /build
 RUN cargo build --release --bin host-tools
@@ -623,7 +625,9 @@ USER claude
 ENV PATH="/home/claude/.local/bin:${PATH}"
 ENV EDITOR=vim
 CMD ["claude"]
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     // Build with project root as context (so COPY . /build gets the source)
     let project_root = std::env::current_dir().unwrap();
@@ -631,7 +635,6 @@ CMD ["claude"]
         .command()
         .args([
             "build",
-            "--no-cache",
             "-t",
             tag,
             "-f",
