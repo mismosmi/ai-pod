@@ -54,19 +54,23 @@ pub fn needs_build(rt: &ContainerRuntime, image: &str, force: bool) -> Result<bo
     Ok(!image_exists(rt, image)?)
 }
 
-pub fn build_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path, image: &str) -> Result<()> {
+pub fn build_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path, image: &str, no_cache: bool) -> Result<()> {
     println!("{}", "Building container image...".blue().bold());
 
-    let status = rt
-        .command()
-        .args([
-            "build",
-            "-t",
-            image,
-            "-f",
-            &dockerfile.to_string_lossy(),
-            &config.config_dir.to_string_lossy(),
-        ])
+    let mut cmd = rt.command();
+    cmd.arg("build");
+    if no_cache {
+        cmd.arg("--no-cache");
+    }
+    cmd.args([
+        "-t",
+        image,
+        "-f",
+        &dockerfile.to_string_lossy(),
+        &config.config_dir.to_string_lossy(),
+    ]);
+
+    let status = cmd
         .status()
         .context(format!("Failed to run {} build", rt.cmd()))?;
 
@@ -80,7 +84,7 @@ pub fn build_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path,
 
 pub fn ensure_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path, image: &str, force: bool) -> Result<()> {
     if needs_build(rt, image, force)? {
-        build_image(rt, config, dockerfile, image)?;
+        build_image(rt, config, dockerfile, image, force)?;
     } else {
         println!("{}", "Container image is up to date.".green());
     }
