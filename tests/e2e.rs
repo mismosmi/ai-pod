@@ -40,7 +40,7 @@ lazy_static! {
     };
 }
 
-fn build_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path, tag: &str) {
+fn build_image(rt: &ContainerRuntime, dockerfile: &Path, tag: &str) {
     let status = rt
         .command()
         .args([
@@ -49,7 +49,7 @@ fn build_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path, tag
             tag,
             "-f",
             &dockerfile.to_string_lossy(),
-            &config.config_dir.to_string_lossy(),
+            &dockerfile.parent().unwrap_or(Path::new(".")).to_string_lossy(),
         ])
         .status()
         .expect("failed to spawn container build");
@@ -58,13 +58,12 @@ fn build_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path, tag
 
 fn ensure_image(
     rt: &ContainerRuntime,
-    config: &AppConfig,
     dockerfile: &Path,
     tag: &str,
     force: bool,
 ) {
     if force || image::needs_build(rt, tag, false).unwrap() {
-        build_image(rt, config, dockerfile, tag);
+        build_image(rt, dockerfile, tag);
     }
 }
 
@@ -163,10 +162,10 @@ fn e2e_runtime_detect() {
 fn e2e_build_image() {
     let rt = require_runtime!();
     let (_ws, dockerfile) = make_test_workspace();
-    let (_dir, config) = make_test_config();
+    let (_dir, _config) = make_test_config();
     let tag = "ai-pod-e2e-build:test";
 
-    build_image(&rt, &config, &dockerfile, tag);
+    build_image(&rt, &dockerfile, tag);
 
     // Verify image exists via the runtime
     let status = rt
@@ -185,13 +184,13 @@ fn e2e_build_image() {
 fn e2e_needs_build_false_after_build() {
     let rt = require_runtime!();
     let (_ws, dockerfile) = make_test_workspace();
-    let (_dir, config) = make_test_config();
+    let (_dir, _config) = make_test_config();
     let tag = "ai-pod-e2e-needs:test";
 
     // Before build: needs_build should be true
     assert!(image::needs_build(&rt, tag, false).unwrap());
 
-    build_image(&rt, &config, &dockerfile, tag);
+    build_image(&rt, &dockerfile, tag);
 
     // After build: needs_build should be false
     assert!(!image::needs_build(&rt, tag, false).unwrap());
@@ -207,15 +206,15 @@ fn e2e_needs_build_false_after_build() {
 fn e2e_ensure_image_is_idempotent() {
     let rt = require_runtime!();
     let (_ws, dockerfile) = make_test_workspace();
-    let (_dir, config) = make_test_config();
+    let (_dir, _config) = make_test_config();
     let tag = "ai-pod-e2e-ensure:test";
 
     // First call builds
-    ensure_image(&rt, &config, &dockerfile, tag, false);
+    ensure_image(&rt, &dockerfile, tag, false);
     assert!(!image::needs_build(&rt, tag, false).unwrap());
 
     // Second call should succeed without rebuilding
-    ensure_image(&rt, &config, &dockerfile, tag, false);
+    ensure_image(&rt, &dockerfile, tag, false);
 
     cleanup_image(&rt, tag);
 }
@@ -225,12 +224,12 @@ fn e2e_ensure_image_is_idempotent() {
 fn e2e_image_name_produces_valid_tag() {
     let rt = require_runtime!();
     let (_ws, dockerfile) = make_test_workspace();
-    let (_dir, config) = make_test_config();
+    let (_dir, _config) = make_test_config();
 
     let ws_path = _ws.path();
     let tag = image::image_name(ws_path);
 
-    build_image(&rt, &config, &dockerfile, &tag);
+    build_image(&rt, &dockerfile, &tag);
     assert!(!image::needs_build(&rt, &tag, false).unwrap());
 
     cleanup_image(&rt, &tag);
@@ -297,10 +296,10 @@ fn e2e_workspace_naming_works_with_runtime() {
 fn e2e_containers_for_prefix() {
     let rt = require_runtime!();
     let (_ws, dockerfile) = make_test_workspace();
-    let (_dir, config) = make_test_config();
+    let (_dir, _config) = make_test_config();
     let tag = "ai-pod-e2e-prefix:test";
 
-    build_image(&rt, &config, &dockerfile, tag);
+    build_image(&rt, &dockerfile, tag);
 
     let ws = tempfile::TempDir::new().unwrap();
     let prefix = workspace::container_prefix(ws.path());
@@ -347,10 +346,10 @@ fn e2e_containers_for_prefix() {
 fn e2e_clean_container_removes_all() {
     let rt = require_runtime!();
     let (_ws, dockerfile) = make_test_workspace();
-    let (_dir, config) = make_test_config();
+    let (_dir, _config) = make_test_config();
     let tag = "ai-pod-e2e-clean:test";
 
-    build_image(&rt, &config, &dockerfile, tag);
+    build_image(&rt, &dockerfile, tag);
 
     let ws = tempfile::TempDir::new().unwrap();
     let prefix = workspace::container_prefix(ws.path());
@@ -413,10 +412,10 @@ fn e2e_clean_container_removes_all() {
 fn e2e_container_default_user() {
     let rt = require_runtime!();
     let (_ws, dockerfile) = make_test_workspace();
-    let (_dir, config) = make_test_config();
+    let (_dir, _config) = make_test_config();
     let tag = "ai-pod-e2e-user:test";
 
-    build_image(&rt, &config, &dockerfile, tag);
+    build_image(&rt, &dockerfile, tag);
 
     let output = rt
         .command()
@@ -439,10 +438,10 @@ fn e2e_container_default_user() {
 fn e2e_container_workdir_is_app() {
     let rt = require_runtime!();
     let (_ws, dockerfile) = make_test_workspace();
-    let (_dir, config) = make_test_config();
+    let (_dir, _config) = make_test_config();
     let tag = "ai-pod-e2e-workdir:test";
 
-    build_image(&rt, &config, &dockerfile, tag);
+    build_image(&rt, &dockerfile, tag);
 
     let output = rt
         .command()
@@ -494,9 +493,9 @@ async fn e2e_server_reachable_from_container() {
 
     // Build image (claude.Dockerfile has curl)
     let (_ws, dockerfile) = make_test_workspace();
-    let (_dir, config) = make_test_config();
+    let (_dir, _config) = make_test_config();
     let tag = "ai-pod-e2e-server:test";
-    build_image(&rt, &config, &dockerfile, tag);
+    build_image(&rt, &dockerfile, tag);
 
     // Start the production server on a free port
     let port = find_free_port();

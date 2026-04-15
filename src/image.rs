@@ -3,7 +3,6 @@ use colored::Colorize;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-use crate::config::AppConfig;
 use crate::runtime::ContainerRuntime;
 
 pub const DOCKERFILE_NAME: &str = "ai-pod.Dockerfile";
@@ -54,7 +53,7 @@ pub fn needs_build(rt: &ContainerRuntime, image: &str, force: bool) -> Result<bo
     Ok(!image_exists(rt, image)?)
 }
 
-pub fn build_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path, image: &str, no_cache: bool) -> Result<()> {
+pub fn build_image(rt: &ContainerRuntime, dockerfile: &Path, image: &str, no_cache: bool) -> Result<()> {
     println!("{}", "Building container image...".blue().bold());
 
     let version_arg = format!("AI_POD_VERSION={}", env!("CARGO_PKG_VERSION"));
@@ -70,7 +69,7 @@ pub fn build_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path,
         image,
         "-f",
         &dockerfile.to_string_lossy(),
-        &config.config_dir.to_string_lossy(),
+        &dockerfile.parent().unwrap_or(Path::new(".")).to_string_lossy(),
     ]);
 
     let status = cmd
@@ -85,9 +84,9 @@ pub fn build_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path,
     Ok(())
 }
 
-pub fn ensure_image(rt: &ContainerRuntime, config: &AppConfig, dockerfile: &Path, image: &str, force: bool) -> Result<()> {
+pub fn ensure_image(rt: &ContainerRuntime, dockerfile: &Path, image: &str, force: bool) -> Result<()> {
     if needs_build(rt, image, force)? {
-        build_image(rt, config, dockerfile, image, force)?;
+        build_image(rt, dockerfile, image, force)?;
     } else {
         println!("{}", "Container image is up to date.".green());
     }

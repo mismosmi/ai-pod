@@ -65,7 +65,7 @@ async fn launch_flow(cli: &Cli, rt: &ContainerRuntime) -> Result<()> {
 
     // 4. Build image if needed
     let image = image::image_name(&workspace);
-    image::ensure_image(rt, &config, &dockerfile, &image, cli.rebuild)?;
+    image::ensure_image(rt, &dockerfile, &image, cli.rebuild)?;
 
     // 5. Ensure shared server is running
     server::lifecycle::ensure_shared_server(&config)?;
@@ -173,7 +173,7 @@ async fn main() -> Result<()> {
                 );
             }
             let image = image::image_name(&workspace);
-            image::ensure_image(&rt, &config, &dockerfile, &image, cli.rebuild)?;
+            image::ensure_image(&rt, &dockerfile, &image, cli.rebuild)?;
         }
         Some(Command::Serve) => {
             let config = AppConfig::new()?;
@@ -209,7 +209,7 @@ async fn main() -> Result<()> {
                 }
             }
             let image = image::image_name(&workspace);
-            image::ensure_image(&rt, &config, &dockerfile, &image, cli.rebuild)?;
+            image::ensure_image(&rt, &dockerfile, &image, cli.rebuild)?;
 
             server::lifecycle::ensure_shared_server(&config)?;
             server::lifecycle::check_server_version().await?;
