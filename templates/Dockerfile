@@ -7,7 +7,7 @@ RUN ARCH=$(uname -m) && \
     curl -fsSL "https://github.com/mismosmi/ai-pod/releases/download/v${AI_POD_VERSION}/host-tools-linux-${ARCH}" \
       -o /usr/local/bin/host-tools && chmod +x /usr/local/bin/host-tools
 
-RUN host-tools install
+RUN host-tools install {{AGENT}}
 
 WORKDIR /app
 

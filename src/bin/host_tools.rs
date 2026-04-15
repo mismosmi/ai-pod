@@ -11,8 +11,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Install all AI coding agents system-wide (for use in Dockerfiles)
-    Install,
+    /// Install an AI coding agent system-wide (for use in Dockerfiles)
+    Install {
+        /// Which agent to install: "claude" or "opencode"
+        agent: String,
+    },
     /// Run a shell command on the host machine
     RunCommand {
         /// List previously approved commands
@@ -131,9 +134,14 @@ fn main() {
         .unwrap_or_else(|_| "http://host.containers.internal:7822".to_string());
 
     match cli.command {
-        Command::Install => {
-            install_all_agents();
-        }
+        Command::Install { agent } => match agent.as_str() {
+            "claude" => install_claude_stub(),
+            "opencode" => install_opencode_binary(),
+            other => {
+                eprintln!("Unknown agent: {other}");
+                std::process::exit(1);
+            }
+        },
         Command::RunCommand { list, command } => {
             if list {
                 run_list_commands(&project_id, &api_key, &server_url);
@@ -578,50 +586,74 @@ fn format_status(status: &serde_json::Value) -> String {
     serde_json::to_string(status).unwrap_or_else(|_| "unknown".to_string())
 }
 
-const CLAUDE_INSTALL_SCRIPT: &[u8] =
-    include_bytes!("../install_scripts/claude_install.sh");
-const OPENCODE_INSTALL_SCRIPT: &[u8] =
-    include_bytes!("../install_scripts/opencode_install.sh");
-
-fn install_all_agents() {
-    let agents: &[(&str, &[u8])] = &[
-        ("claude", CLAUDE_INSTALL_SCRIPT),
-        ("opencode", OPENCODE_INSTALL_SCRIPT),
-    ];
-    for (name, script) in agents {
-        install_stub(name, script);
-    }
-}
-
-/// Write an install script to /usr/local/bin/<name> that runs the embedded
-/// installer on first invocation, then hands off to the real binary.
-fn install_stub(name: &str, install_script: &[u8]) {
-    // Wrap the embedded installer in a one-shot launcher: run it once, then
-    // exec the real binary that the installer placed in ~/.local/bin.
-    let inner = std::str::from_utf8(install_script).unwrap_or_default();
-    let script = format!(
-        "#!/bin/sh\nset -e\n{inner}\nexec \"$HOME/.local/bin/{name}\" \"$@\"\n",
-        inner = inner,
-        name = name,
-    );
-
-    let path = format!("/usr/local/bin/{}", name);
-    if let Err(e) = std::fs::write(&path, script.as_bytes()) {
-        eprintln!("Failed to write {}: {}", path, e);
+fn install_claude_stub() {
+    let script = "#!/bin/sh\nset -e\ncurl -fsSL https://claude.ai/install.sh | bash\nexec \"$HOME/.local/bin/claude\" \"$@\"\n";
+    let path = "/usr/local/bin/claude";
+    if let Err(e) = std::fs::write(path, script.as_bytes()) {
+        eprintln!("Failed to write {path}: {e}");
         std::process::exit(1);
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)) {
+            eprintln!("Failed to chmod {path}: {e}");
+            std::process::exit(1);
+        }
+    }
+    eprintln!("Installed claude at {path}");
+}
+
+fn install_opencode_binary() {
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        other => {
+            eprintln!("Unsupported architecture: {other}");
+            std::process::exit(1);
+        }
+    };
+    let url = format!(
+        "https://github.com/anomalyco/opencode/releases/latest/download/opencode-linux-{arch}.tar.gz"
+    );
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let archive = tmp.path().join("opencode.tar.gz");
+
+    let ok = std::process::Command::new("curl")
+        .args(["-fsSL", &url, "-o", archive.to_str().unwrap()])
+        .status()
+        .expect("curl")
+        .success();
+    if !ok {
+        eprintln!("Failed to download opencode from {url}");
+        std::process::exit(1);
+    }
+
+    let ok = std::process::Command::new("tar")
+        .args(["-xzf", archive.to_str().unwrap(), "-C", tmp.path().to_str().unwrap()])
+        .status()
+        .expect("tar")
+        .success();
+    if !ok {
+        eprintln!("Failed to extract opencode archive");
+        std::process::exit(1);
+    }
+
+    let src = tmp.path().join("opencode");
+    std::fs::copy(&src, "/usr/local/bin/opencode").expect("copy opencode binary");
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)) {
-            eprintln!("Failed to chmod {}: {}", path, e);
-            std::process::exit(1);
-        }
+        std::fs::set_permissions(
+            "/usr/local/bin/opencode",
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod opencode");
     }
-
-    eprintln!("Installed {} at {}", name, path);
+    eprintln!("Installed opencode at /usr/local/bin/opencode");
 }
+
 
 fn format_unix_time(secs: u64) -> String {
     if secs == 0 {
