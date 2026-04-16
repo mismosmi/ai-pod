@@ -92,9 +92,9 @@ pub fn build_image(rt: &ContainerRuntime, dockerfile: &Path, image: &str, no_cac
     Ok(())
 }
 
-pub fn ensure_image(rt: &ContainerRuntime, dockerfile: &Path, image: &str, force: bool) -> Result<()> {
+pub fn ensure_image(rt: &ContainerRuntime, dockerfile: &Path, image: &str, force: bool, no_cache: bool) -> Result<()> {
     if needs_build(rt, image, force)? {
-        build_image(rt, dockerfile, image, force)?;
+        build_image(rt, dockerfile, image, no_cache)?;
     } else {
         println!("{}", "Container image is up to date.".green());
     }

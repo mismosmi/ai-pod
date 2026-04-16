@@ -21,6 +21,10 @@ pub struct Cli {
     #[arg(long)]
     pub rebuild: bool,
 
+    /// Build image without Docker/Podman layer cache
+    #[arg(long)]
+    pub no_cache: bool,
+
     /// Override workspace directory (default: cwd)
     #[arg(long)]
     pub workdir: Option<PathBuf>,
