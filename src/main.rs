@@ -63,12 +63,13 @@ async fn launch_flow(cli: &Cli, rt: &ContainerRuntime) -> Result<()> {
         }
     }
 
-    // 4. Build image if needed
+    // 4. Ensure shared server is running (must be up before image build so the
+    //    Dockerfile can fetch host-tools from http://{gateway}:7822/host-tools)
+    server::lifecycle::ensure_shared_server(&config)?;
+
+    // 5. Build image if needed
     let image = image::image_name(&workspace);
     image::ensure_image(rt, &dockerfile, &image, cli.rebuild)?;
-
-    // 5. Ensure shared server is running
-    server::lifecycle::ensure_shared_server(&config)?;
 
     // 6. Check server version compatibility
     server::lifecycle::check_server_version().await?;
@@ -172,6 +173,7 @@ async fn main() -> Result<()> {
                     workspace.display()
                 );
             }
+            server::lifecycle::ensure_shared_server(&config)?;
             let image = image::image_name(&workspace);
             image::ensure_image(&rt, &dockerfile, &image, cli.rebuild)?;
         }
@@ -208,10 +210,9 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
             }
+            server::lifecycle::ensure_shared_server(&config)?;
             let image = image::image_name(&workspace);
             image::ensure_image(&rt, &dockerfile, &image, cli.rebuild)?;
-
-            server::lifecycle::ensure_shared_server(&config)?;
             server::lifecycle::check_server_version().await?;
             let project_id = workspace::workspace_hash(&workspace);
             let state = server::lifecycle::get_or_create_project_state(&config, &workspace)?;

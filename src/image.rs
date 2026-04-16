@@ -57,14 +57,22 @@ pub fn build_image(rt: &ContainerRuntime, dockerfile: &Path, image: &str, no_cac
     println!("{}", "Building container image...".blue().bold());
 
     let version_arg = format!("AI_POD_VERSION={}", env!("CARGO_PKG_VERSION"));
+    let gateway_arg = format!("HOST_GATEWAY={}", rt.host_gateway());
     let mut cmd = rt.command();
     cmd.arg("build");
     if no_cache {
         cmd.arg("--no-cache");
     }
+    // For Docker, host.docker.internal is not automatically available in build
+    // containers — we need to inject it explicitly.
+    if rt.kind == crate::runtime::RuntimeKind::Docker {
+        cmd.args(["--add-host", &format!("{}:host-gateway", rt.host_gateway())]);
+    }
     cmd.args([
         "--build-arg",
         &version_arg,
+        "--build-arg",
+        &gateway_arg,
         "-t",
         image,
         "-f",
