@@ -101,7 +101,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Skip update check for internal/daemon commands
-    if !matches!(&cli.command, Some(Command::Serve)) {
+    if !matches!(&cli.command, Some(Command::Serve) | Some(Command::Update)) {
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(3),
             update::check_for_update(),
@@ -118,6 +118,10 @@ async fn main() -> Result<()> {
                 cli::Agent::Opencode => "opencode",
             };
             init_project(&workspace, agent_str)?;
+            return Ok(());
+        }
+        Some(Command::Update) => {
+            update::run_update().await?;
             return Ok(());
         }
         Some(Command::Allowed { action }) => {
