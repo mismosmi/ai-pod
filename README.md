@@ -118,7 +118,7 @@ The default image is based on Ubuntu and installs Claude Code via the official i
 
 ## Host interaction
 
-The `host-tools` binary is installed in every container at `/home/claude/.local/bin/host-tools`. Claude is taught to use it via a skill file that is automatically installed in each container.
+The `host-tools` binary is installed in every container at `/home/ai-pod/.local/bin/host-tools`. Claude is taught to use it via a skill file that is automatically installed in each container.
 
 ### host-tools run-command
 

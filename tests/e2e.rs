@@ -46,11 +46,11 @@ lazy_static! {
 const SHARED_DOCKERFILE: &str = r#"FROM alpine:latest
 RUN apk add --no-cache curl git vim
 WORKDIR /app
-RUN adduser -D claude && chown -R claude /app
-RUN git config --system user.email "claude@ai-pod" && \
-    git config --system user.name "claude"
-USER claude
-ENV PATH="/home/claude/.local/bin:${PATH}"
+RUN adduser -D ai-pod && chown -R ai-pod /app
+RUN git config --system user.email "ai-pod@ai-pod" && \
+    git config --system user.name "ai-pod"
+USER ai-pod
+ENV PATH="/home/ai-pod/.local/bin:${PATH}"
 ENV EDITOR=vim
 "#;
 
@@ -149,11 +149,11 @@ fn make_test_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
         r#"FROM alpine:latest
 RUN apk add --no-cache curl git vim
 WORKDIR /app
-RUN adduser -D claude && chown -R claude /app
-RUN git config --system user.email "claude@ai-pod" && \
-    git config --system user.name "claude"
-USER claude
-ENV PATH="/home/claude/.local/bin:${PATH}"
+RUN adduser -D ai-pod && chown -R ai-pod /app
+RUN git config --system user.email "ai-pod@ai-pod" && \
+    git config --system user.name "ai-pod"
+USER ai-pod
+ENV PATH="/home/ai-pod/.local/bin:${PATH}"
 ENV EDITOR=vim
 "#,
     )

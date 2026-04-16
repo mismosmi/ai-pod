@@ -8,16 +8,16 @@ RUN host-tools install claude
 
 WORKDIR /app
 
-RUN useradd -u 1000 -ms /bin/bash claude
-RUN chown -R claude /app
+RUN useradd -ms /bin/bash ai-pod
+RUN chown -R ai-pod /app
 
 # System-level git identity
-RUN git config --system user.email "claude@ai-pod" && \
-    git config --system user.name "claude"
+RUN git config --system user.email "ai-pod@ai-pod" && \
+    git config --system user.name "ai-pod"
 
-USER claude
+USER ai-pod
 
-ENV PATH="/home/claude/.local/bin:${PATH}"
+ENV PATH="/home/ai-pod/.local/bin:${PATH}"
 
 
 CMD ["claude"]
