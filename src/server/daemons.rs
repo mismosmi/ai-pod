@@ -1334,6 +1334,7 @@ mod tests {
 
             #[derive(Deserialize)]
             #[serde(tag = "type", content = "data")]
+            #[allow(dead_code)]
             enum Msg {
                 Stdout(String),
                 Stderr(String),
@@ -1921,6 +1922,7 @@ mod tests {
             // Parse line-delimited JSON messages
             #[derive(Deserialize)]
             #[serde(tag = "type", content = "data")]
+            #[allow(dead_code)]
             enum Msg {
                 Stdout(String),
                 Stderr(String),
@@ -1994,6 +1996,7 @@ mod tests {
 
             #[derive(Deserialize)]
             #[serde(tag = "type", content = "data")]
+            #[allow(dead_code)]
             enum Msg {
                 Stdout(String),
                 Stderr(String),
