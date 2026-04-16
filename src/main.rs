@@ -158,7 +158,7 @@ async fn main() -> Result<()> {
     }
 
     // Detect container runtime (podman preferred, docker fallback)
-    let rt = ContainerRuntime::detect()?;
+    let rt = ContainerRuntime::detect(cli.dry_run)?;
 
     match &cli.command {
         Some(Command::Build) => {

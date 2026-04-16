@@ -750,6 +750,7 @@ mod tests {
     fn test_runtime() -> ContainerRuntime {
         ContainerRuntime {
             kind: RuntimeKind::Podman,
+            dry_run: false,
         }
     }
 
@@ -902,6 +903,7 @@ mod tests {
         let config = make_test_config(&dir);
         let rt = ContainerRuntime {
             kind: RuntimeKind::Docker,
+            dry_run: false,
         };
         generate_runtime_claude_md(&rt, &config).unwrap();
 

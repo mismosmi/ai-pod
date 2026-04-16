@@ -22,6 +22,7 @@ fn make_state(config_dir: &std::path::Path) -> AppState {
         daemons: Arc::new(Mutex::new(HashMap::new())),
         runtime: ContainerRuntime {
             kind: RuntimeKind::Podman,
+            dry_run: false,
         },
     }
 }

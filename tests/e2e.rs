@@ -26,7 +26,7 @@ lazy_static! {
     /// `None` means no runtime is available on this machine; tests that
     /// require one skip via `try_runtime()`.
     static ref RT: Option<Mutex<ContainerRuntime>> = {
-        let rt = ContainerRuntime::detect().ok()?;
+        let rt = ContainerRuntime::detect(false).ok()?;
         // detect() only checks `--version`; probe `info` to confirm the
         // daemon is actually running.
         let ok = rt
