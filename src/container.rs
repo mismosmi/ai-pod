@@ -21,22 +21,31 @@ fn container_claude_md(rt: &ContainerRuntime) -> String {
         display_name: rt.display_name(),
         host_gateway: rt.host_gateway(),
     };
-    tmpl.render().expect("failed to render container CLAUDE.md template")
+    tmpl.render()
+        .expect("failed to render container CLAUDE.md template")
 }
-
-/// Setup script: installs Claude Code.
-const SETUP_SCRIPT: &str = include_str!("../templates/setup_script.sh");
 
 const SKILL_MD: &str = include_str!("../templates/skill.md");
 
-pub fn containers_for_prefix(rt: &ContainerRuntime, prefix: &str, running_only: bool) -> Result<Vec<String>> {
+pub fn containers_for_prefix(
+    rt: &ContainerRuntime,
+    prefix: &str,
+    running_only: bool,
+) -> Result<Vec<String>> {
     let filter = format!("name=^{}-", prefix);
     let mut cmd = rt.command();
     cmd.arg("ps");
     if !running_only {
         cmd.arg("-a");
     }
-    cmd.args(["--filter", &filter, "--filter", "label=managed-by=ai-pod", "--format", "{{.Names}}"]);
+    cmd.args([
+        "--filter",
+        &filter,
+        "--filter",
+        "label=managed-by=ai-pod",
+        "--format",
+        "{{.Names}}",
+    ]);
     let output = cmd.output().context("Failed to list containers")?;
     let names = String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -466,13 +475,31 @@ pub fn launch_container(
             let _ = rt.command().args(["rm", "--force", &name]).status();
         }
         if volume_exists(rt, &volume_name)? {
-            reseed_home_volume(rt, config, &volume_name, &prefix, image, project_id, api_key, &home_dir)?;
+            reseed_home_volume(
+                rt,
+                config,
+                &volume_name,
+                &prefix,
+                image,
+                project_id,
+                api_key,
+                &home_dir,
+            )?;
         }
     }
 
     // Init home volume if it doesn't exist
     if !volume_exists(rt, &volume_name)? {
-        init_home_volume(rt, config, &volume_name, &prefix, image, project_id, api_key, &home_dir)?;
+        init_home_volume(
+            rt,
+            config,
+            &volume_name,
+            &prefix,
+            image,
+            project_id,
+            api_key,
+            &home_dir,
+        )?;
     }
 
     let container_name = new_container_name(workspace);
