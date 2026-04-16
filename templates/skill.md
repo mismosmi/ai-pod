@@ -1,11 +1,11 @@
 ---
 name: ai-pod
-description: This skill should be used when the user asks to run a command on the host machine, open an application on the host, send a desktop notification to the user, list previously approved host commands, or manage long-running background processes (daemons) on the host. Provides the host-tools binary at /home/claude/.local/bin/host-tools.
+description: This skill should be used when the user asks to run a command on the host machine, open an application on the host, send a desktop notification to the user, list previously approved host commands, or manage long-running background processes (daemons) on the host. Provides the host-tools binary at /home/ai-pod/.local/bin/host-tools.
 version: 0.1.0
 ---
 # host-tools — Host Interaction
 
-`/home/claude/.local/bin/host-tools` interacts with the host machine from inside this container.
+`/home/ai-pod/.local/bin/host-tools` interacts with the host machine from inside this container.
 
 ## run-command
 

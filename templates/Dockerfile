@@ -14,12 +14,12 @@ WORKDIR /app
 {{CREATE_USER}}
 
 # System-level git identity (fallback when no host identity is provided)
-RUN git config --system user.email "{{AGENT}}@ai-pod" && \
-    git config --system user.name "{{AGENT}}"
+RUN git config --system user.email "ai-pod@ai-pod" && \
+    git config --system user.name "ai-pod"
 
-USER {{AGENT}}
+USER ai-pod
 
-ENV PATH="/home/{{AGENT}}/.local/bin:${PATH}"
+ENV PATH="/home/ai-pod/.local/bin:${PATH}"
 ENV EDITOR=vim
 
 CMD ["{{AGENT}}"]

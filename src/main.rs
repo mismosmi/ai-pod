@@ -80,27 +80,27 @@ fn base_image_config(image: &cli::BaseImage) -> BaseImageConfig {
         cli::BaseImage::Alpine => BaseImageConfig {
             from: "alpine:latest",
             install_packages: "RUN apk add --no-cache curl git vim bash",
-            create_user: "RUN adduser -D -h /home/{{AGENT}} {{AGENT}} && chown -R {{AGENT}} /app",
+            create_user: "RUN adduser -D -h /home/ai-pod ai-pod && chown -R ai-pod /app",
         },
         cli::BaseImage::Ubuntu => BaseImageConfig {
             from: "ubuntu:latest",
             install_packages: "RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git vim && rm -rf /var/lib/apt/lists/*",
-            create_user: "RUN useradd -ms /bin/bash {{AGENT}} && chown -R {{AGENT}} /app",
+            create_user: "RUN useradd -ms /bin/bash ai-pod && chown -R ai-pod /app",
         },
         cli::BaseImage::Node => BaseImageConfig {
             from: "node:lts",
             install_packages: "RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git vim && rm -rf /var/lib/apt/lists/*",
-            create_user: "RUN useradd -ms /bin/bash {{AGENT}} && chown -R {{AGENT}} /app",
+            create_user: "RUN useradd -ms /bin/bash ai-pod && chown -R ai-pod /app",
         },
         cli::BaseImage::Rust => BaseImageConfig {
             from: "rust:latest",
             install_packages: "RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git vim && rm -rf /var/lib/apt/lists/*",
-            create_user: "RUN useradd -ms /bin/bash {{AGENT}} && chown -R {{AGENT}} /app",
+            create_user: "RUN useradd -ms /bin/bash ai-pod && chown -R ai-pod /app",
         },
         cli::BaseImage::Python => BaseImageConfig {
             from: "python:latest",
             install_packages: "RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git vim && rm -rf /var/lib/apt/lists/*",
-            create_user: "RUN useradd -ms /bin/bash {{AGENT}} && chown -R {{AGENT}} /app",
+            create_user: "RUN useradd -ms /bin/bash ai-pod && chown -R ai-pod /app",
         },
     }
 }
