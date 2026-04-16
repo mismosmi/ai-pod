@@ -30,7 +30,9 @@ pub enum CheckResult {
 }
 
 /// Build the osascript Command for requesting user approval on macOS.
-/// Not cfg-gated so that tests can verify the command structure on all platforms.
+/// cfg-gated to macOS production code and tests so the function is available
+/// on all platforms for test verification without triggering dead_code warnings.
+#[cfg(any(target_os = "macos", test))]
 fn build_approval_command(command: &str, project_name: &str) -> std::process::Command {
     let script = include_str!("../../templates/approval_dialog.applescript");
     let mut c = std::process::Command::new("osascript");

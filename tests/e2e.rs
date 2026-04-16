@@ -12,7 +12,7 @@ use ai_pod::workspace;
 
 use lazy_static::lazy_static;
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 lazy_static! {
     /// Shared container runtime, lazily detected on first access. Wrapped in a
@@ -38,6 +38,37 @@ lazy_static! {
             .is_ok_and(|s| s.success());
         ok.then(|| Mutex::new(rt))
     };
+}
+
+/// The Dockerfile used by most e2e tests. Hardcoded here so we can build it
+/// once and reuse the resulting image across all tests that don't specifically
+/// test build behaviour.
+const SHARED_DOCKERFILE: &str = r#"FROM ubuntu:latest
+RUN apt-get update && apt-get install -y curl git vim
+WORKDIR /app
+RUN useradd -ms /bin/bash claude && chown -R claude /app
+RUN git config --system user.email "claude@ai-pod" && \
+    git config --system user.name "claude"
+USER claude
+ENV PATH="/home/claude/.local/bin:${PATH}"
+ENV EDITOR=vim
+"#;
+
+const SHARED_IMAGE_TAG: &str = "ai-pod-e2e-shared:test";
+static SHARED_IMAGE_BUILT: OnceLock<()> = OnceLock::new();
+
+/// Returns the shared test image tag, building it on the first call.
+///
+/// Tests are serialised by the RT Mutex, so the `OnceLock` initialiser runs
+/// exactly once even though `OnceLock` itself is also thread-safe.
+fn shared_image_tag(rt: &ContainerRuntime) -> &'static str {
+    SHARED_IMAGE_BUILT.get_or_init(|| {
+        let ws = tempfile::TempDir::new().unwrap();
+        let dst = ws.path().join(image::DOCKERFILE_NAME);
+        std::fs::write(&dst, SHARED_DOCKERFILE).expect("write shared dockerfile");
+        ensure_image(rt, &dst, SHARED_IMAGE_TAG, false);
+    });
+    SHARED_IMAGE_TAG
 }
 
 fn build_image(rt: &ContainerRuntime, dockerfile: &Path, tag: &str) {
@@ -295,11 +326,7 @@ fn e2e_workspace_naming_works_with_runtime() {
 #[test]
 fn e2e_containers_for_prefix() {
     let rt = require_runtime!();
-    let (_ws, dockerfile) = make_test_workspace();
-    let (_dir, _config) = make_test_config();
-    let tag = "ai-pod-e2e-prefix:test";
-
-    build_image(&rt, &dockerfile, tag);
+    let tag = shared_image_tag(&rt);
 
     let ws = tempfile::TempDir::new().unwrap();
     let prefix = workspace::container_prefix(ws.path());
@@ -338,18 +365,13 @@ fn e2e_containers_for_prefix() {
     assert!(found_all.contains(&name));
 
     cleanup_container(&rt, &name);
-    cleanup_image(&rt, tag);
 }
 
 /// `container::clean_container()` removes containers and volumes for a workspace.
 #[test]
 fn e2e_clean_container_removes_all() {
     let rt = require_runtime!();
-    let (_ws, dockerfile) = make_test_workspace();
-    let (_dir, _config) = make_test_config();
-    let tag = "ai-pod-e2e-clean:test";
-
-    build_image(&rt, &dockerfile, tag);
+    let tag = shared_image_tag(&rt);
 
     let ws = tempfile::TempDir::new().unwrap();
     let prefix = workspace::container_prefix(ws.path());
@@ -404,18 +426,13 @@ fn e2e_clean_container_removes_all() {
         "containers should be removed"
     );
 
-    cleanup_image(&rt, tag);
 }
 
 /// Image built from `claude.Dockerfile` has `claude` as the default user.
 #[test]
 fn e2e_container_default_user() {
     let rt = require_runtime!();
-    let (_ws, dockerfile) = make_test_workspace();
-    let (_dir, _config) = make_test_config();
-    let tag = "ai-pod-e2e-user:test";
-
-    build_image(&rt, &dockerfile, tag);
+    let tag = shared_image_tag(&rt);
 
     let output = rt
         .command()
@@ -429,19 +446,13 @@ fn e2e_container_default_user() {
         "claude",
         "default user should be claude"
     );
-
-    cleanup_image(&rt, tag);
 }
 
 /// Image built from `claude.Dockerfile` has `/app` as WORKDIR.
 #[test]
 fn e2e_container_workdir_is_app() {
     let rt = require_runtime!();
-    let (_ws, dockerfile) = make_test_workspace();
-    let (_dir, _config) = make_test_config();
-    let tag = "ai-pod-e2e-workdir:test";
-
-    build_image(&rt, &dockerfile, tag);
+    let tag = shared_image_tag(&rt);
 
     let output = rt
         .command()
@@ -455,8 +466,6 @@ fn e2e_container_workdir_is_app() {
         "/app",
         "WORKDIR should be /app"
     );
-
-    cleanup_image(&rt, tag);
 }
 
 // ---------------------------------------------------------------------------
@@ -491,11 +500,8 @@ async fn e2e_server_reachable_from_container() {
         }
     };
 
-    // Build image (claude.Dockerfile has curl)
-    let (_ws, dockerfile) = make_test_workspace();
-    let (_dir, _config) = make_test_config();
-    let tag = "ai-pod-e2e-server:test";
-    build_image(&rt, &dockerfile, tag);
+    // Use the shared test image (has curl from apt-get install)
+    let tag = shared_image_tag(&rt);
 
     // Start the production server on a free port
     let port = find_free_port();
@@ -577,9 +583,7 @@ async fn e2e_server_reachable_from_container() {
         body
     );
 
-    // Cleanup
     server_handle.abort();
-    cleanup_image(&rt, tag);
 }
 
 /// Build an image with `host-tools install` (multi-stage, builds
