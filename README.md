@@ -83,6 +83,7 @@ ai-pod --workdir /path/to/project
 | `clean [--workdir PATH]` | Stop and remove the container for a workspace |
 | `run <command> [args...]` | Run a command in the container instead of the default |
 | `serve` | Start the shared server manually (normally auto-started) |
+| `update` | Fetch the latest install script and run it to upgrade |
 
 ### Run a specific command in the container
 

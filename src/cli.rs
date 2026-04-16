@@ -88,6 +88,9 @@ pub enum Command {
         #[command(subcommand)]
         action: AllowedAction,
     },
+
+    /// Update ai-pod to the latest release
+    Update,
 }
 
 #[derive(Subcommand)]

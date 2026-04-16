@@ -1,7 +1,52 @@
+use anyhow::{Context, Result};
 use colored::Colorize;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RELEASES_URL: &str = "https://api.github.com/repos/mismosmi/ai-pod/releases/latest";
+const INSTALL_SCRIPT_URL: &str =
+    "https://raw.githubusercontent.com/mismosmi/ai-pod/main/install.sh";
+
+pub async fn run_update() -> Result<()> {
+    println!("{} {}", "Fetching".blue().bold(), INSTALL_SCRIPT_URL);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent(format!("ai-pod/{CURRENT_VERSION}"))
+        .build()?;
+
+    let script = client
+        .get(INSTALL_SCRIPT_URL)
+        .send()
+        .await?
+        .error_for_status()
+        .context("Failed to download install script")?
+        .text()
+        .await?;
+
+    println!("{}", "Running install script...".blue().bold());
+
+    let mut child = Command::new("bash")
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("Failed to spawn bash")?;
+
+    child
+        .stdin
+        .as_mut()
+        .context("Failed to open bash stdin")?
+        .write_all(script.as_bytes())
+        .context("Failed to write install script to bash")?;
+
+    let status = child.wait().context("Failed to wait for bash")?;
+
+    if !status.success() {
+        anyhow::bail!("Install script exited with {status}");
+    }
+
+    Ok(())
+}
 
 pub async fn check_for_update() {
     if let Ok(latest) = fetch_latest_version().await {
