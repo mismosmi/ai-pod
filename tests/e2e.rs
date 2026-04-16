@@ -20,7 +20,7 @@ lazy_static! {
     /// `build`. Parallel podman commands sharing the overlay cache corrupt
     /// each other ("layer not known", missing `merged` dir), which is why
     /// builds previously had to pass --no-cache. Locking the whole runtime
-    /// lets us keep the layer cache enabled so ubuntu and apt aren't
+    /// lets us keep the layer cache enabled so alpine and apk aren't
     /// re-fetched for every test.
     ///
     /// `None` means no runtime is available on this machine; tests that
@@ -43,10 +43,10 @@ lazy_static! {
 /// The Dockerfile used by most e2e tests. Hardcoded here so we can build it
 /// once and reuse the resulting image across all tests that don't specifically
 /// test build behaviour.
-const SHARED_DOCKERFILE: &str = r#"FROM ubuntu:latest
-RUN apt-get update && apt-get install -y curl git vim
+const SHARED_DOCKERFILE: &str = r#"FROM alpine:latest
+RUN apk add --no-cache curl git vim
 WORKDIR /app
-RUN useradd -ms /bin/bash claude && chown -R claude /app
+RUN adduser -D claude && chown -R claude /app
 RUN git config --system user.email "claude@ai-pod" && \
     git config --system user.name "claude"
 USER claude
@@ -146,10 +146,10 @@ fn make_test_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
     let dst = ws.path().join(image::DOCKERFILE_NAME);
     std::fs::write(
         &dst,
-        r#"FROM ubuntu:latest
-RUN apt-get update && apt-get install -y curl git vim
+        r#"FROM alpine:latest
+RUN apk add --no-cache curl git vim
 WORKDIR /app
-RUN useradd -ms /bin/bash claude && chown -R claude /app
+RUN adduser -D claude && chown -R claude /app
 RUN git config --system user.email "claude@ai-pod" && \
     git config --system user.name "claude"
 USER claude
@@ -500,7 +500,7 @@ async fn e2e_server_reachable_from_container() {
         }
     };
 
-    // Use the shared test image (has curl from apt-get install)
+    // Use the shared test image (has curl from apk add)
     let tag = shared_image_tag(&rt);
 
     // Start the production server on a free port
@@ -616,12 +616,12 @@ COPY . /build
 WORKDIR /build
 RUN cargo build --release --bin host-tools
 
-FROM ubuntu:latest
-RUN apt-get update && apt-get install -y curl git vim
+FROM alpine:latest
+RUN apk add --no-cache curl git vim
 COPY --from=builder /build/target/release/host-tools /usr/local/bin/host-tools
 RUN host-tools install
 WORKDIR /app
-RUN useradd -ms /bin/bash claude && chown -R claude /app
+RUN adduser -D claude && chown -R claude /app
 RUN git config --system user.email "claude@ai-pod" && \
     git config --system user.name "claude"
 USER claude
