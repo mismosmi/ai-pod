@@ -9,7 +9,7 @@ use axum::{
     extract::{Request, State},
     http::{StatusCode, header},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde_json::json;
@@ -46,6 +46,23 @@ async fn health_handler() -> &'static str {
 
 async fn version_handler() -> Json<serde_json::Value> {
     Json(json!({ "version": env!("CARGO_PKG_VERSION") }))
+}
+
+async fn host_tools_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let path = state.config_dir.join("host-tools");
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            "host-tools not cached. Run install.sh or install-local.sh first.",
+        )
+            .into_response(),
+    }
 }
 
 /// Middleware that translates tower_governor's non-standard
@@ -95,7 +112,8 @@ pub fn build_app(state: AppState) -> Router {
         }
     });
 
-    Router::new()
+    // Rate-limited routes (API endpoints that could be brute-forced or flooded)
+    let rate_limited = Router::new()
         .route("/health", get(health_handler))
         .route("/version", get(version_handler))
         .route("/reload", post(reload_handler))
@@ -111,7 +129,12 @@ pub fn build_app(state: AppState) -> Router {
         .layer(GovernorLayer { config: governor_conf })
         // Applied after GovernorLayer so it sees the 429 response and can
         // rewrite the header.
-        .layer(middleware::from_fn(add_retry_after_header))
+        .layer(middleware::from_fn(add_retry_after_header));
+
+    // Unthrottled routes (large static file downloads that should not be rate-limited)
+    Router::new()
+        .route("/host-tools", get(host_tools_handler))
+        .merge(rate_limited)
         .with_state(state)
 }
 

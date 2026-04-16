@@ -28,6 +28,7 @@ case "${ARCH}" in
 esac
 
 ASSET_NAME="${BINARY_NAME}-${OS_NAME}-${ARCH_NAME}"
+HOST_TOOLS_DIR="${HOME}/.ai-pod"
 
 # Resolve latest release tag by following the redirect
 echo "Fetching latest release..."
@@ -44,10 +45,12 @@ DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/${ASSET
 
 # Create install directory
 mkdir -p "${INSTALL_DIR}"
+mkdir -p "${HOST_TOOLS_DIR}"
 
 # Download binary to a temp file, then move into place
 TMP="$(mktemp)"
-trap 'rm -f "${TMP}"' EXIT
+TMP2="$(mktemp)"
+trap 'rm -f "${TMP}" "${TMP2}"' EXIT
 
 if ! curl -fsSL "${DOWNLOAD_URL}" -o "${TMP}"; then
   echo "Download failed: ${DOWNLOAD_URL}" >&2
@@ -58,6 +61,17 @@ chmod +x "${TMP}"
 mv "${TMP}" "${INSTALL_DIR}/${BINARY_NAME}"
 
 echo "Installed ${BINARY_NAME} to ${INSTALL_DIR}/${BINARY_NAME}"
+
+# Download host-tools for Linux (always linux — it runs inside containers)
+HOST_TOOLS_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/host-tools-linux-${ARCH_NAME}"
+echo "Caching host-tools to ${HOST_TOOLS_DIR}/host-tools..."
+if curl -fsSL "${HOST_TOOLS_URL}" -o "${TMP2}"; then
+  chmod +x "${TMP2}"
+  mv "${TMP2}" "${HOST_TOOLS_DIR}/host-tools"
+  echo "Cached host-tools to ${HOST_TOOLS_DIR}/host-tools"
+else
+  echo "Warning: could not download host-tools from ${HOST_TOOLS_URL}" >&2
+fi
 
 # Advise the user if the install dir isn't in PATH
 if ! printf '%s\n' "${PATH//:/$'\n'}" | grep -qx "${INSTALL_DIR}"; then

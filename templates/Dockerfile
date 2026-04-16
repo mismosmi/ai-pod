@@ -2,9 +2,8 @@ FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y curl git vim
 
-ARG AI_POD_VERSION
-RUN ARCH=$(uname -m) && \
-    curl -fsSL "https://github.com/mismosmi/ai-pod/releases/download/v${AI_POD_VERSION}/host-tools-linux-${ARCH}" \
+ARG HOST_GATEWAY
+RUN curl -fsSL "http://${HOST_GATEWAY}:7822/host-tools" \
       -o /usr/local/bin/host-tools && chmod +x /usr/local/bin/host-tools
 
 RUN host-tools install {{AGENT}}
