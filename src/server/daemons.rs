@@ -695,6 +695,7 @@ mod tests {
             daemons: Arc::new(Mutex::new(HashMap::new())),
             runtime: crate::runtime::ContainerRuntime {
                 kind: crate::runtime::RuntimeKind::Podman,
+                dry_run: false,
             },
         }
     }
@@ -1267,6 +1268,7 @@ mod tests {
                 daemons: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 runtime: crate::runtime::ContainerRuntime {
                     kind: crate::runtime::RuntimeKind::Podman,
+                    dry_run: false,
                 },
             };
 

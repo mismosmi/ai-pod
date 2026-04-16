@@ -166,7 +166,7 @@ mod tests {
     #[test]
     fn needs_build_returns_true_when_force() {
         use crate::runtime::{ContainerRuntime, RuntimeKind};
-        let rt = ContainerRuntime { kind: RuntimeKind::Podman };
+        let rt = ContainerRuntime { kind: RuntimeKind::Podman, dry_run: false };
         assert!(needs_build(&rt, "any-image", true).unwrap());
     }
 }
