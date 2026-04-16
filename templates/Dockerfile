@@ -1,6 +1,6 @@
 FROM alpine:latest
 
-RUN apk add --no-cache curl git vim
+RUN apk add --no-cache curl git vim bash
 
 ARG HOST_GATEWAY
 RUN curl -fsSL "http://${HOST_GATEWAY}:7822/host-tools" \
