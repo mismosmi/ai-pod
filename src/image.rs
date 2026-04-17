@@ -2,8 +2,11 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::runtime::ContainerRuntime;
+use crate::server::lifecycle::MCP_PORT;
 
 pub const DOCKERFILE_NAME: &str = "ai-pod.Dockerfile";
 
@@ -80,10 +83,31 @@ pub fn build_image(rt: &ContainerRuntime, dockerfile: &Path, image: &str, no_cac
         &dockerfile.parent().unwrap_or(Path::new(".")).to_string_lossy(),
     ]);
 
+    // Keep the shared server alive during the build by pinging /keepalive every 10s.
+    // No containers are running while the Dockerfile executes, so without this the
+    // server's idle-timeout would fire and kill itself mid-build.
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+    let keepalive_thread = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::new();
+        let url = format!("http://127.0.0.1:{}/keepalive", MCP_PORT);
+        while !stop_clone.load(Ordering::Relaxed) {
+            let _ = client
+                .get(&url)
+                .timeout(std::time::Duration::from_secs(5))
+                .send();
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        }
+    });
+
     let status = cmd
         .status()
-        .context(format!("Failed to run {} build", rt.cmd()))?;
+        .context(format!("Failed to run {} build", rt.cmd()));
 
+    stop.store(true, Ordering::Relaxed);
+    let _ = keepalive_thread.join();
+
+    let status = status?;
     if !status.success() {
         anyhow::bail!("{} build failed", rt.cmd());
     }

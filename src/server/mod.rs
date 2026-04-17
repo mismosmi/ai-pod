@@ -17,6 +17,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 
@@ -38,9 +40,22 @@ pub struct AppState {
     pub approval_lock: Arc<Mutex<()>>,
     pub daemons: Arc<Mutex<HashMap<String, DaemonEntry>>>,
     pub runtime: ContainerRuntime,
+    pub last_keepalive: Arc<AtomicU64>,
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 async fn health_handler() -> &'static str {
+    "ok"
+}
+
+async fn keepalive_handler(State(state): State<AppState>) -> &'static str {
+    state.last_keepalive.store(now_secs(), Ordering::Relaxed);
     "ok"
 }
 
@@ -131,9 +146,10 @@ pub fn build_app(state: AppState) -> Router {
         // rewrite the header.
         .layer(middleware::from_fn(add_retry_after_header));
 
-    // Unthrottled routes (large static file downloads that should not be rate-limited)
+    // Unthrottled routes (large static file downloads and frequent heartbeats)
     Router::new()
         .route("/host-tools", get(host_tools_handler))
+        .route("/keepalive", get(keepalive_handler))
         .merge(rate_limited)
         .with_state(state)
 }
@@ -205,6 +221,7 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
         approval_lock: Arc::new(Mutex::new(())),
         daemons: Arc::new(Mutex::new(HashMap::new())),
         runtime: rt,
+        last_keepalive: Arc::new(AtomicU64::new(now_secs())),
     };
 
     // Background task: kill daemons when their project has no running containers
@@ -217,13 +234,15 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
         }
     });
 
-    // Background task: shut down server when all claude-* containers have stopped
+    // Background task: shut down server when no ai-pod containers have been running
+    // for 30 seconds. The /keepalive endpoint resets the idle timer so long-running
+    // builds (which have no containers yet) can keep the server alive.
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let shutdown_rt = state.runtime.clone();
+    let shutdown_keepalive = state.last_keepalive.clone();
     tokio::spawn(async move {
-        // Grace period: allow container to start before first check
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             let output = shutdown_rt
                 .async_command()
                 .args(["ps", "--filter", "label=managed-by=ai-pod", "--format", "{{.Names}}"])
@@ -233,10 +252,13 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
                 .map(|o| String::from_utf8_lossy(&o.stdout).lines().any(|l| !l.is_empty()))
                 .unwrap_or(true); // on error, stay alive
             if !has_containers {
-                let _ = shutdown_tx.send(());
-                break;
+                let idle_secs = now_secs()
+                    .saturating_sub(shutdown_keepalive.load(Ordering::Relaxed));
+                if idle_secs > 30 {
+                    let _ = shutdown_tx.send(());
+                    break;
+                }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         }
     });
 
