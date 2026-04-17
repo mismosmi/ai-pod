@@ -38,10 +38,6 @@ pub struct Cli {
     #[arg(long)]
     pub workdir: Option<PathBuf>,
 
-    /// Value for --userns passed to podman run (default: keep-id)
-    #[arg(long, default_value = "keep-id")]
-    pub userns: String,
-
     /// Print podman/docker commands instead of executing them
     #[arg(long)]
     pub dry_run: bool,

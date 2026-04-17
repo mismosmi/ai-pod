@@ -203,7 +203,6 @@ fn init_home_volume(
     project_id: &str,
     api_key: &str,
     home_dir: &str,
-    userns: &str,
 ) -> Result<()> {
     println!(
         "{} {}",
@@ -222,8 +221,6 @@ fn init_home_volume(
     }
 
     // 2. Create a stopped container for cp operations.
-    // Use the same --userns as the actual run so the volume is seeded with the
-    // correct UID mapping (avoids permission errors when keep-id shifts UIDs).
     let init_container = format!("{}-init", container_name);
     let status = rt
         .command()
@@ -231,8 +228,6 @@ fn init_home_volume(
             "create",
             "--name",
             &init_container,
-            "--userns",
-            userns,
             "-v",
             &format!("{}:{}", volume_name, home_dir),
             image,
@@ -258,14 +253,11 @@ fn init_home_volume(
     }
 
     // 3b. Ensure required directories exist in the volume.
-    // Use the same --userns as the actual run so created dirs have the right
-    // ownership (rootless Podman keep-id maps UID 1000 differently than default).
     let _ = rt
         .command()
         .args([
             "run",
             "--rm",
-            &format!("--userns={}", userns),
             "-v",
             &format!("{}:{}:z", volume_name, home_dir),
             image,
@@ -351,7 +343,6 @@ fn reseed_home_volume(
     project_id: &str,
     api_key: &str,
     home_dir: &str,
-    userns: &str,
 ) -> Result<()> {
     println!(
         "{} {}",
@@ -360,8 +351,6 @@ fn reseed_home_volume(
     );
 
     // 1. Create a stopped container for cp operations.
-    // Use the same --userns as the actual run so dirs are created with the
-    // correct UID mapping.
     let init_container = format!("{}-init", container_name);
     let status = rt
         .command()
@@ -369,8 +358,6 @@ fn reseed_home_volume(
             "create",
             "--name",
             &init_container,
-            "--userns",
-            userns,
             "-v",
             &format!("{}:{}", volume_name, home_dir),
             image,
@@ -383,13 +370,11 @@ fn reseed_home_volume(
     }
 
     // 2. Ensure required directories exist in the volume.
-    // Use the same --userns as the actual run.
     let _ = rt
         .command()
         .args([
             "run",
             "--rm",
-            &format!("--userns={}", userns),
             "-v",
             &format!("{}:{}:z", volume_name, home_dir),
             image,
@@ -472,7 +457,6 @@ pub fn launch_container(
     image: &str,
     project_id: &str,
     api_key: &str,
-    userns: &str,
 ) -> Result<()> {
     let prefix = container_prefix(workspace);
     let volume_name = gen_volume_name(workspace);
@@ -499,7 +483,6 @@ pub fn launch_container(
                 project_id,
                 api_key,
                 &home_dir,
-                userns,
             )?;
         }
     }
@@ -515,20 +498,18 @@ pub fn launch_container(
             project_id,
             api_key,
             &home_dir,
-            userns,
         )?;
     }
 
     let container_name = new_container_name(workspace);
     println!("{} {}", "Starting container:".blue().bold(), container_name);
 
-    let userns_arg = format!("--userns={}", userns);
     let add_host = rt.add_host_arg();
     let host_gw_env = format!("HOST_GATEWAY={}", rt.host_gateway());
     let server_url_env = format!("AI_POD_SERVER_URL={}", rt.server_url());
 
     let mut run_cmd = rt.command();
-    run_cmd.args(["run", "--rm", "-it", &userns_arg]);
+    run_cmd.args(["run", "--rm", "-it"]);
     run_cmd.args([
         "--name",
         &container_name,
@@ -568,7 +549,6 @@ pub fn run_in_container(
     api_key: &str,
     command: &str,
     args: &[String],
-    userns: &str,
 ) -> Result<()> {
     let container_name = new_container_name(workspace);
     let volume_name = gen_volume_name(workspace);
@@ -586,7 +566,6 @@ pub fn run_in_container(
             project_id,
             api_key,
             &home_dir,
-            userns,
         )?;
     }
 
@@ -597,12 +576,7 @@ pub fn run_in_container(
         command
     );
 
-    let mut run_args: Vec<String> = vec![
-        "run".into(),
-        "--rm".into(),
-        "-it".into(),
-        format!("--userns={}", userns),
-    ];
+    let mut run_args: Vec<String> = vec!["run".into(), "--rm".into(), "-it".into()];
     run_args.extend_from_slice(&[
         "--label".into(),
         "managed-by=ai-pod".into(),

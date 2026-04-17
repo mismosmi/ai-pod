@@ -197,7 +197,6 @@ async fn launch_flow(cli: &Cli, rt: &ContainerRuntime) -> Result<()> {
         &image,
         &project_id,
         &state.api_key,
-        &cli.userns,
     )?;
 
     Ok(())
@@ -335,7 +334,6 @@ async fn main() -> Result<()> {
                 &state.api_key,
                 command,
                 args,
-                &cli.userns,
             )?;
         }
         Some(Command::Daemons) => {
