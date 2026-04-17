@@ -185,33 +185,17 @@ fn write_gitconfig_to_volume(
     Ok(())
 }
 
-/// Initialize a named home volume for the first time.
-fn init_home_volume(
+/// Populate a home volume via a temporary stopped container.
+/// Handles directory creation, runtime config, skill file, opencode config, and git identity.
+/// Set `copy_claude_json` to copy `~/.claude.json` (first-time init only; skipped on reseed).
+fn seed_home_volume(
     rt: &ContainerRuntime,
     config: &AppConfig,
     volume_name: &str,
     container_name: &str,
     image: &str,
-    project_id: &str,
-    api_key: &str,
+    copy_claude_json: bool,
 ) -> Result<()> {
-    println!(
-        "{} {}",
-        "Initialising home volume:".blue().bold(),
-        volume_name
-    );
-
-    // 1. Create the volume
-    let status = rt
-        .command()
-        .args(["volume", "create", volume_name])
-        .status()
-        .context("Failed to create volume")?;
-    if !status.success() {
-        anyhow::bail!("Failed to create volume {}", volume_name);
-    }
-
-    // 2. Create a stopped container for cp operations.
     let init_container = format!("{}-init", container_name);
     let status = rt
         .command()
@@ -230,20 +214,20 @@ fn init_home_volume(
         anyhow::bail!("Failed to create init container");
     }
 
-    // 3. Copy ~/.claude.json (soft error — auth state)
-    let claude_json = config.home_dir.join(".claude.json");
-    if claude_json.exists() {
-        let _ = rt
-            .command()
-            .args([
-                "cp",
-                &claude_json.to_string_lossy(),
-                &format!("{}:{}/", init_container, CONTAINER_HOME),
-            ])
-            .status();
+    if copy_claude_json {
+        let claude_json = config.home_dir.join(".claude.json");
+        if claude_json.exists() {
+            let _ = rt
+                .command()
+                .args([
+                    "cp",
+                    &claude_json.to_string_lossy(),
+                    &format!("{}:{}/", init_container, CONTAINER_HOME),
+                ])
+                .status();
+        }
     }
 
-    // 3b. Ensure required directories exist in the volume.
     let _ = rt
         .command()
         .args([
@@ -260,7 +244,6 @@ fn init_home_volume(
         ])
         .status();
 
-    // 4. Generate and copy runtime config
     generate_runtime_claude_md(rt, config)?;
     generate_runtime_settings(config)?;
 
@@ -282,7 +265,6 @@ fn init_home_volume(
         ])
         .status();
 
-    // 5. Copy skill file
     let skill_path = config.config_dir.join("skill.md");
     std::fs::write(&skill_path, SKILL_MD)?;
     let _ = rt
@@ -297,7 +279,6 @@ fn init_home_volume(
         ])
         .status();
 
-    // 6. Copy opencode config if present on host
     let opencode_config = config.home_dir.join(".config").join("opencode");
     if opencode_config.exists() {
         let _ = rt
@@ -310,11 +291,39 @@ fn init_home_volume(
             .status();
     }
 
-    // 7. Copy host git identity into the volume
     write_gitconfig_to_volume(rt, config, &init_container)?;
 
-    // 8. Remove init container
     let _ = rt.command().args(["rm", &init_container]).status();
+
+    Ok(())
+}
+
+/// Initialize a named home volume for the first time.
+fn init_home_volume(
+    rt: &ContainerRuntime,
+    config: &AppConfig,
+    volume_name: &str,
+    container_name: &str,
+    image: &str,
+    project_id: &str,
+    api_key: &str,
+) -> Result<()> {
+    println!(
+        "{} {}",
+        "Initialising home volume:".blue().bold(),
+        volume_name
+    );
+
+    let status = rt
+        .command()
+        .args(["volume", "create", volume_name])
+        .status()
+        .context("Failed to create volume")?;
+    if !status.success() {
+        anyhow::bail!("Failed to create volume {}", volume_name);
+    }
+
+    seed_home_volume(rt, config, volume_name, container_name, image, true)?;
 
     let _ = (project_id, api_key); // used via env vars at runtime
 
@@ -340,97 +349,7 @@ fn reseed_home_volume(
         volume_name
     );
 
-    // 1. Create a stopped container for cp operations.
-    let init_container = format!("{}-init", container_name);
-    let status = rt
-        .command()
-        .args([
-            "create",
-            "--name",
-            &init_container,
-            "-v",
-            &format!("{}:{}", volume_name, CONTAINER_HOME),
-            image,
-            "true",
-        ])
-        .status()
-        .context("Failed to create init container for reseed")?;
-    if !status.success() {
-        anyhow::bail!("Failed to create init container for reseed");
-    }
-
-    // 2. Ensure required directories exist in the volume.
-    let _ = rt
-        .command()
-        .args([
-            "run",
-            "--rm",
-            "-v",
-            &format!("{}:{}:z", volume_name, CONTAINER_HOME),
-            image,
-            "mkdir",
-            "-p",
-            &format!("{}/.claude", CONTAINER_HOME),
-            &format!("{}/.claude/skills/ai-pod", CONTAINER_HOME),
-            &format!("{}/.config", CONTAINER_HOME),
-        ])
-        .status();
-
-    // 2b. Regenerate and copy runtime config (refreshes hooks + permissions)
-    generate_runtime_claude_md(rt, config)?;
-    generate_runtime_settings(config)?;
-
-    let _ = rt
-        .command()
-        .args([
-            "cp",
-            &config.runtime_settings.to_string_lossy(),
-            &format!("{}:{}/.claude/settings.json", init_container, CONTAINER_HOME),
-        ])
-        .status();
-
-    let _ = rt
-        .command()
-        .args([
-            "cp",
-            &config.runtime_claude_md.to_string_lossy(),
-            &format!("{}:{}/.claude/CLAUDE.md", init_container, CONTAINER_HOME),
-        ])
-        .status();
-
-    // 3. Copy skill file
-    let skill_path = config.config_dir.join("skill.md");
-    std::fs::write(&skill_path, SKILL_MD)?;
-    let _ = rt
-        .command()
-        .args([
-            "cp",
-            skill_path.to_str().unwrap(),
-            &format!(
-                "{}:{}/.claude/skills/ai-pod/SKILL.md",
-                init_container, CONTAINER_HOME
-            ),
-        ])
-        .status();
-
-    // 4. Copy opencode config if present on host
-    let opencode_config = config.home_dir.join(".config").join("opencode");
-    if opencode_config.exists() {
-        let _ = rt
-            .command()
-            .args([
-                "cp",
-                &opencode_config.to_string_lossy(),
-                &format!("{}:{}/.config/", init_container, CONTAINER_HOME),
-            ])
-            .status();
-    }
-
-    // 5. Copy host git identity into the volume
-    write_gitconfig_to_volume(rt, config, &init_container)?;
-
-    // 6. Remove init container
-    let _ = rt.command().args(["rm", &init_container]).status();
+    seed_home_volume(rt, config, volume_name, container_name, image, false)?;
 
     let _ = (project_id, api_key); // used via env vars at runtime
 
@@ -561,7 +480,11 @@ pub fn run_in_container(
         command
     );
 
-    let mut run_args: Vec<String> = vec!["run".into(), "--rm".into(), "-it".into()];
+    let mut run_args: Vec<String> = vec![
+        "run".into(),
+        "--rm".into(),
+        "-it".into(),
+    ];
     run_args.extend_from_slice(&[
         "--label".into(),
         "managed-by=ai-pod".into(),
@@ -615,9 +538,9 @@ pub fn list_containers(rt: &ContainerRuntime) -> Result<()> {
         .context("Failed to list containers")?;
 
     if output.stdout.is_empty() {
-        println!("{}", "No claude containers found.".yellow());
+        println!("{}", "No ai-pod containers found.".yellow());
     } else {
-        println!("{}", "Claude containers:".blue().bold());
+        println!("{}", "ai-pod containers:".blue().bold());
         println!("{:<20} {:<30} {}", "NAME", "STATUS", "CREATED");
         println!("{}", "-".repeat(80));
         print!("{}", String::from_utf8_lossy(&output.stdout));
@@ -627,7 +550,7 @@ pub fn list_containers(rt: &ContainerRuntime) -> Result<()> {
 }
 
 pub fn attach_container(rt: &ContainerRuntime) -> Result<()> {
-    // List all running claude containers with their start times
+    // List all running ai-pod containers with their start times
     let output = rt
         .command()
         .args([
@@ -652,7 +575,7 @@ pub fn attach_container(rt: &ContainerRuntime) -> Result<()> {
         .collect();
 
     if entries.is_empty() {
-        println!("{}", "No running claude containers found.".yellow());
+        println!("{}", "No running ai-pod containers found.".yellow());
         return Ok(());
     }
 
