@@ -467,13 +467,28 @@ pub async fn start_daemon_handler(
                     // Kill the whole process group (see
                     // `.process_group(0)` on spawn) so children of
                     // `sh` are caught too.
-                    unsafe {
-                        libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
+                    let ret = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGTERM) };
+                    debug_assert_eq!(ret, 0, "kill({}, SIGTERM) failed: {}", pid, std::io::Error::last_os_error());
+                    // Give the process group a grace period, then escalate to SIGKILL
+                    // to handle processes that ignore SIGTERM.
+                    tokio::select! {
+                        res = child.wait() => match res {
+                            Ok(status) => status.code().unwrap_or(-1),
+                            Err(_) => -1,
+                        },
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                            let _ = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+                            match child.wait().await {
+                                Ok(status) => status.code().unwrap_or(-1),
+                                Err(_) => -1,
+                            }
+                        }
                     }
-                }
-                match child.wait().await {
-                    Ok(status) => status.code().unwrap_or(-1),
-                    Err(_) => -1,
+                } else {
+                    match child.wait().await {
+                        Ok(status) => status.code().unwrap_or(-1),
+                        Err(_) => -1,
+                    }
                 }
             }
         };
@@ -1568,39 +1583,22 @@ mod tests {
             //   1. receive the oneshot kill signal,
             //   2. send SIGTERM to the process group,
             //   3. call child.wait() which reaps the child,
-            //   4. consume the DaemonEntry.kill_tx (already taken by the stop handler),
-            //   5. leave status == Killed (preserved by the Running-guard).
-            // The entry's status is already Killed (set synchronously), but
-            // we need to confirm the reaper actually ran and didn't hang.
-            for _ in 0..400 {
-                let reaped = {
-                    let daemons = state.daemons.lock().await;
-                    let entry = &daemons[&daemon_id];
-                    // kill_tx was taken by the stop handler; the reaper then
-                    // consumed the receiver and exited. There is no direct
-                    // "reaper finished" flag, but the child log file will
-                    // have the Exit message written after wait() returns.
-                    entry.kill_tx.is_none() && entry.status == DaemonStatus::Killed
-                };
-                if reaped {
-                    // Extra: briefly confirm the log file now contains an Exit line.
-                    let log_path = {
-                        let daemons = state.daemons.lock().await;
-                        daemons[&daemon_id].log_path.clone()
-                    };
-                    for _ in 0..200 {
-                        if let Ok(bytes) = tokio::fs::read(&log_path).await
-                            && String::from_utf8_lossy(&bytes).contains("\"Exit\"")
-                        {
-                            return;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                    }
-                    panic!("reaper ran but never wrote Exit to the log file");
+            //   4. write the Exit message to the log file.
+            // Poll the log file for the Exit message as the definitive signal
+            // that the reaper has fully completed (not just that kill_tx was taken).
+            let log_path = {
+                let daemons = state.daemons.lock().await;
+                daemons[&daemon_id].log_path.clone()
+            };
+            for _ in 0..200 {
+                if let Ok(bytes) = tokio::fs::read(&log_path).await
+                    && String::from_utf8_lossy(&bytes).contains("\"Exit\"")
+                {
+                    return;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
-            panic!("daemon '{}' kill_tx was never consumed", daemon_id);
+            panic!("reaper never wrote Exit to the log file for daemon '{}'", daemon_id);
         }
 
         #[tokio::test]

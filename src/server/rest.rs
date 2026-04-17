@@ -197,13 +197,28 @@ pub async fn run_command_handler(
                     // Kill the whole process group (see
                     // `.process_group(0)` on spawn) so children of
                     // `sh` are caught too.
-                    unsafe {
-                        libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
+                    let ret = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGTERM) };
+                    debug_assert_eq!(ret, 0, "kill({}, SIGTERM) failed: {}", pid, std::io::Error::last_os_error());
+                    // Give the process group a grace period, then escalate to SIGKILL
+                    // to handle processes that ignore SIGTERM.
+                    tokio::select! {
+                        res = child.wait() => match res {
+                            Ok(status) => status.code().unwrap_or(-1),
+                            Err(_) => -1,
+                        },
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                            let _ = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+                            match child.wait().await {
+                                Ok(status) => status.code().unwrap_or(-1),
+                                Err(_) => -1,
+                            }
+                        }
                     }
-                }
-                match child.wait().await {
-                    Ok(status) => status.code().unwrap_or(-1),
-                    Err(_) => -1,
+                } else {
+                    match child.wait().await {
+                        Ok(status) => status.code().unwrap_or(-1),
+                        Err(_) => -1,
+                    }
                 }
             }
         };
