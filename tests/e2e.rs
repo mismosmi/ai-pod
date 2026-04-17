@@ -428,7 +428,7 @@ fn e2e_clean_container_removes_all() {
 
 }
 
-/// Image built from `claude.Dockerfile` has `claude` as the default user.
+/// Image built from the shared Dockerfile has `ai-pod` as the default user.
 #[test]
 fn e2e_container_default_user() {
     let rt = require_runtime!();
@@ -443,8 +443,8 @@ fn e2e_container_default_user() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        "claude",
-        "default user should be claude"
+        "ai-pod",
+        "default user should be ai-pod"
     );
 }
 
