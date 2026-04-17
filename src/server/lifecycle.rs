@@ -116,7 +116,15 @@ fn is_server_process_alive(pid: u32, expected_exe: Option<&str>) -> bool {
     #[cfg(target_os = "linux")]
     {
         match std::fs::read_link(format!("/proc/{}/exe", pid)) {
-            Ok(target) => target.to_string_lossy() == expected,
+            Ok(target) => {
+                let target_str = target.to_string_lossy();
+                // When the running binary is replaced on disk (e.g. `cargo install`
+                // over the same path), the kernel appends " (deleted)" to the symlink
+                // target. Strip it before comparing so we don't falsely kill a still-
+                // valid server process.
+                let target_str = target_str.strip_suffix(" (deleted)").unwrap_or(&target_str);
+                target_str == expected
+            }
             Err(_) => false, // /proc entry gone → process is dead or inaccessible
         }
     }
