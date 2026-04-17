@@ -217,12 +217,15 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
         }
     });
 
-    // Background task: shut down server when all claude-* containers have stopped
+    // Background task: shut down server when all claude-* containers have stopped.
+    // Requires 5 consecutive empty checks (5 min) so long image builds (apt-get
+    // install, etc.) don't trigger a premature shutdown while no containers exist.
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let shutdown_rt = state.runtime.clone();
     tokio::spawn(async move {
         // Grace period: allow container to start before first check
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        let mut empty_ticks = 0u32;
         loop {
             let output = shutdown_rt
                 .async_command()
@@ -232,9 +235,14 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
             let has_containers = output
                 .map(|o| String::from_utf8_lossy(&o.stdout).lines().any(|l| !l.is_empty()))
                 .unwrap_or(true); // on error, stay alive
-            if !has_containers {
-                let _ = shutdown_tx.send(());
-                break;
+            if has_containers {
+                empty_ticks = 0;
+            } else {
+                empty_ticks += 1;
+                if empty_ticks >= 5 {
+                    let _ = shutdown_tx.send(());
+                    break;
+                }
             }
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         }
