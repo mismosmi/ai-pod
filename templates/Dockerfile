@@ -1,16 +1,17 @@
-FROM alpine:latest
+FROM {{BASE_IMAGE}}
 
-RUN apk add --no-cache curl git vim bash
+{{INSTALL_PACKAGES}}
 
 ARG HOST_GATEWAY
 RUN curl -fsSL "http://${HOST_GATEWAY}:7822/host-tools" \
       -o /usr/local/bin/host-tools && chmod +x /usr/local/bin/host-tools
 
+ARG AI_POD_VERSION
 RUN host-tools install {{AGENT}}
 
 WORKDIR /app
 
-RUN adduser -D -h /home/{{AGENT}} {{AGENT}} && chown -R {{AGENT}} /app
+{{CREATE_USER}}
 
 # System-level git identity (fallback when no host identity is provided)
 RUN git config --system user.email "{{AGENT}}@ai-pod" && \
