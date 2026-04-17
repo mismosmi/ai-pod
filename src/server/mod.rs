@@ -223,6 +223,11 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
     tokio::spawn(async move {
         // Grace period: allow container to start before first check
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        // Require two consecutive "no containers" ticks before shutting down.
+        // A single tick can fire during a brief inter-test gap (e.g. while a
+        // new image is being built) and prematurely kill the server before the
+        // next container starts.
+        let mut no_container_ticks = 0u32;
         loop {
             let output = shutdown_rt
                 .async_command()
@@ -233,8 +238,13 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
                 .map(|o| String::from_utf8_lossy(&o.stdout).lines().any(|l| !l.is_empty()))
                 .unwrap_or(true); // on error, stay alive
             if !has_containers {
-                let _ = shutdown_tx.send(());
-                break;
+                no_container_ticks += 1;
+                if no_container_ticks >= 2 {
+                    let _ = shutdown_tx.send(());
+                    break;
+                }
+            } else {
+                no_container_ticks = 0;
             }
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         }

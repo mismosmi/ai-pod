@@ -199,8 +199,24 @@ pub fn ensure_shared_server(config: &AppConfig) -> Result<()> {
     file.write_all(json.as_bytes())
         .context("Failed to write server state contents")?;
 
-    // Wait briefly for server to start
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // Poll until the server is accepting connections (up to 10 seconds).
+    // A fixed sleep is not reliable: the server may shut itself down between
+    // tests, and restarting it can take longer than 500 ms on a loaded host.
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", MCP_PORT)
+        .parse()
+        .expect("valid addr");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100))
+            .is_ok()
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("Server did not become ready within 10 seconds (port {})", MCP_PORT);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 
     println!(
         "{} (PID {}, port {})",
