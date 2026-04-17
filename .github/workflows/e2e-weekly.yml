@@ -1,0 +1,89 @@
+name: Weekly E2E Agent Tests
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # Every Sunday at midnight UTC
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Add ~/.local/bin to PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build and install ai-pod
+        run: bash install-local.sh
+
+      - name: claude + alpine
+        run: bash tests/e2e_agents.sh claude alpine
+
+      - name: claude + ubuntu
+        run: bash tests/e2e_agents.sh claude ubuntu
+
+      - name: claude + node
+        run: bash tests/e2e_agents.sh claude node
+
+      - name: claude + rust
+        run: bash tests/e2e_agents.sh claude rust
+
+      - name: claude + python
+        run: bash tests/e2e_agents.sh claude python
+
+      - name: opencode + ubuntu
+        run: bash tests/e2e_agents.sh opencode ubuntu
+
+      - name: opencode + node
+        run: bash tests/e2e_agents.sh opencode node
+
+      - name: opencode + rust
+        run: bash tests/e2e_agents.sh opencode rust
+
+      - name: opencode + python
+        run: bash tests/e2e_agents.sh opencode python
+
+      - name: Create issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = 'Weekly e2e agent tests failed';
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'e2e-failure',
+            });
+            if (open.some(i => i.title === title)) return;
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body: [
+                '## Weekly e2e agent test run failed',
+                '',
+                `**Workflow run:** ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+                '',
+                'Check the workflow logs above for the first failing combination and its output.',
+              ].join('\n'),
+              labels: ['e2e-failure', 'bug'],
+            });

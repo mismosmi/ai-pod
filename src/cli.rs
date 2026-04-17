@@ -7,8 +7,17 @@ pub enum Agent {
     Opencode,
 }
 
+#[derive(ValueEnum, Clone, Debug, PartialEq)]
+pub enum BaseImage {
+    Alpine,
+    Ubuntu,
+    Node,
+    Rust,
+    Python,
+}
+
 #[derive(Parser)]
-#[command(name = "claude-container", about = "Run Claude Code inside Podman containers")]
+#[command(name = "ai-pod", about = "Run Claude Code inside Podman containers", version)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -52,9 +61,13 @@ pub enum Command {
         #[arg(long)]
         workdir: Option<PathBuf>,
 
-        /// Default agent to start in the container (default: claude)
-        #[arg(long, value_enum, default_value = "claude")]
-        agent: Agent,
+        /// Agent to start in the container (interactive if omitted)
+        #[arg(long, value_enum)]
+        agent: Option<Agent>,
+
+        /// Base image for the container (interactive if omitted)
+        #[arg(long, value_enum)]
+        image: Option<BaseImage>,
     },
 
     /// Attach to a running claude container session

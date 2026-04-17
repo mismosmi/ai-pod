@@ -16,7 +16,100 @@ fn resolve_workspace(workdir: &Option<std::path::PathBuf>) -> Result<std::path::
     }
 }
 
-fn init_project(workspace: &Path, agent: &str) -> Result<()> {
+fn resolve_agent(agent: Option<cli::Agent>) -> Result<cli::Agent> {
+    match agent {
+        Some(a) => Ok(a),
+        None => {
+            let items = &["Claude", "OpenCode"];
+            let sel = dialoguer::Select::new()
+                .with_prompt("Select agent")
+                .items(items)
+                .default(0)
+                .interact()
+                .context("Selection cancelled")?;
+            Ok(match sel {
+                0 => cli::Agent::Claude,
+                _ => cli::Agent::Opencode,
+            })
+        }
+    }
+}
+
+fn resolve_base_image(agent: &cli::Agent, image: Option<cli::BaseImage>) -> Result<cli::BaseImage> {
+    if let Some(ref i) = image {
+        if matches!(agent, cli::Agent::Opencode) && matches!(i, cli::BaseImage::Alpine) {
+            anyhow::bail!("opencode is not supported on Alpine (glibc-linked binary incompatible with musl). Use ubuntu, node, rust, or python.");
+        }
+        return Ok(image.unwrap());
+    }
+
+    let (items, variants): (&[&str], &[cli::BaseImage]) = match agent {
+        cli::Agent::Opencode => (&["Ubuntu", "Node", "Rust", "Python"], &[
+            cli::BaseImage::Ubuntu,
+            cli::BaseImage::Node,
+            cli::BaseImage::Rust,
+            cli::BaseImage::Python,
+        ]),
+        cli::Agent::Claude => (&["Alpine", "Ubuntu", "Node", "Rust", "Python"], &[
+            cli::BaseImage::Alpine,
+            cli::BaseImage::Ubuntu,
+            cli::BaseImage::Node,
+            cli::BaseImage::Rust,
+            cli::BaseImage::Python,
+        ]),
+    };
+
+    let sel = dialoguer::Select::new()
+        .with_prompt("Select base image")
+        .items(items)
+        .default(0)
+        .interact()
+        .context("Selection cancelled")?;
+
+    Ok(variants[sel].clone())
+}
+
+struct BaseImageConfig {
+    from: &'static str,
+    install_packages: &'static str,
+    create_user: &'static str,
+}
+
+fn base_image_config(image: &cli::BaseImage) -> BaseImageConfig {
+    match image {
+        cli::BaseImage::Alpine => BaseImageConfig {
+            from: "alpine:latest",
+            install_packages: "RUN apk add --no-cache curl git vim bash",
+            create_user: "RUN adduser -D -h /home/{{AGENT}} {{AGENT}} && chown -R {{AGENT}} /app",
+        },
+        cli::BaseImage::Ubuntu => BaseImageConfig {
+            from: "ubuntu:latest",
+            install_packages: "RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git vim && rm -rf /var/lib/apt/lists/*",
+            create_user: "RUN useradd -ms /bin/bash {{AGENT}} && chown -R {{AGENT}} /app",
+        },
+        cli::BaseImage::Node => BaseImageConfig {
+            from: "node:lts",
+            install_packages: "RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git vim && rm -rf /var/lib/apt/lists/*",
+            create_user: "RUN useradd -ms /bin/bash {{AGENT}} && chown -R {{AGENT}} /app",
+        },
+        cli::BaseImage::Rust => BaseImageConfig {
+            from: "rust:latest",
+            install_packages: "RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git vim && rm -rf /var/lib/apt/lists/*",
+            create_user: "RUN useradd -ms /bin/bash {{AGENT}} && chown -R {{AGENT}} /app",
+        },
+        cli::BaseImage::Python => BaseImageConfig {
+            from: "python:latest",
+            install_packages: "RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git vim && rm -rf /var/lib/apt/lists/*",
+            create_user: "RUN useradd -ms /bin/bash {{AGENT}} && chown -R {{AGENT}} /app",
+        },
+    }
+}
+
+fn init_project(
+    workspace: &Path,
+    agent: Option<cli::Agent>,
+    image: Option<cli::BaseImage>,
+) -> Result<()> {
     let dockerfile = workspace.join(image::DOCKERFILE_NAME);
 
     if dockerfile.exists() {
@@ -28,11 +121,25 @@ fn init_project(workspace: &Path, agent: &str) -> Result<()> {
         return Ok(());
     }
 
-    let default = include_str!("../templates/Dockerfile").replace("{{AGENT}}", agent);
-    std::fs::write(&dockerfile, default).context("Failed to write ai-pod.Dockerfile")?;
+    let agent = resolve_agent(agent)?;
+    let image = resolve_base_image(&agent, image)?;
+
+    let agent_str = match agent {
+        cli::Agent::Claude => "claude",
+        cli::Agent::Opencode => "opencode",
+    };
+
+    let cfg = base_image_config(&image);
+    let content = include_str!("../templates/Dockerfile")
+        .replace("{{BASE_IMAGE}}", cfg.from)
+        .replace("{{INSTALL_PACKAGES}}", cfg.install_packages)
+        .replace("{{CREATE_USER}}", cfg.create_user)
+        .replace("{{AGENT}}", agent_str);
+
+    std::fs::write(&dockerfile, content).context("Failed to write ai-pod.Dockerfile")?;
 
     println!("{} {}", "Created:".green().bold(), dockerfile.display());
-    println!("Edit this file to customise your Claude container, then run `ai-pod` to launch.");
+    println!("Edit this file to customise your container, then run `ai-pod` to launch.");
 
     Ok(())
 }
@@ -111,13 +218,9 @@ async fn main() -> Result<()> {
 
     // Commands that don't need a container runtime
     match &cli.command {
-        Some(Command::Init { workdir, agent }) => {
+        Some(Command::Init { workdir, agent, image }) => {
             let workspace = resolve_workspace(workdir)?;
-            let agent_str = match agent {
-                cli::Agent::Claude => "claude",
-                cli::Agent::Opencode => "opencode",
-            };
-            init_project(&workspace, agent_str)?;
+            init_project(&workspace, agent.clone(), image.clone())?;
             return Ok(());
         }
         Some(Command::Allowed { action }) => {
@@ -189,7 +292,8 @@ async fn main() -> Result<()> {
             container::list_containers(&rt)?;
         }
         Some(Command::Clean { workdir }) => {
-            let workspace = resolve_workspace(workdir)?;
+            let ws = workdir.clone().or_else(|| cli.workdir.clone());
+            let workspace = resolve_workspace(&ws)?;
             container::clean_container(&rt, &workspace)?;
         }
         Some(Command::Run { command, args }) => {
