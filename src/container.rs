@@ -203,6 +203,7 @@ fn init_home_volume(
     project_id: &str,
     api_key: &str,
     home_dir: &str,
+    userns: &str,
 ) -> Result<()> {
     println!(
         "{} {}",
@@ -220,7 +221,9 @@ fn init_home_volume(
         anyhow::bail!("Failed to create volume {}", volume_name);
     }
 
-    // 2. Create a stopped container for cp operations
+    // 2. Create a stopped container for cp operations.
+    // Use the same --userns as the actual run so the volume is seeded with the
+    // correct UID mapping (avoids permission errors when keep-id shifts UIDs).
     let init_container = format!("{}-init", container_name);
     let status = rt
         .command()
@@ -228,6 +231,8 @@ fn init_home_volume(
             "create",
             "--name",
             &init_container,
+            "--userns",
+            userns,
             "-v",
             &format!("{}:{}", volume_name, home_dir),
             image,
@@ -252,12 +257,15 @@ fn init_home_volume(
             .status();
     }
 
-    // 3b. Ensure required directories exist in the volume
+    // 3b. Ensure required directories exist in the volume.
+    // Use the same --userns as the actual run so created dirs have the right
+    // ownership (rootless Podman keep-id maps UID 1000 differently than default).
     let _ = rt
         .command()
         .args([
             "run",
             "--rm",
+            &format!("--userns={}", userns),
             "-v",
             &format!("{}:{}:z", volume_name, home_dir),
             image,
@@ -343,6 +351,7 @@ fn reseed_home_volume(
     project_id: &str,
     api_key: &str,
     home_dir: &str,
+    userns: &str,
 ) -> Result<()> {
     println!(
         "{} {}",
@@ -350,7 +359,9 @@ fn reseed_home_volume(
         volume_name
     );
 
-    // 1. Create a stopped container for cp operations
+    // 1. Create a stopped container for cp operations.
+    // Use the same --userns as the actual run so dirs are created with the
+    // correct UID mapping.
     let init_container = format!("{}-init", container_name);
     let status = rt
         .command()
@@ -358,6 +369,8 @@ fn reseed_home_volume(
             "create",
             "--name",
             &init_container,
+            "--userns",
+            userns,
             "-v",
             &format!("{}:{}", volume_name, home_dir),
             image,
@@ -369,12 +382,14 @@ fn reseed_home_volume(
         anyhow::bail!("Failed to create init container for reseed");
     }
 
-    // 2. Ensure required directories exist in the volume
+    // 2. Ensure required directories exist in the volume.
+    // Use the same --userns as the actual run.
     let _ = rt
         .command()
         .args([
             "run",
             "--rm",
+            &format!("--userns={}", userns),
             "-v",
             &format!("{}:{}:z", volume_name, home_dir),
             image,
@@ -484,6 +499,7 @@ pub fn launch_container(
                 project_id,
                 api_key,
                 &home_dir,
+                userns,
             )?;
         }
     }
@@ -499,6 +515,7 @@ pub fn launch_container(
             project_id,
             api_key,
             &home_dir,
+            userns,
         )?;
     }
 
@@ -569,6 +586,7 @@ pub fn run_in_container(
             project_id,
             api_key,
             &home_dir,
+            userns,
         )?;
     }
 
