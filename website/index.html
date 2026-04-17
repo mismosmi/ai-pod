@@ -1106,54 +1106,15 @@ RUN npm install -g @my-org/mcp-server</pre>
                         </div>
 
                         <h4 style="margin-top: 1.5rem; font-size: 0.95rem; color: var(--text);">
-                            2. Change the user-namespace mode with <code>--userns</code>
-                        </h4>
-                        <p>
-                            ai-pod forwards <code>--userns</code> straight
-                            through to <code>podman run</code>. The default
-                            is <code>keep-id</code>, which maps the container
-                            user's uid back to your host uid so bind-mounted
-                            files stay owned by you. When the default mapping
-                            picks the wrong uid, pin it explicitly with
-                            <code>keep-id:uid=X,gid=Y</code>.
-                        </p>
-                        <div class="code-block" style="margin-top: 0.75rem">
-                            <div class="code-block-header">
-                                <span class="dot"></span>
-                                --userns modes
-                            </div>
-                            <pre><span class="comment"># Explicit mapping — force claude's uid → your host uid</span>
-<span class="cmd">ai-pod</span> <span class="flag">--userns</span>=keep-id:uid=1000,gid=1000
-
-<span class="comment"># Let Podman pick an isolated uid range from /etc/subuid</span>
-<span class="cmd">ai-pod</span> <span class="flag">--userns</span>=auto
-
-<span class="comment"># Share the host namespace directly — no remapping</span>
-<span class="cmd">ai-pod</span> <span class="flag">--userns</span>=host</pre>
-                        </div>
-                        <p style="margin-top: 0.75rem">
-                            <code>keep-id</code> is the default and usually
-                            what you want. <code>keep-id:uid=...,gid=...</code>
-                            is the fix when the default mapping produces the
-                            wrong uid inside the container.
-                            <code>auto</code> gives the container its own
-                            isolated uid range — good for sandboxing but
-                            usually causes exactly this permission problem on
-                            bind mounts. <code>host</code> skips remapping
-                            entirely; use sparingly.
-                        </p>
-
-                        <h4 style="margin-top: 1.5rem; font-size: 0.95rem; color: var(--text);">
-                            3. Set <code>PODMAN_USERNS</code> globally
+                            2. Set <code>PODMAN_USERNS</code> globally
                         </h4>
                         <p>
                             <code>PODMAN_USERNS</code> is a standard Podman
                             environment variable. When set, it becomes the
-                            default <code>--userns</code> value for every
+                            <code>--userns</code> value for every
                             <code>podman run</code> — including the ones
-                            ai-pod makes. Use this if you want a default
-                            across every project without passing the flag
-                            each time.
+                            ai-pod makes. Use this to configure user namespace
+                            mapping across every project.
                         </p>
                         <div class="code-block" style="margin-top: 0.75rem">
                             <div class="code-block-header">
@@ -1162,12 +1123,6 @@ RUN npm install -g @my-org/mcp-server</pre>
                             </div>
                             <pre><span class="cmd">export</span> PODMAN_USERNS=keep-id:uid=1000,gid=1000</pre>
                         </div>
-                        <p style="margin-top: 0.75rem">
-                            Precedence: <code>ai-pod --userns=...</code> on
-                            the command line wins over
-                            <code>PODMAN_USERNS</code>, which wins over
-                            Podman's built-in default.
-                        </p>
 
                         <h4 style="margin-top: 1.5rem; font-size: 0.95rem; color: var(--text);">
                             Debugging uid mismatches
