@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 
@@ -38,9 +39,15 @@ pub struct AppState {
     pub approval_lock: Arc<Mutex<()>>,
     pub daemons: Arc<Mutex<HashMap<String, DaemonEntry>>>,
     pub runtime: ContainerRuntime,
+    pub keep_alive_until: Arc<Mutex<Instant>>,
 }
 
 async fn health_handler() -> &'static str {
+    "ok"
+}
+
+async fn keep_alive_handler(State(state): State<AppState>) -> &'static str {
+    *state.keep_alive_until.lock().await = Instant::now() + Duration::from_secs(30);
     "ok"
 }
 
@@ -116,6 +123,7 @@ pub fn build_app(state: AppState) -> Router {
     let rate_limited = Router::new()
         .route("/health", get(health_handler))
         .route("/version", get(version_handler))
+        .route("/keep-alive", post(keep_alive_handler))
         .route("/reload", post(reload_handler))
         .route("/run_command", post(rest::run_command_handler))
         .route("/notify_user", post(rest::notify_user_handler))
@@ -205,6 +213,7 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
         approval_lock: Arc::new(Mutex::new(())),
         daemons: Arc::new(Mutex::new(HashMap::new())),
         runtime: rt,
+        keep_alive_until: Arc::new(Mutex::new(Instant::now() + Duration::from_secs(30))),
     };
 
     // Background task: kill daemons when their project has no running containers
@@ -217,13 +226,20 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
         }
     });
 
-    // Background task: shut down server when all claude-* containers have stopped
+    // Background task: shut down server when the keep-alive period has expired and
+    // no managed containers are running. keep_alive_until is bumped 30 s forward on
+    // startup, on every authenticated container request, and via POST /keep-alive so
+    // the CLI can hold the server alive while building a new image.
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let shutdown_rt = state.runtime.clone();
+    let shutdown_keep_alive = state.keep_alive_until.clone();
     tokio::spawn(async move {
-        // Grace period: allow container to start before first check
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
+            interval.tick().await;
+            if Instant::now() < *shutdown_keep_alive.lock().await {
+                continue;
+            }
             let output = shutdown_rt
                 .async_command()
                 .args(["ps", "--filter", "label=managed-by=ai-pod", "--format", "{{.Names}}"])
@@ -236,7 +252,6 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
                 let _ = shutdown_tx.send(());
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         }
     });
 

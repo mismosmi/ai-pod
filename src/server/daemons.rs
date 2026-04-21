@@ -747,6 +747,9 @@ mod tests {
                 kind: crate::runtime::RuntimeKind::Podman,
                 dry_run: false,
             },
+            keep_alive_until: Arc::new(Mutex::new(
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+            )),
         }
     }
 
@@ -1320,6 +1323,9 @@ mod tests {
                     kind: crate::runtime::RuntimeKind::Podman,
                     dry_run: false,
                 },
+                keep_alive_until: Arc::new(Mutex::new(
+                    std::time::Instant::now() + std::time::Duration::from_secs(30),
+                )),
             };
 
             pre_allow(config_dir.path(), &ws1, "pwd");
