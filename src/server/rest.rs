@@ -64,16 +64,21 @@ async fn authenticate(
     project_id: &str,
     provided_key: &str,
 ) -> Result<PathBuf, (StatusCode, &'static str)> {
-    let map = state.projects.lock().await;
-    match map.get(project_id) {
-        None => Err((StatusCode::NOT_FOUND, "Unknown project")),
-        Some(info) => {
-            if !bool::from(info.api_key.as_bytes().ct_eq(provided_key.as_bytes())) {
-                return Err((StatusCode::UNAUTHORIZED, "Invalid API key"));
+    let workspace = {
+        let map = state.projects.lock().await;
+        match map.get(project_id) {
+            None => return Err((StatusCode::NOT_FOUND, "Unknown project")),
+            Some(info) => {
+                if !bool::from(info.api_key.as_bytes().ct_eq(provided_key.as_bytes())) {
+                    return Err((StatusCode::UNAUTHORIZED, "Invalid API key"));
+                }
+                info.workspace.clone()
             }
-            Ok(info.workspace.clone())
         }
-    }
+    };
+    *state.keep_alive_until.lock().await =
+        std::time::Instant::now() + std::time::Duration::from_secs(30);
+    Ok(workspace)
 }
 
 pub async fn run_command_handler(
