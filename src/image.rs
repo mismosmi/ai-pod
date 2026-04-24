@@ -80,11 +80,34 @@ pub fn build_image(rt: &ContainerRuntime, dockerfile: &Path, image: &str, no_cac
         &dockerfile.parent().unwrap_or(Path::new(".")).to_string_lossy(),
     ]);
 
+    // Keep the shared server alive during the build: POST /keep-alive every 20 s.
+    // The server auto-shuts-down after 30 s of inactivity with no containers running,
+    // so without this the server would die mid-build.
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let keepalive_thread = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::new();
+        let url = format!(
+            "http://127.0.0.1:{}/keep-alive",
+            crate::server::lifecycle::MCP_PORT
+        );
+        loop {
+            match stop_rx.recv_timeout(std::time::Duration::from_secs(20)) {
+                Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = client.post(&url).send();
+                }
+            }
+        }
+    });
+
     let status = cmd
         .status()
-        .context(format!("Failed to run {} build", rt.cmd()))?;
+        .context(format!("Failed to run {} build", rt.cmd()));
 
-    if !status.success() {
+    let _ = stop_tx.send(());
+    let _ = keepalive_thread.join();
+
+    if !status?.success() {
         anyhow::bail!("{} build failed", rt.cmd());
     }
 
