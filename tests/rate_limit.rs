@@ -24,6 +24,9 @@ fn make_state(config_dir: &std::path::Path) -> AppState {
             kind: RuntimeKind::Podman,
             dry_run: false,
         },
+        keep_alive_until: Arc::new(Mutex::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        )),
     }
 }
 
