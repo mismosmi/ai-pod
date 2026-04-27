@@ -66,10 +66,10 @@ pub enum Command {
         image: Option<BaseImage>,
     },
 
-    /// Attach to a running claude container session
+    /// Attach to a running ai-pod container session
     Attach,
 
-    /// List all claude containers
+    /// List all ai-pod containers
     List,
 
     /// Remove the container for current/specified workspace

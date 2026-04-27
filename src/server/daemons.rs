@@ -226,8 +226,8 @@ pub async fn cleanup_orphaned_daemons(state: &AppState) {
     };
 
     for project_id in project_ids {
-        // Container prefix is "claude-{project_id}" (project_id == workspace_hash)
-        let filter = format!("name=^claude-{}-", project_id);
+        // Container prefix is "ai-pod-{project_id}" (project_id == workspace_hash)
+        let filter = format!("name=^ai-pod-{}-", project_id);
         let output = match state
             .runtime
             .async_command()

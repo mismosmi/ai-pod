@@ -673,9 +673,9 @@ mod tests {
     }
 
     #[test]
-    fn container_prefix_starts_with_claude() {
+    fn container_prefix_starts_with_ai_pod() {
         let name = container_prefix(Path::new("/home/user/myproject"));
-        assert!(name.starts_with("claude-"));
+        assert!(name.starts_with("ai-pod-"));
     }
 
     #[test]

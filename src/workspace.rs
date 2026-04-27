@@ -9,7 +9,7 @@ pub fn workspace_hash(workspace: &Path) -> String {
 
 /// Stable prefix shared by all containers for this workspace.
 pub fn container_prefix(workspace: &Path) -> String {
-    format!("claude-{}", workspace_hash(workspace))
+    format!("ai-pod-{}", workspace_hash(workspace))
 }
 
 /// Unique container name for a new session.
@@ -19,7 +19,7 @@ pub fn new_container_name(workspace: &Path) -> String {
 }
 
 pub fn volume_name(workspace: &Path) -> String {
-    format!("claude-{}-home", workspace_hash(workspace))
+    format!("ai-pod-{}-home", workspace_hash(workspace))
 }
 
 #[cfg(test)]
@@ -40,9 +40,9 @@ mod tests {
     }
 
     #[test]
-    fn container_prefix_starts_with_claude() {
+    fn container_prefix_starts_with_ai_pod() {
         let prefix = container_prefix(Path::new("/home/user/myproject"));
-        assert!(prefix.starts_with("claude-"));
+        assert!(prefix.starts_with("ai-pod-"));
     }
 
     #[test]
@@ -61,7 +61,7 @@ mod tests {
     #[test]
     fn volume_name_uses_workspace_hash() {
         let p = Path::new("/home/user/myproject");
-        assert_eq!(volume_name(p), format!("claude-{}-home", workspace_hash(p)));
+        assert_eq!(volume_name(p), format!("ai-pod-{}-home", workspace_hash(p)));
     }
 
     #[test]
