@@ -156,6 +156,18 @@ pub fn state_file_for(config: &AppConfig, workspace: &Path) -> PathBuf {
     config.project_state_file(&hash)
 }
 
+/// Best-effort blocking POST to `/keep-alive` to bump the shared server's
+/// inactivity timer. Errors are intentionally swallowed: the caller is
+/// re-arming the timer for the next operation, and any real connectivity
+/// problem will surface on the subsequent authenticated request.
+pub fn bump_keep_alive() {
+    let url = format!("http://127.0.0.1:{}/keep-alive", MCP_PORT);
+    let _ = reqwest::blocking::Client::new()
+        .post(&url)
+        .timeout(std::time::Duration::from_secs(2))
+        .send();
+}
+
 /// Ensure the shared server is running. Starts it if not alive.
 pub fn ensure_shared_server(config: &AppConfig) -> Result<()> {
     let state_path = config.server_state_file();
@@ -167,6 +179,9 @@ pub fn ensure_shared_server(config: &AppConfig) -> Result<()> {
     if let Some(pid) = state.pid
         && is_server_process_alive(pid, state.exe_path.as_deref())
     {
+        // Re-arm the inactivity timer so a freshly-arriving CLI command does
+        // not inherit a near-expired timer from the previous run.
+        bump_keep_alive();
         return Ok(());
     }
 

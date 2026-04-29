@@ -80,9 +80,10 @@ pub fn build_image(rt: &ContainerRuntime, dockerfile: &Path, image: &str, no_cac
         &dockerfile.parent().unwrap_or(Path::new(".")).to_string_lossy(),
     ]);
 
-    // Keep the shared server alive during the build: POST /keep-alive every 20 s.
-    // The server auto-shuts-down after 30 s of inactivity with no containers running,
-    // so without this the server would die mid-build.
+    // Keep the shared server alive during the build. The server auto-shuts-down
+    // after 30 s of inactivity with no containers running. POST /keep-alive
+    // immediately so the timer is bumped before the build's first long step,
+    // then re-bump every 10 s for safety margin.
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     let keepalive_thread = std::thread::spawn(move || {
         let client = reqwest::blocking::Client::new();
@@ -90,8 +91,9 @@ pub fn build_image(rt: &ContainerRuntime, dockerfile: &Path, image: &str, no_cac
             "http://127.0.0.1:{}/keep-alive",
             crate::server::lifecycle::MCP_PORT
         );
+        let _ = client.post(&url).send();
         loop {
-            match stop_rx.recv_timeout(std::time::Duration::from_secs(20)) {
+            match stop_rx.recv_timeout(std::time::Duration::from_secs(10)) {
                 Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     let _ = client.post(&url).send();
