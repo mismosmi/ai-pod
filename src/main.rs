@@ -178,6 +178,11 @@ async fn launch_flow(cli: &Cli, rt: &ContainerRuntime) -> Result<()> {
     let image = image::image_name(&workspace);
     image::ensure_image(rt, &dockerfile, &image, cli.rebuild, cli.no_cache)?;
 
+    // Bridge the gap between build completion and the first authenticated
+    // request: re-arm the inactivity timer so the server doesn't shut down
+    // while we set up state and launch the container.
+    server::lifecycle::bump_keep_alive();
+
     // 6. Check server version compatibility
     server::lifecycle::check_server_version().await?;
 
@@ -320,6 +325,7 @@ async fn main() -> Result<()> {
             server::lifecycle::ensure_shared_server(&config)?;
             let image = image::image_name(&workspace);
             image::ensure_image(&rt, &dockerfile, &image, cli.rebuild, cli.no_cache)?;
+            server::lifecycle::bump_keep_alive();
             server::lifecycle::check_server_version().await?;
             let project_id = workspace::workspace_hash(&workspace);
             let state = server::lifecycle::get_or_create_project_state(&config, &workspace)?;
