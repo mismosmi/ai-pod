@@ -134,7 +134,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/daemon/list", post(daemons::list_daemons_handler))
         .route("/daemon/status", post(daemons::daemon_status_handler))
         .route("/daemon/output", post(daemons::daemon_output_handler))
-        .layer(GovernorLayer { config: governor_conf })
+        .layer(GovernorLayer::new(governor_conf))
         // Applied after GovernorLayer so it sees the 429 response and can
         // rewrite the header.
         .layer(middleware::from_fn(add_retry_after_header));
