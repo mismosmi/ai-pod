@@ -19,7 +19,7 @@ dirs = "5"
 sha2 = "0.10"
 hex = "0.4"
 colored = "2"
-dialoguer = "0.11"
+dialoguer = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
