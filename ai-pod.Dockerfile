@@ -5,6 +5,7 @@ RUN curl -fsSL "http://${HOST_GATEWAY}:7822/host-tools" \
       -o /usr/local/bin/host-tools && chmod +x /usr/local/bin/host-tools
 
 RUN host-tools install claude
+RUN host-tools install opencode
 
 WORKDIR /app
 
@@ -18,6 +19,7 @@ RUN git config --system user.email "ai-pod@ai-pod" && \
 USER ai-pod
 
 ENV PATH="/home/ai-pod/.local/bin:${PATH}"
+ENV OPENCODE_YOLO=1
 
 
 CMD ["claude"]

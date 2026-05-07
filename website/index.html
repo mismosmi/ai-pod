@@ -3,7 +3,7 @@
     <head>
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>ai-pod — Claude Code in Isolated Containers</title>
+        <title>ai-pod — AI Agents in Isolated Containers</title>
         <style>
             *,
             *::before,
@@ -653,12 +653,13 @@
 
                     <div class="feature-card">
                         <div class="feature-icon">💾</div>
-                        <h3>Persistent Claude state</h3>
+                        <h3>Persistent agent state</h3>
                         <p>
                             A named volume preserves
-                            <code>~/.claude</code> across sessions — your login,
-                            memory, settings, and conversation history survive
-                            container restarts.
+                            <code>~/.claude</code> and
+                            <code>~/.config/opencode</code> across sessions —
+                            your login, memory, settings, and conversation history
+                            survive container restarts.
                         </p>
                     </div>
 
@@ -685,13 +686,13 @@
 
                     <div class="feature-card">
                         <div class="feature-icon">⚙️</div>
-                        <h3>Settings &amp; CLAUDE.md merging</h3>
+                        <h3>AI-driven skill file</h3>
                         <p>
-                            Your host <code>~/.claude/settings.json</code> and
-                            <code>CLAUDE.md</code>
-                            are merged with container defaults at launch, so
-                            your personal Claude preferences follow you
-                            everywhere.
+                            Container environment context and
+                            <code>host-tools</code> usage are delivered via an
+                            auto-generated ai-pod skill loaded by Claude and
+                            OpenCode, so agents know how to interact with the
+                            host and the container.
                         </p>
                     </div>
 

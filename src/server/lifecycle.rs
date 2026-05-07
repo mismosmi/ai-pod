@@ -317,7 +317,6 @@ mod tests {
         std::fs::create_dir_all(&config_dir).unwrap();
         AppConfig {
             runtime_settings: config_dir.join("runtime-settings.json"),
-            runtime_claude_md: config_dir.join("runtime-CLAUDE.md"),
             config_dir,
             home_dir: home,
         }

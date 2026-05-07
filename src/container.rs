@@ -10,22 +10,11 @@ use crate::runtime::ContainerRuntime;
 use crate::workspace::{container_prefix, new_container_name, volume_name as gen_volume_name};
 
 #[derive(Template)]
-#[template(path = "container_claude_md.txt")]
-struct ContainerClaudeMd<'a> {
+#[template(path = "skill.md")]
+struct AiPodSkill<'a> {
     display_name: &'a str,
     host_gateway: &'a str,
 }
-
-fn container_claude_md(rt: &ContainerRuntime) -> String {
-    let tmpl = ContainerClaudeMd {
-        display_name: rt.display_name(),
-        host_gateway: rt.host_gateway(),
-    };
-    tmpl.render()
-        .expect("failed to render container CLAUDE.md template")
-}
-
-const SKILL_MD: &str = include_str!("../templates/skill.md");
 
 /// Home directory of the `ai-pod` user inside every container image.
 /// The Dockerfile template creates this user with this home path, so the
@@ -69,23 +58,6 @@ pub fn volume_exists(rt: &ContainerRuntime, name: &str) -> Result<bool> {
         .status()
         .context("Failed to check if volume exists")?;
     Ok(status.success())
-}
-
-fn generate_runtime_claude_md(rt: &ContainerRuntime, config: &AppConfig) -> Result<()> {
-    let mut content = container_claude_md(rt);
-
-    let host_claude_md = config.claude_md_path();
-    if host_claude_md.exists() {
-        let existing = std::fs::read_to_string(&host_claude_md)
-            .context("Failed to read existing CLAUDE.md")?;
-        content.push('\n');
-        content.push_str(&existing);
-    }
-
-    std::fs::write(&config.runtime_claude_md, content)
-        .context("Failed to write runtime CLAUDE.md")?;
-
-    Ok(())
 }
 
 fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
@@ -241,10 +213,12 @@ fn seed_home_volume(
             &format!("{}/.claude", CONTAINER_HOME),
             &format!("{}/.claude/skills/ai-pod", CONTAINER_HOME),
             &format!("{}/.config", CONTAINER_HOME),
+            &format!("{}/.config/opencode/skills/ai-pod", CONTAINER_HOME),
+            &format!("{}/.config/opencode/plugins", CONTAINER_HOME),
+            &format!("{}/.config/opencode/plugins", CONTAINER_HOME),
         ])
         .status();
 
-    generate_runtime_claude_md(rt, config)?;
     generate_runtime_settings(config)?;
 
     let _ = rt
@@ -256,17 +230,29 @@ fn seed_home_volume(
         ])
         .status();
 
-    let _ = rt
-        .command()
-        .args([
-            "cp",
-            &config.runtime_claude_md.to_string_lossy(),
-            &format!("{}:{}/.claude/CLAUDE.md", init_container, CONTAINER_HOME),
-        ])
-        .status();
+    // Copy the host's personal CLAUDE.md into the container (no ai-pod preamble)
+    let host_claude_md = config.claude_md_path();
+    if host_claude_md.exists() {
+        let _ = rt
+            .command()
+            .args([
+                "cp",
+                &host_claude_md.to_string_lossy(),
+                &format!("{}:{}/.claude/CLAUDE.md", init_container, CONTAINER_HOME),
+            ])
+            .status();
+    }
 
+    let skill = AiPodSkill {
+        display_name: rt.display_name(),
+        host_gateway: rt.host_gateway(),
+    };
+    let skill_md = skill
+        .render()
+        .expect("failed to render ai-pod skill template");
     let skill_path = config.config_dir.join("skill.md");
-    std::fs::write(&skill_path, SKILL_MD)?;
+    std::fs::write(&skill_path, skill_md)?;
+
     let _ = rt
         .command()
         .args([
@@ -279,14 +265,29 @@ fn seed_home_volume(
         ])
         .status();
 
-    let opencode_config = config.home_dir.join(".config").join("opencode");
-    if opencode_config.exists() {
+    let _ = rt
+        .command()
+        .args([
+            "cp",
+            skill_path.to_str().unwrap(),
+            &format!(
+                "{}:{}/.config/opencode/skills/ai-pod/SKILL.md",
+                init_container, CONTAINER_HOME
+            ),
+        ])
+        .status();
+
+    let opencode_plugin = config.config_dir.join("opencode-plugin.js");
+    if opencode_plugin.exists() {
         let _ = rt
             .command()
             .args([
                 "cp",
-                &opencode_config.to_string_lossy(),
-                &format!("{}:{}/.config/", init_container, CONTAINER_HOME),
+                &opencode_plugin.to_string_lossy(),
+                &format!(
+                    "{}:{}/.config/opencode/plugins/ai-pod.js",
+                    init_container, CONTAINER_HOME
+                ),
             ])
             .status();
     }
@@ -660,7 +661,6 @@ mod tests {
         std::fs::create_dir_all(&config_dir).unwrap();
         AppConfig {
             runtime_settings: config_dir.join("runtime-settings.json"),
-            runtime_claude_md: config_dir.join("runtime-CLAUDE.md"),
             config_dir,
             home_dir: home,
         }
@@ -786,56 +786,31 @@ mod tests {
     }
 
     #[test]
-    fn runtime_claude_md_contains_container_preamble() {
-        let dir = TempDir::new().unwrap();
-        let config = make_test_config(&dir);
+    fn rendered_skill_contains_container_preamble_for_podman() {
         let rt = test_runtime();
-        generate_runtime_claude_md(&rt, &config).unwrap();
-
-        let content = std::fs::read_to_string(&config.runtime_claude_md).unwrap();
-        assert!(content.contains("host.containers.internal"));
-        assert!(content.contains("Podman container"));
+        let skill = AiPodSkill {
+            display_name: rt.display_name(),
+            host_gateway: rt.host_gateway(),
+        };
+        let rendered = skill.render().unwrap();
+        assert!(rendered.contains("host.containers.internal"));
+        assert!(rendered.contains("Podman container"));
+        assert!(rendered.contains("/usr/local/bin/host-tools"));
     }
 
     #[test]
-    fn runtime_claude_md_contains_docker_preamble() {
-        let dir = TempDir::new().unwrap();
-        let config = make_test_config(&dir);
+    fn rendered_skill_contains_container_preamble_for_docker() {
         let rt = ContainerRuntime {
             kind: RuntimeKind::Docker,
             dry_run: false,
         };
-        generate_runtime_claude_md(&rt, &config).unwrap();
-
-        let content = std::fs::read_to_string(&config.runtime_claude_md).unwrap();
-        assert!(content.contains("host.docker.internal"));
-        assert!(content.contains("Docker container"));
-    }
-
-    #[test]
-    fn runtime_claude_md_appends_existing_claude_md() {
-        let dir = TempDir::new().unwrap();
-        let config = make_test_config(&dir);
-        let rt = test_runtime();
-
-        let claude_dir = config.home_dir.join(".claude");
-        std::fs::create_dir_all(&claude_dir).unwrap();
-        std::fs::write(config.claude_md_path(), "# My Rules\nAlways use Rust.\n").unwrap();
-
-        generate_runtime_claude_md(&rt, &config).unwrap();
-
-        let content = std::fs::read_to_string(&config.runtime_claude_md).unwrap();
-        assert!(content.contains("host.containers.internal"));
-        assert!(content.contains("My Rules"));
-        assert!(content.contains("Always use Rust."));
-    }
-
-    #[test]
-    fn runtime_claude_md_without_existing_file_does_not_error() {
-        let dir = TempDir::new().unwrap();
-        let config = make_test_config(&dir);
-        let rt = test_runtime();
-        generate_runtime_claude_md(&rt, &config).unwrap();
-        assert!(config.runtime_claude_md.exists());
+        let skill = AiPodSkill {
+            display_name: rt.display_name(),
+            host_gateway: rt.host_gateway(),
+        };
+        let rendered = skill.render().unwrap();
+        assert!(rendered.contains("host.docker.internal"));
+        assert!(rendered.contains("Docker container"));
+        assert!(rendered.contains("/usr/local/bin/host-tools"));
     }
 }

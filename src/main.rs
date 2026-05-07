@@ -130,9 +130,11 @@ fn init_project(
     };
 
     let cfg = base_image_config(&image);
+    let extra_commands = if agent == cli::Agent::Opencode { "ENV OPENCODE_YOLO=1" } else { "" };
     let content = include_str!("../templates/Dockerfile")
         .replace("{{BASE_IMAGE}}", cfg.from)
         .replace("{{INSTALL_PACKAGES}}", cfg.install_packages)
+        .replace("{{EXTRA_COMMANDS}}", extra_commands)
         .replace("{{CREATE_USER}}", cfg.create_user)
         .replace("{{AGENT}}", agent_str);
 
