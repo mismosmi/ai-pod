@@ -74,7 +74,7 @@ jobs:
         run: cp target/${{ matrix.target }}/release/host-tools ${{ matrix.host_tools_artifact }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
@@ -82,7 +82,7 @@ jobs:
 
       - name: Upload host-tools artifact
         if: matrix.host_tools_artifact != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.host_tools_artifact }}
           path: ${{ matrix.host_tools_artifact }}
@@ -95,7 +95,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
