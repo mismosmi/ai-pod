@@ -1,11 +1,20 @@
 ---
 name: ai-pod
-description: This skill should be used when the user asks to run a command on the host machine, open an application on the host, send a desktop notification to the user, list previously approved host commands, or manage long-running background processes (daemons) on the host. Provides the host-tools binary at /home/ai-pod/.local/bin/host-tools.
+description: This skill should be used when the user asks to run a command on the host machine, open an application on the host, send a desktop notification to the user, list previously approved host commands, or manage long-running background processes (daemons) on the host. Provides the host-tools binary at /usr/local/bin/host-tools.
 version: 0.1.0
 ---
+# Container Environment
+
+You are running inside a {{ display_name }} container. To reach services on the host machine,
+use `{{ host_gateway }}` instead of `localhost`.
+
+For example: `curl http://{{ host_gateway }}:3000`
+
+Working directory: /app
+
 # host-tools — Host Interaction
 
-`/home/ai-pod/.local/bin/host-tools` interacts with the host machine from inside this container.
+`/usr/local/bin/host-tools` interacts with the host machine from inside this container.
 
 ## run-command
 

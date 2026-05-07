@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 pub struct AppConfig {
     pub config_dir: PathBuf,
     pub runtime_settings: PathBuf,
-    pub runtime_claude_md: PathBuf,
     pub home_dir: PathBuf,
 }
 
@@ -15,7 +14,6 @@ impl AppConfig {
 
         Ok(Self {
             runtime_settings: config_dir.join("runtime-settings.json"),
-            runtime_claude_md: config_dir.join("runtime-CLAUDE.md"),
             config_dir,
             home_dir,
         })
@@ -75,7 +73,6 @@ mod tests {
         let config_dir = home.join(".ai-pod");
         AppConfig {
             runtime_settings: config_dir.join("runtime-settings.json"),
-            runtime_claude_md: config_dir.join("runtime-CLAUDE.md"),
             config_dir,
             home_dir: home,
         }
@@ -86,7 +83,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = temp_config(&dir);
         assert!(config.runtime_settings.starts_with(&config.config_dir));
-        assert!(config.runtime_claude_md.starts_with(&config.config_dir));
     }
 
     #[test]

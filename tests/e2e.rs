@@ -132,7 +132,6 @@ fn make_test_config() -> (tempfile::TempDir, AppConfig) {
     std::fs::create_dir_all(&config_dir).unwrap();
     let config = AppConfig {
         runtime_settings: config_dir.join("runtime-settings.json"),
-        runtime_claude_md: config_dir.join("runtime-CLAUDE.md"),
         config_dir,
         home_dir: home,
     };

@@ -2,7 +2,7 @@
 
 [Read the docs](https://ai-pod.apps.farbenmeer.de)
 
-**Claude Code inside isolated containers — safe, persistent, and project-aware.**
+**Claude Code & OpenCode inside isolated containers — safe, persistent, and project-aware.**
 
 ai-pod manages per-workspace containers that run Claude Code. It works with **Podman** (preferred) or **Docker** — whichever is available on your system. Each workspace gets a dedicated container, a shared background server bridges host interaction, and your personal Claude settings follow you everywhere.
 
@@ -11,12 +11,12 @@ ai-pod manages per-workspace containers that run Claude Code. It works with **Po
 ## Features
 
 - **Workspace isolation** — each directory gets its own container, named by a hash of its path; projects can't interfere with each other
-- **Persistent Claude state** — a named volume preserves `~/.claude` (login, memory, settings) across container restarts
+- **Persistent agent state** — a named volume preserves `~/.claude` and `~/.config/opencode` (login, memory, settings) across container restarts
 - **Credential scanning** — scans the workspace for secrets before mounting it; prompts you to review or abort
 - **Custom Dockerfiles per project** — drop an `ai-pod.Dockerfile` in any project to install extra runtimes, tools, or MCP servers
-- **Settings & CLAUDE.md merging** — your host `~/.claude/settings.json` and `CLAUDE.md` are merged with container defaults at launch
-- **Host command execution** — the bundled `host-tools` binary lets Claude run commands on the host machine; every command requires your explicit approval with a persistent allowlist
-- **Desktop notifications** — a Stop hook fires `host-tools notify-user` when a Claude session ends so you know when to come back
+- **AI-driven skill file** — container environment context and `host-tools` usage are delivered via an auto-generated ai-pod skill loaded by Claude and OpenCode
+- **Host command execution** — the bundled `host-tools` binary at `/usr/local/bin/host-tools` lets agents run commands on the host machine; every command requires your explicit approval with a persistent allowlist
+- **Desktop notifications** — Stop hooks fire `host-tools notify-user` on Claude session end, and an OpenCode plugin sends notifications when `session.idle` fires, so you know when to come back
 - **Transparent host networking** — containers reach host services at `host.containers.internal` (Podman) or `host.docker.internal` (Docker); no manual port mapping needed
 - **Auto-update checks** — silently checks for new releases on startup and notifies you when one is available
 
@@ -118,7 +118,7 @@ The default image is based on Ubuntu and installs Claude Code via the official i
 
 ## Host interaction
 
-The `host-tools` binary is installed in every container at `/home/ai-pod/.local/bin/host-tools`. Claude is taught to use it via a skill file that is automatically installed in each container.
+The `host-tools` binary is installed in every container at `/usr/local/bin/host-tools`. Claude and OpenCode are taught to use it via a skill file that is automatically installed in each container.
 
 ### host-tools run-command
 
