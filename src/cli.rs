@@ -95,10 +95,11 @@ pub enum Command {
         action: Option<CommandsAction>,
     },
 
-    /// Manage the whitelist of always-allowed commands for a workspace
+    /// Manage the whitelist of always-allowed commands for a workspace.
+    /// Run with no subcommand to open an interactive TUI.
     Allowed {
         #[command(subcommand)]
-        action: AllowedAction,
+        action: Option<AllowedAction>,
     },
 
     /// Update ai-pod to the latest release

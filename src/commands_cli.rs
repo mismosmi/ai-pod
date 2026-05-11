@@ -477,6 +477,108 @@ async fn tui_loop(
     Ok(())
 }
 
+// ---------------- Allow-list TUI ----------------
+
+pub fn run_allowed_tui(config: &AppConfig, workspace: &Path) -> Result<()> {
+    let hash = workspace_hash(workspace);
+    let state_path = config.project_state_file(&hash);
+
+    enable_raw_mode().context("enable raw mode")?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen).context("enter alt screen")?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).context("create terminal")?;
+
+    let result = allowed_tui_loop(&mut terminal, &state_path);
+
+    disable_raw_mode().ok();
+    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
+    terminal.show_cursor().ok();
+
+    result
+}
+
+fn allowed_tui_loop(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    state_path: &Path,
+) -> Result<()> {
+    let mut state = ProjectState::load(state_path);
+    let mut list_state = ListState::default();
+    if !state.allowed_commands.is_empty() {
+        list_state.select(Some(0));
+    }
+    let mut confirm_delete: Option<usize> = None;
+
+    loop {
+        terminal.draw(|f| {
+            let items: Vec<ListItem> = state
+                .allowed_commands
+                .iter()
+                .map(|c| ListItem::new(c.clone()))
+                .collect();
+            let title = match confirm_delete {
+                Some(_) => "allowed commands  (y confirm delete, n cancel)".to_string(),
+                None => "allowed commands  (↑/↓ select, d delete, q quit)".to_string(),
+            };
+            let list = List::new(items)
+                .block(Block::default().borders(Borders::ALL).title(title))
+                .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+            f.render_stateful_widget(list, f.area(), &mut list_state);
+        })?;
+
+        if event::poll(Duration::from_millis(250))? {
+            if let Event::Key(KeyEvent { code, kind, .. }) = event::read()? {
+                if kind != KeyEventKind::Press {
+                    continue;
+                }
+                if let Some(idx) = confirm_delete {
+                    match code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            if idx < state.allowed_commands.len() {
+                                let cmd = state.allowed_commands[idx].clone();
+                                state.remove_allowed(&cmd);
+                                state.save(state_path)?;
+                                let new_len = state.allowed_commands.len();
+                                if new_len == 0 {
+                                    list_state.select(None);
+                                } else {
+                                    list_state.select(Some(idx.min(new_len - 1)));
+                                }
+                            }
+                            confirm_delete = None;
+                        }
+                        _ => confirm_delete = None,
+                    }
+                    continue;
+                }
+                match code {
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if !state.allowed_commands.is_empty() {
+                            let cur = list_state.selected().unwrap_or(0);
+                            let next = (cur + 1).min(state.allowed_commands.len() - 1);
+                            list_state.select(Some(next));
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        let cur = list_state.selected().unwrap_or(0);
+                        list_state.select(Some(cur.saturating_sub(1)));
+                    }
+                    KeyCode::Char('d') | KeyCode::Delete => {
+                        if let Some(idx) = list_state.selected() {
+                            if idx < state.allowed_commands.len() {
+                                confirm_delete = Some(idx);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn current_log(ctx: &Ctx, s: &TuiState) -> String {
     let idx = match s.list_state.selected() {
         Some(i) => i,

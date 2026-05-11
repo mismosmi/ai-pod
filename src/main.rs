@@ -287,6 +287,14 @@ async fn main() -> Result<()> {
         }
         Some(Command::Allowed { action }) => {
             let config = AppConfig::new()?;
+            let action = match action {
+                Some(a) => a,
+                None => {
+                    let workspace = resolve_workspace(&cli.workdir)?;
+                    commands_cli::run_allowed_tui(&config, &workspace)?;
+                    return Ok(());
+                }
+            };
             match action {
                 AllowedAction::List { workdir } => {
                     let workspace = resolve_workspace(workdir)?;
