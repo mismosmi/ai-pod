@@ -7,7 +7,9 @@ use std::process::Stdio;
 
 use crate::config::AppConfig;
 use crate::runtime::ContainerRuntime;
-use crate::workspace::{container_prefix, new_container_name, volume_name as gen_volume_name};
+use crate::workspace::{
+    container_name_for, container_prefix, new_session_id, volume_name as gen_volume_name,
+};
 
 #[derive(Template)]
 #[template(path = "skill.md")]
@@ -69,11 +71,18 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
         serde_json::json!({})
     };
 
+    let notify_curl = |msg: &str| {
+        format!(
+            "curl -fsS -X POST -H \"X-Api-Key: $AI_POD_API_KEY\" -H 'Content-Type: application/json' -d '{{\"project_id\":\"'\"$AI_POD_PROJECT_ID\"'\",\"message\":\"{}\"}}' \"$AI_POD_SERVER_URL/notify_user\" >/dev/null || true",
+            msg
+        )
+    };
+
     let stop_hook = serde_json::json!([{
         "matcher": "*",
         "hooks": [{
             "type": "command",
-            "command": "/usr/local/bin/host-tools daemon stop-all || true; /usr/local/bin/host-tools notify-user \"Task completed\" || true"
+            "command": notify_curl("Task completed"),
         }]
     }]);
 
@@ -81,7 +90,7 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
         "matcher": "*",
         "hooks": [{
             "type": "command",
-            "command": "/usr/local/bin/host-tools notify-user \"Claude needs your approval\" || true"
+            "command": notify_curl("Claude needs your approval"),
         }]
     }]);
 
@@ -110,6 +119,24 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
     std::fs::write(&config.runtime_settings, output).context("Failed to write runtime settings")?;
 
     Ok(())
+}
+
+/// Render the MCP client config that points the in-container agent at the
+/// shared host server. Env-var interpolation in the headers means the same
+/// config works for every container session.
+fn mcp_config_json(server_url: &str) -> serde_json::Value {
+    serde_json::json!({
+        "mcpServers": {
+            "ai-pod": {
+                "type": "http",
+                "url": format!("{}/mcp", server_url),
+                "headers": {
+                    "X-Api-Key": "${AI_POD_API_KEY}",
+                    "X-Ai-Pod-Session-Id": "${AI_POD_SESSION_ID}"
+                }
+            }
+        }
+    })
 }
 
 fn read_git_global(key: &str) -> Option<String> {
@@ -168,6 +195,7 @@ fn seed_home_volume(
     image: &str,
     copy_claude_json: bool,
 ) -> Result<()> {
+    let server_url = rt.server_url();
     let init_container = format!("{}-init", container_name);
     let status = rt
         .command()
@@ -292,6 +320,20 @@ fn seed_home_volume(
             .status();
     }
 
+    // MCP client config — copied into both Claude Code and OpenCode config
+    // locations so either agent can talk to the host MCP server.
+    let mcp_path = config.config_dir.join("ai-pod-mcp.json");
+    std::fs::write(&mcp_path, serde_json::to_string_pretty(&mcp_config_json(&server_url))?)?;
+
+    let _ = rt
+        .command()
+        .args([
+            "cp",
+            mcp_path.to_str().unwrap(),
+            &format!("{}:{}/.mcp.json", init_container, CONTAINER_HOME),
+        ])
+        .status();
+
     write_gitconfig_to_volume(rt, config, &init_container)?;
 
     let _ = rt.command().args(["rm", &init_container]).status();
@@ -408,7 +450,8 @@ pub fn launch_container(
         )?;
     }
 
-    let container_name = new_container_name(workspace);
+    let session_id = new_session_id();
+    let container_name = container_name_for(workspace, &session_id);
     println!("{} {}", "Starting container:".blue().bold(), container_name);
 
     let add_host = rt.add_host_arg();
@@ -434,6 +477,8 @@ pub fn launch_container(
         "-e",
         &format!("AI_POD_API_KEY={}", api_key),
         "-e",
+        &format!("AI_POD_SESSION_ID={}", session_id),
+        "-e",
         &server_url_env,
     ]);
     run_cmd.arg(image);
@@ -457,7 +502,8 @@ pub fn run_in_container(
     command: &str,
     args: &[String],
 ) -> Result<()> {
-    let container_name = new_container_name(workspace);
+    let session_id = new_session_id();
+    let container_name = container_name_for(workspace, &session_id);
     let volume_name = gen_volume_name(workspace);
     let workspace_str = workspace.to_string_lossy();
 
@@ -500,6 +546,8 @@ pub fn run_in_container(
         format!("AI_POD_PROJECT_ID={}", project_id),
         "-e".into(),
         format!("AI_POD_API_KEY={}", api_key),
+        "-e".into(),
+        format!("AI_POD_SESSION_ID={}", session_id),
         "-e".into(),
         format!("AI_POD_SERVER_URL={}", rt.server_url()),
         "--entrypoint".into(),
@@ -723,12 +771,12 @@ mod tests {
         let stop = &json["hooks"]["Stop"];
         assert!(stop.is_array(), "hooks.Stop should be an array");
         let cmd = stop[0]["hooks"][0]["command"].as_str().unwrap();
-        assert!(cmd.contains("host-tools"));
-        assert!(cmd.contains("notify-user"));
+        assert!(cmd.contains("notify_user"));
+        assert!(cmd.contains("$AI_POD_SERVER_URL"));
     }
 
     #[test]
-    fn runtime_settings_stop_hook_calls_host_tools() {
+    fn runtime_settings_stop_hook_uses_curl() {
         let dir = TempDir::new().unwrap();
         let config = make_test_config(&dir);
         generate_runtime_settings(&config).unwrap();
@@ -738,7 +786,7 @@ mod tests {
         let cmd = json["hooks"]["Stop"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap();
-        assert!(cmd.contains("host-tools"));
+        assert!(cmd.starts_with("curl"));
     }
 
     #[test]
@@ -795,7 +843,7 @@ mod tests {
         let rendered = skill.render().unwrap();
         assert!(rendered.contains("host.containers.internal"));
         assert!(rendered.contains("Podman container"));
-        assert!(rendered.contains("/usr/local/bin/host-tools"));
+        assert!(rendered.contains("MCP"));
     }
 
     #[test]
@@ -811,6 +859,22 @@ mod tests {
         let rendered = skill.render().unwrap();
         assert!(rendered.contains("host.docker.internal"));
         assert!(rendered.contains("Docker container"));
-        assert!(rendered.contains("/usr/local/bin/host-tools"));
+        assert!(rendered.contains("MCP"));
+    }
+
+    #[test]
+    fn mcp_config_points_at_host_server() {
+        let cfg = mcp_config_json("http://host.containers.internal:7822");
+        assert_eq!(
+            cfg["mcpServers"]["ai-pod"]["url"],
+            "http://host.containers.internal:7822/mcp"
+        );
+        assert_eq!(cfg["mcpServers"]["ai-pod"]["type"], "http");
+        assert!(
+            cfg["mcpServers"]["ai-pod"]["headers"]["X-Api-Key"]
+                .as_str()
+                .unwrap()
+                .contains("AI_POD_API_KEY")
+        );
     }
 }

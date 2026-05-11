@@ -1,12 +1,13 @@
 pub mod commands;
-pub mod daemons;
 pub mod lifecycle;
+pub mod mcp;
 pub mod notify;
 pub mod rest;
+pub mod runner;
 
 use axum::{
     Json, Router,
-    extract::{Request, State},
+    extract::{Path as AxumPath, Request, State},
     http::{StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -23,8 +24,8 @@ use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 
 use crate::config::AppConfig;
 use crate::runtime::ContainerRuntime;
-use daemons::DaemonEntry;
 use lifecycle::ProjectState;
+use runner::CommandHandle;
 
 #[derive(Clone)]
 pub struct ProjectInfo {
@@ -37,7 +38,7 @@ pub struct AppState {
     pub projects: Arc<Mutex<HashMap<String, ProjectInfo>>>,
     pub config_dir: PathBuf,
     pub approval_lock: Arc<Mutex<()>>,
-    pub daemons: Arc<Mutex<HashMap<String, DaemonEntry>>>,
+    pub commands: Arc<Mutex<HashMap<(String, String), CommandHandle>>>,
     pub runtime: ContainerRuntime,
     pub keep_alive_until: Arc<Mutex<Instant>>,
 }
@@ -55,21 +56,23 @@ async fn version_handler() -> Json<serde_json::Value> {
     Json(json!({ "version": env!("CARGO_PKG_VERSION") }))
 }
 
-async fn host_tools_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let path = state.config_dir.join("host-tools");
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/octet-stream")],
-            bytes,
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::NOT_FOUND,
-            "host-tools not cached. Run install.sh or install-local.sh first.",
-        )
-            .into_response(),
-    }
+const INSTALL_CLAUDE_SH: &str = include_str!("../../templates/install-claude.sh");
+const INSTALL_OPENCODE_SH: &str = include_str!("../../templates/install-opencode.sh");
+
+async fn install_script_handler(AxumPath(name): AxumPath<String>) -> Response {
+    let body = match name.as_str() {
+        "claude.sh" => INSTALL_CLAUDE_SH,
+        "opencode.sh" => INSTALL_OPENCODE_SH,
+        _ => {
+            return (StatusCode::NOT_FOUND, "Unknown install script").into_response();
+        }
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
+        body,
+    )
+        .into_response()
 }
 
 /// Middleware that translates tower_governor's non-standard
@@ -87,19 +90,7 @@ async fn add_retry_after_header(request: Request, next: Next) -> Response {
     response
 }
 
-/// Build the Axum router with the rate-limiting middleware applied.
-///
-/// The returned router still needs to be served via
-/// `into_make_service_with_connect_info::<SocketAddr>()` so that
-/// `PeerIpKeyExtractor` can read the client peer address.
-///
-/// Exposed so integration tests can exercise the real middleware stack.
 pub fn build_app(state: AppState) -> Router {
-    // Rate limiting: token-bucket (GCRA) per peer IP. A 50-token burst with
-    // 1 token/second refill covers the bursty MCP workload (several file reads
-    // in quick succession) while blocking sustained brute-force of API keys
-    // and flooding of /run_command (which forks a subprocess per request).
-    // Returns HTTP 429 with Retry-After when exceeded.
     let governor_conf = Arc::new(
         GovernorConfigBuilder::default()
             .per_second(1)
@@ -108,8 +99,6 @@ pub fn build_app(state: AppState) -> Router {
             .expect("valid governor config"),
     );
 
-    // Periodically trim the governor's per-IP state map so it does not grow
-    // unbounded across long-lived server runs.
     let governor_limiter = governor_conf.limiter().clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -119,29 +108,24 @@ pub fn build_app(state: AppState) -> Router {
         }
     });
 
-    // Rate-limited routes (API endpoints that could be brute-forced or flooded)
     let rate_limited = Router::new()
         .route("/health", get(health_handler))
         .route("/version", get(version_handler))
         .route("/keep-alive", post(keep_alive_handler))
         .route("/reload", post(reload_handler))
-        .route("/run_command", post(rest::run_command_handler))
         .route("/notify_user", post(rest::notify_user_handler))
         .route("/list_allowed_commands", post(rest::list_allowed_commands_handler))
-        .route("/daemon/start", post(daemons::start_daemon_handler))
-        .route("/daemon/stop", post(daemons::stop_daemon_handler))
-        .route("/daemon/stop-all", post(daemons::stop_all_daemons_handler))
-        .route("/daemon/list", post(daemons::list_daemons_handler))
-        .route("/daemon/status", post(daemons::daemon_status_handler))
-        .route("/daemon/output", post(daemons::daemon_output_handler))
+        .route("/commands/run", post(rest::run_command_handler))
+        .route("/commands/stop", post(rest::stop_command_handler))
+        .route("/commands/status", post(rest::command_status_handler))
+        .route("/commands/list", post(rest::list_commands_handler))
+        .route("/mcp", post(mcp::mcp_handler))
         .layer(GovernorLayer::new(governor_conf))
-        // Applied after GovernorLayer so it sees the 429 response and can
-        // rewrite the header.
         .layer(middleware::from_fn(add_retry_after_header));
 
-    // Unthrottled routes (large static file downloads that should not be rate-limited)
+    // Unthrottled: install scripts (fetched at image build time, idempotent)
     Router::new()
-        .route("/host-tools", get(host_tools_handler))
+        .route("/install/{name}", get(install_script_handler))
         .merge(rate_limited)
         .with_state(state)
 }
@@ -177,7 +161,6 @@ async fn reload_handler(State(state): State<AppState>) -> &'static str {
 }
 
 pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> anyhow::Result<()> {
-    // Scan existing project state files to pre-populate the projects map
     let mut projects: HashMap<String, ProjectInfo> = HashMap::new();
 
     if let Ok(entries) = std::fs::read_dir(&config.config_dir) {
@@ -190,7 +173,6 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
                 Some(s) => s.to_string(),
                 None => continue,
             };
-            // Skip server.json
             if stem == "server" {
                 continue;
             }
@@ -211,25 +193,11 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
         projects: Arc::new(Mutex::new(projects)),
         config_dir: config.config_dir.clone(),
         approval_lock: Arc::new(Mutex::new(())),
-        daemons: Arc::new(Mutex::new(HashMap::new())),
+        commands: Arc::new(Mutex::new(HashMap::new())),
         runtime: rt,
         keep_alive_until: Arc::new(Mutex::new(Instant::now() + Duration::from_secs(30))),
     };
 
-    // Background task: kill daemons when their project has no running containers
-    let bg_state = state.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-        loop {
-            interval.tick().await;
-            daemons::cleanup_orphaned_daemons(&bg_state).await;
-        }
-    });
-
-    // Background task: shut down server when the keep-alive period has expired and
-    // no managed containers are running. keep_alive_until is bumped 30 s forward on
-    // startup, on every authenticated container request, and via POST /keep-alive so
-    // the CLI can hold the server alive while building a new image.
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let shutdown_rt = state.runtime.clone();
     let shutdown_keep_alive = state.keep_alive_until.clone();
@@ -247,7 +215,7 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
                 .await;
             let has_containers = output
                 .map(|o| String::from_utf8_lossy(&o.stdout).lines().any(|l| !l.is_empty()))
-                .unwrap_or(true); // on error, stay alive
+                .unwrap_or(true);
             if !has_containers {
                 let _ = shutdown_tx.send(());
                 break;
@@ -261,8 +229,6 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
     println!("Shared server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    // into_make_service_with_connect_info is required so the governor layer's
-    // PeerIpKeyExtractor can read ConnectInfo<SocketAddr>.
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),

@@ -4,23 +4,57 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use tokio::io::AsyncBufReadExt;
-use tokio::sync::{mpsc, oneshot};
-use tokio_stream::wrappers::ReceiverStream;
 
 use subtle::ConstantTimeEq;
 
 use super::AppState;
 use super::commands;
 use super::notify;
+use super::runner;
 
 #[derive(Deserialize)]
 pub struct RunCommandRequest {
     pub project_id: String,
     pub command: String,
+    /// Required for MCP-style runs that produce per-session output dirs.
+    /// Host-side `ai-pod commands run` may omit this; the workspace project_id
+    /// is used as a fallback session id ("host" namespace).
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct StopCommandRequest {
+    pub project_id: String,
+    pub session_id: String,
+    pub command_id: String,
+}
+
+#[derive(Serialize)]
+pub struct StopCommandResponse {
+    pub stopped: bool,
+}
+
+#[derive(Deserialize)]
+pub struct CommandStatusRequest {
+    pub project_id: String,
+    pub session_id: String,
+    pub command_id: String,
+}
+
+#[derive(Deserialize)]
+pub struct ListCommandsRequest2 {
+    pub project_id: String,
+    /// `None` → list all sessions for the workspace.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ListCommandsResponse2 {
+    pub commands: Vec<runner::CommandSummary>,
 }
 
 #[derive(Deserialize)]
@@ -35,21 +69,13 @@ pub struct NotifyUserResponse {
 }
 
 #[derive(Deserialize)]
-pub struct ListCommandsRequest {
+pub struct ListAllowedCommandsRequest {
     pub project_id: String,
 }
 
 #[derive(Serialize)]
-pub struct ListCommandsResponse {
+pub struct ListAllowedCommandsResponse {
     pub commands: Vec<String>,
-}
-
-#[derive(Serialize)]
-#[serde(tag = "type", content = "data")]
-enum Message {
-    Stdout(String),
-    Stderr(String),
-    Exit(i32),
 }
 
 fn extract_api_key(headers: &HeaderMap) -> &str {
@@ -59,7 +85,7 @@ fn extract_api_key(headers: &HeaderMap) -> &str {
         .unwrap_or("")
 }
 
-async fn authenticate(
+pub(crate) async fn authenticate(
     state: &AppState,
     project_id: &str,
     provided_key: &str,
@@ -87,17 +113,26 @@ pub async fn run_command_handler(
     Json(req): Json<RunCommandRequest>,
 ) -> impl IntoResponse {
     let provided_key = extract_api_key(&headers).to_string();
-
     let workspace = match authenticate(&state, &req.project_id, &provided_key).await {
         Ok(w) => w,
         Err((status, msg)) => return (status, msg.to_string()).into_response(),
     };
 
+    let session_id = req
+        .session_id
+        .clone()
+        .or_else(|| {
+            headers
+                .get("x-ai-pod-session-id")
+                .and_then(|v| v.to_str().ok().map(|s| s.to_string()))
+        })
+        .unwrap_or_else(|| "host".to_string());
+
     match commands::run_host_command(&state, &req.command, &workspace).await {
         commands::ApprovalOutcome::Rejected => {
             let pattern = commands::COMMAND_REJECT_RE.as_str();
             let body = serde_json::json!({
-                "error": format!("Command rejected — it matches the forbidden pattern: {pattern}. Do not use `cd /` or `| head` / `| tail` in daemon commands."),
+                "error": format!("Command rejected — it matches the forbidden pattern: {pattern}. Do not use `cd /` or `| head` / `| tail`."),
             });
             return (StatusCode::BAD_REQUEST, body.to_string()).into_response();
         }
@@ -118,126 +153,57 @@ pub async fn run_command_handler(
         commands::ApprovalOutcome::Approved | commands::ApprovalOutcome::AlwaysAllow => {}
     }
 
-    let mut child = match tokio::process::Command::new("sh")
-        .args(["-c", &req.command])
-        .current_dir(&workspace)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .process_group(0)
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to spawn command: {}", e),
-            )
-                .into_response();
-        }
+    match runner::spawn_and_wait(&state, &workspace, &session_id, &req.command).await {
+        Ok(outcome) => Json(outcome).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to run command: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn stop_command_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<StopCommandRequest>,
+) -> impl IntoResponse {
+    let provided_key = extract_api_key(&headers).to_string();
+    if let Err((status, msg)) = authenticate(&state, &req.project_id, &provided_key).await {
+        return (status, msg.to_string()).into_response();
+    }
+    let stopped = runner::stop(&state, &req.session_id, &req.command_id).await;
+    Json(StopCommandResponse { stopped }).into_response()
+}
+
+pub async fn command_status_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CommandStatusRequest>,
+) -> impl IntoResponse {
+    let provided_key = extract_api_key(&headers).to_string();
+    let workspace = match authenticate(&state, &req.project_id, &provided_key).await {
+        Ok(w) => w,
+        Err((status, msg)) => return (status, msg.to_string()).into_response(),
     };
+    match runner::status_for(&state, &workspace, &req.session_id, &req.command_id).await {
+        Some(o) => Json(o).into_response(),
+        None => (StatusCode::NOT_FOUND, "Unknown command").into_response(),
+    }
+}
 
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-
-    let (tx, rx) = mpsc::channel::<String>(64);
-    let (stdout_done_tx, stdout_done_rx) = oneshot::channel::<()>();
-    let (stderr_done_tx, stderr_done_rx) = oneshot::channel::<()>();
-
-    let tx_stdout = tx.clone();
-    tokio::spawn(async move {
-        let mut reader = tokio::io::BufReader::new(stdout);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) => break,
-                Ok(_) => {
-                    let msg = serde_json::to_string(&Message::Stdout(line.clone())).unwrap() + "\n";
-                    let _ = tx_stdout.send(msg).await;
-                }
-                Err(_) => break,
-            }
-        }
-        let _ = stdout_done_tx.send(());
-    });
-
-    let tx_stderr = tx.clone();
-    tokio::spawn(async move {
-        let mut reader = tokio::io::BufReader::new(stderr);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) => break,
-                Ok(_) => {
-                    let msg = serde_json::to_string(&Message::Stderr(line.clone())).unwrap() + "\n";
-                    let _ = tx_stderr.send(msg).await;
-                }
-                Err(_) => break,
-            }
-        }
-        let _ = stderr_done_tx.send(());
-    });
-
-    tokio::spawn(async move {
-        // Own `child` throughout. The kernel cannot recycle the PID
-        // until `Child::wait()` returns, so `child.id()` in the
-        // client-disconnect branch is guaranteed to still reference our
-        // process group. This eliminates the PID-reuse TOCTOU that
-        // motivated issue #29.
-        let exit_code = tokio::select! {
-            res = child.wait() => {
-                match res {
-                    Ok(status) => status.code().unwrap_or(-1),
-                    Err(_) => -1,
-                }
-            }
-            // Resolves when the axum response body (and hence the mpsc
-            // Receiver held by ReceiverStream) is dropped — client
-            // disconnect or early cancel. `closed()` is cancel-safe.
-            _ = tx.closed() => {
-                if let Some(pid) = child.id()
-                    && pid > 0
-                {
-                    // Kill the whole process group (see
-                    // `.process_group(0)` on spawn) so children of
-                    // `sh` are caught too.
-                    let ret = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGTERM) };
-                    debug_assert_eq!(ret, 0, "kill({}, SIGTERM) failed: {}", pid, std::io::Error::last_os_error());
-                    // Give the process group a grace period, then escalate to SIGKILL
-                    // to handle processes that ignore SIGTERM.
-                    tokio::select! {
-                        res = child.wait() => match res {
-                            Ok(status) => status.code().unwrap_or(-1),
-                            Err(_) => -1,
-                        },
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-                            let _ = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
-                            match child.wait().await {
-                                Ok(status) => status.code().unwrap_or(-1),
-                                Err(_) => -1,
-                            }
-                        }
-                    }
-                } else {
-                    match child.wait().await {
-                        Ok(status) => status.code().unwrap_or(-1),
-                        Err(_) => -1,
-                    }
-                }
-            }
-        };
-        // Wait for both reader tasks to finish before sending Exit,
-        // ensuring Exit is always the last message in the channel.
-        let _ = stdout_done_rx.await;
-        let _ = stderr_done_rx.await;
-        let msg = serde_json::to_string(&Message::Exit(exit_code)).unwrap() + "\n";
-        // On the client-disconnect path, tx.send will Err and we move on.
-        let _ = tx.send(msg).await;
-    });
-
-    let stream = ReceiverStream::new(rx).map(|s| Ok::<_, std::convert::Infallible>(s));
-    axum::body::Body::from_stream(stream).into_response()
+pub async fn list_commands_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ListCommandsRequest2>,
+) -> impl IntoResponse {
+    let provided_key = extract_api_key(&headers).to_string();
+    let workspace = match authenticate(&state, &req.project_id, &provided_key).await {
+        Ok(w) => w,
+        Err((status, msg)) => return (status, msg.to_string()).into_response(),
+    };
+    let cmds = runner::list(&state, &workspace, req.session_id.as_deref()).await;
+    Json(ListCommandsResponse2 { commands: cmds }).into_response()
 }
 
 pub async fn notify_user_handler(
@@ -265,7 +231,7 @@ pub async fn notify_user_handler(
 pub async fn list_allowed_commands_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(req): Json<ListCommandsRequest>,
+    Json(req): Json<ListAllowedCommandsRequest>,
 ) -> impl IntoResponse {
     let provided_key = extract_api_key(&headers).to_string();
 
@@ -275,5 +241,5 @@ pub async fn list_allowed_commands_handler(
     };
 
     let cmds = commands::get_allowed_commands(&state, &workspace);
-    Json(ListCommandsResponse { commands: cmds }).into_response()
+    Json(ListAllowedCommandsResponse { commands: cmds }).into_response()
 }

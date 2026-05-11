@@ -1,11 +1,13 @@
-use ai_pod::{cli, config, container, credentials, daemons, image, runtime, server, update, workspace};
+use ai_pod::{
+    cli, commands_cli, config, container, credentials, image, runtime, server, update, workspace,
+};
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use colored::Colorize;
 use std::path::Path;
 
-use cli::{AllowedAction, Cli, Command};
+use cli::{AllowedAction, Cli, Command, CommandsAction};
 use config::AppConfig;
 use runtime::ContainerRuntime;
 
@@ -143,6 +145,53 @@ fn init_project(
     println!("{} {}", "Created:".green().bold(), dockerfile.display());
     println!("Edit this file to customise your container, then run `ai-pod` to launch.");
 
+    maybe_prompt_gitignore(workspace)?;
+
+    Ok(())
+}
+
+/// If `workspace` is a git repo and `.gitignore` doesn't yet exclude `.ai-pod`,
+/// ask the user whether to add it. Best-effort: failure to read or write the
+/// file does not abort init.
+fn clean_stale_sessions(rt: &ContainerRuntime, workspace: &Path) {
+    let prefix = workspace::container_prefix(workspace);
+    let live = match container::containers_for_prefix(rt, &prefix, true) {
+        Ok(names) => names
+            .into_iter()
+            .filter_map(|n| workspace::session_id_from_container_name(&n))
+            .collect::<Vec<_>>(),
+        Err(_) => return,
+    };
+    let _ = ai_pod::server::runner::clean_stale_sessions(workspace, &live);
+}
+
+fn maybe_prompt_gitignore(workspace: &Path) -> Result<()> {
+    if !workspace.join(".git").exists() {
+        return Ok(());
+    }
+    let gitignore = workspace.join(".gitignore");
+    let existing = std::fs::read_to_string(&gitignore).unwrap_or_default();
+    let already_ignored = existing
+        .lines()
+        .any(|l| matches!(l.trim(), ".ai-pod" | ".ai-pod/"));
+    if already_ignored {
+        return Ok(());
+    }
+    let confirm = dialoguer::Confirm::new()
+        .with_prompt("Add .ai-pod/ to .gitignore?")
+        .default(true)
+        .interact()
+        .unwrap_or(false);
+    if !confirm {
+        return Ok(());
+    }
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(".ai-pod/\n");
+    std::fs::write(&gitignore, content).context("Failed to write .gitignore")?;
+    println!("{} .ai-pod/ to {}", "Added:".green().bold(), gitignore.display());
     Ok(())
 }
 
@@ -173,8 +222,11 @@ async fn launch_flow(cli: &Cli, rt: &ContainerRuntime) -> Result<()> {
     }
 
     // 4. Ensure shared server is running (must be up before image build so the
-    //    Dockerfile can fetch host-tools from http://{gateway}:7822/host-tools)
-    server::lifecycle::ensure_shared_server(&config)?;
+    //    Dockerfile can fetch /install/{agent}.sh from http://{gateway}:7822)
+    server::lifecycle::ensure_shared_server(&config).await?;
+
+    // Prune .ai-pod/commands/ entries for sessions whose container is gone.
+    clean_stale_sessions(rt, &workspace);
 
     // 5. Build image if needed
     let image = image::image_name(&workspace);
@@ -183,7 +235,7 @@ async fn launch_flow(cli: &Cli, rt: &ContainerRuntime) -> Result<()> {
     // Bridge the gap between build completion and the first authenticated
     // request: re-arm the inactivity timer so the server doesn't shut down
     // while we set up state and launch the container.
-    server::lifecycle::bump_keep_alive();
+    server::lifecycle::bump_keep_alive().await;
 
     // 6. Check server version compatibility
     server::lifecycle::check_server_version().await?;
@@ -286,7 +338,7 @@ async fn main() -> Result<()> {
                     workspace.display()
                 );
             }
-            server::lifecycle::ensure_shared_server(&config)?;
+            server::lifecycle::ensure_shared_server(&config).await?;
             let image = image::image_name(&workspace);
             image::ensure_image(&rt, &dockerfile, &image, cli.rebuild, cli.no_cache)?;
         }
@@ -324,10 +376,10 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
             }
-            server::lifecycle::ensure_shared_server(&config)?;
+            server::lifecycle::ensure_shared_server(&config).await?;
             let image = image::image_name(&workspace);
             image::ensure_image(&rt, &dockerfile, &image, cli.rebuild, cli.no_cache)?;
-            server::lifecycle::bump_keep_alive();
+            server::lifecycle::bump_keep_alive().await;
             server::lifecycle::check_server_version().await?;
             let project_id = workspace::workspace_hash(&workspace);
             let state = server::lifecycle::get_or_create_project_state(&config, &workspace)?;
@@ -344,10 +396,30 @@ async fn main() -> Result<()> {
                 args,
             )?;
         }
-        Some(Command::Daemons) => {
+        Some(Command::Commands { action }) => {
             let config = AppConfig::new()?;
             let workspace = resolve_workspace(&cli.workdir)?;
-            daemons::run_daemons(&config, &workspace).await?;
+            match action {
+                None => commands_cli::run_tui(&config, &workspace).await?,
+                Some(CommandsAction::List { all }) => {
+                    commands_cli::run_list(&config, &workspace, *all).await?
+                }
+                Some(CommandsAction::Run { command }) => {
+                    if command.is_empty() {
+                        anyhow::bail!("ai-pod commands run <shell command>");
+                    }
+                    let cmd = command.join(" ");
+                    commands_cli::run_run(&config, &workspace, &cmd).await?;
+                }
+                Some(CommandsAction::Kill { command_id, session }) => {
+                    commands_cli::run_kill(&config, &workspace, session.as_deref(), command_id)
+                        .await?;
+                }
+                Some(CommandsAction::Logs { command_id, session }) => {
+                    commands_cli::run_logs(&config, &workspace, session.as_deref(), command_id)
+                        .await?;
+                }
+            }
         }
         None => {
             launch_flow(&cli, &rt).await?;

@@ -1,70 +1,70 @@
 ---
 name: ai-pod
-description: This skill should be used when the user asks to run a command on the host machine, open an application on the host, send a desktop notification to the user, list previously approved host commands, or manage long-running background processes (daemons) on the host. Provides the host-tools binary at /usr/local/bin/host-tools.
-version: 0.1.0
+description: Use when the user asks to run a host command, send a desktop notification, or inspect a previously started host command. Tools are exposed via the ai-pod MCP server (no in-container CLI).
+version: 0.2.0
 ---
 # Container Environment
 
-You are running inside a {{ display_name }} container. To reach services on the host machine,
-use `{{ host_gateway }}` instead of `localhost`.
+You are running inside a {{ display_name }} container. To reach services on the
+host machine, use `{{ host_gateway }}` instead of `localhost`.
 
 For example: `curl http://{{ host_gateway }}:3000`
 
 Working directory: /app
 
-# host-tools — Host Interaction
+# Host interaction (MCP tools)
 
-`/usr/local/bin/host-tools` interacts with the host machine from inside this container.
+The `ai-pod` MCP server exposes the following tools. Use them via your MCP
+tool-calling interface — there is no `host-tools` binary.
 
-## run-command
+## run_command
 
-Run a shell command on the host. The host user is prompted to approve commands not previously allowed. Output streams back in real time.
+Run a shell command on the host. The host user is asked to approve commands
+not previously allowed.
 
-    host-tools run-command <shell command and args>
+- The call returns within ~5 seconds.
+- If the command finished in time, you get `status: "finished"`, the exit
+  code, and the last 10 lines of stdout/stderr.
+- If it is still running, you get `status: "running"` and a `command_id`.
 
-Examples:
-- `host-tools run-command pnpm tsc`
-- `host-tools run-command podman compose up -d`
-- `host-tools run-command cargo build`
+All output is always written to:
 
-DO NOT start commands with `cd /some/path && ...`. The working directory is already set to the project workspace. Commands starting with `cd /` are rejected by the server.
+    /app/.ai-pod/commands/{session_id}/{command_id}/
+        stdout
+        stderr
+        exit       (written when the command finishes; "killed" if stopped)
+        command    (the original shell string)
 
-YOU MUST NOT TRIM OUTPUT ON THE HOST.
-do not use `host-tools run-command 'command | head -n 10'` to trim output.
-ALWAYS use head or tail in the container instead: `host-tools run-command 'command' | head -n 10`
-Keep the commands you run on the host as simple as possible.
-host-tools run-command forwards all output (stdout and stderr).
+You can read those files directly with the Read tool — that is the canonical
+way to inspect long-running output.
 
-List previously approved commands:
+DO NOT start commands with `cd /...`. The working directory is already set to
+the workspace.
 
-    host-tools run-command --list
+DO NOT pipe to `| head` or `| tail` on the host. Read the stdout file inside
+the container and trim with `head`/`tail` there.
 
-If a command is in the list, always run it on the host.
-If a command is not in the list, prefer to run it inside the container.
+## command_status
 
-For long-running commands prefer the daemon-subcommands.
+Given a `command_id`, returns running / finished / killed plus the latest
+stdout/stderr tails. Equivalent to checking whether the `exit` file exists.
 
-## notify-user
+## stop_command
 
-Send a desktop notification to the host user. The notification title is set automatically to the project name.
+Sends SIGTERM (then SIGKILL after 5s) to a running command.
 
-    host-tools notify-user "<message>"
+## list_commands
 
-Example: `host-tools notify-user "Build finished successfully"`
+Lists commands for this session by default; pass `scope: "workspace"` to see
+all sessions for the workspace.
 
-A Stop hook already calls this automatically when the session ends.
+## notify_user
 
-## daemon
+Sends a desktop notification to the host user. A Stop hook already calls this
+automatically when the session ends.
 
-Use this if you need to run a dev server or need to run long-running tests. Pipe `host-tools daemon output <daemon-id>` into `grep`, `head`, `tail` etc to evaluate output.
+## list_allowed_commands
 
-Manage long-running background processes on the host.
-
-    host-tools daemon start <shell command>   # returns daemon ID
-    host-tools daemon list                    # show all daemons for this project
-    host-tools daemon output <daemon-id>      # print log and exit
-    host-tools daemon status <daemon-id>      # running/finished, exit code
-    host-tools daemon stop <daemon-id>
-    host-tools daemon stop-all
-
-The same rules apply to daemon commands as to regular run-commands.
+Lists the host commands the user has previously approved for this workspace.
+If a command is in this list, prefer running it on the host. Otherwise prefer
+running inside the container.
