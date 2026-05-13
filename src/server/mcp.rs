@@ -20,6 +20,7 @@ use super::AppState;
 use super::commands;
 use super::notify;
 use super::runner;
+use crate::runtime::ContainerRuntime;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -63,11 +64,15 @@ fn tool_error(text: String) -> Value {
     })
 }
 
-fn tools_definition() -> Value {
+fn tools_definition(runtime: &ContainerRuntime) -> Value {
+    let run_command_description = format!(
+        "Run a shell command on the host (outside this container). From inside the container, reach host services via `{}` instead of `localhost`. Waits up to 5 seconds; returns the result inline if finished, otherwise returns a command_id for polling. Output is always written to {{workspace}}/.ai-pod/commands/{{session_id}}/{{command_id}}/{{stdout,stderr,exit}}, read directly from there. Do not start commands with `cd /`. Do not pipe to `| head`/`| tail` on the host — trim output in the container instead. Keep commands as simple as possible.",
+        runtime.host_gateway(),
+    );
     json!([
         {
             "name": "run_command",
-            "description": "Run a shell command on the host. Waits up to 5 seconds; returns the result inline if finished, otherwise returns a command_id for polling. Output is always written to {workspace}/.ai-pod/commands/{session_id}/{command_id}/{stdout,stderr,exit}, which the agent can read directly. Do not start commands with `cd /`. Do not pipe to `| head`/`| tail` on the host — trim output in the container instead.",
+            "description": run_command_description,
             "inputSchema": {
                 "type": "object",
                 "properties": { "command": { "type": "string" } },
@@ -147,7 +152,7 @@ pub async fn mcp_handler(
         "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
         "tools/list" => Json(rpc_result(
             id,
-            json!({ "tools": tools_definition() }),
+            json!({ "tools": tools_definition(&state.runtime) }),
         ))
         .into_response(),
         "tools/call" => {
@@ -168,8 +173,7 @@ pub async fn mcp_handler(
                     }
                 }
             };
-            let session_id = extract_session_id(&headers)
-                .unwrap_or_else(|| "host".to_string());
+            let session_id = extract_session_id(&headers).unwrap_or_else(|| "host".to_string());
 
             let result = handle_tool_call(&state, &workspace, &session_id, &params).await;
             Json(rpc_result(id, result)).into_response()
@@ -197,10 +201,18 @@ async fn resolve_project_id(state: &AppState, api_key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::RuntimeKind;
+
+    fn test_runtime(kind: RuntimeKind) -> ContainerRuntime {
+        ContainerRuntime {
+            kind,
+            dry_run: false,
+        }
+    }
 
     #[test]
     fn tools_definition_lists_all_expected_tools() {
-        let v = tools_definition();
+        let v = tools_definition(&test_runtime(RuntimeKind::Podman));
         let names: Vec<&str> = v
             .as_array()
             .unwrap()
@@ -213,6 +225,22 @@ mod tests {
         assert!(names.contains(&"list_commands"));
         assert!(names.contains(&"notify_user"));
         assert!(names.contains(&"list_allowed_commands"));
+    }
+
+    #[test]
+    fn run_command_description_includes_podman_host_gateway() {
+        let v = tools_definition(&test_runtime(RuntimeKind::Podman));
+        let desc = v[0]["description"].as_str().unwrap();
+        assert!(desc.contains("Podman"));
+        assert!(desc.contains("host.containers.internal"));
+    }
+
+    #[test]
+    fn run_command_description_includes_docker_host_gateway() {
+        let v = tools_definition(&test_runtime(RuntimeKind::Docker));
+        let desc = v[0]["description"].as_str().unwrap();
+        assert!(desc.contains("Docker"));
+        assert!(desc.contains("host.docker.internal"));
     }
 }
 
@@ -280,8 +308,15 @@ async fn handle_tool_call(
             tool_text(format!("stopped: {stopped}"))
         }
         "list_commands" => {
-            let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("session");
-            let sid = if scope == "workspace" { None } else { Some(session_id) };
+            let scope = args
+                .get("scope")
+                .and_then(|v| v.as_str())
+                .unwrap_or("session");
+            let sid = if scope == "workspace" {
+                None
+            } else {
+                Some(session_id)
+            };
             let list = runner::list(state, workspace, sid).await;
             json!({
                 "content": [{

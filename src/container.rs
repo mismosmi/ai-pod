@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use askama::Template;
 use colored::Colorize;
 use dialoguer;
 use std::path::Path;
@@ -10,13 +9,6 @@ use crate::runtime::ContainerRuntime;
 use crate::workspace::{
     container_name_for, container_prefix, new_session_id, volume_name as gen_volume_name,
 };
-
-#[derive(Template)]
-#[template(path = "skill.md")]
-struct AiPodSkill<'a> {
-    display_name: &'a str,
-    host_gateway: &'a str,
-}
 
 /// Home directory of the `ai-pod` user inside every container image.
 /// The Dockerfile template creates this user with this home path, so the
@@ -259,10 +251,7 @@ fn seed_home_volume(
             "mkdir",
             "-p",
             &format!("{}/.claude", CONTAINER_HOME),
-            &format!("{}/.claude/skills/ai-pod", CONTAINER_HOME),
             &format!("{}/.config", CONTAINER_HOME),
-            &format!("{}/.config/opencode/skills/ai-pod", CONTAINER_HOME),
-            &format!("{}/.config/opencode/plugins", CONTAINER_HOME),
             &format!("{}/.config/opencode/plugins", CONTAINER_HOME),
         ])
         .status();
@@ -290,40 +279,6 @@ fn seed_home_volume(
             ])
             .status();
     }
-
-    let skill = AiPodSkill {
-        display_name: rt.display_name(),
-        host_gateway: rt.host_gateway(),
-    };
-    let skill_md = skill
-        .render()
-        .expect("failed to render ai-pod skill template");
-    let skill_path = config.config_dir.join("skill.md");
-    std::fs::write(&skill_path, skill_md)?;
-
-    let _ = rt
-        .command()
-        .args([
-            "cp",
-            skill_path.to_str().unwrap(),
-            &format!(
-                "{}:{}/.claude/skills/ai-pod/SKILL.md",
-                init_container, CONTAINER_HOME
-            ),
-        ])
-        .status();
-
-    let _ = rt
-        .command()
-        .args([
-            "cp",
-            skill_path.to_str().unwrap(),
-            &format!(
-                "{}:{}/.config/opencode/skills/ai-pod/SKILL.md",
-                init_container, CONTAINER_HOME
-            ),
-        ])
-        .status();
 
     let opencode_plugin = config.config_dir.join("opencode-plugin.js");
     if opencode_plugin.exists() {
@@ -808,17 +763,9 @@ pub fn clean_container(rt: &ContainerRuntime, workspace: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::RuntimeKind;
     use crate::workspace::{container_prefix, new_container_name, volume_name};
     use std::path::Path;
     use tempfile::TempDir;
-
-    fn test_runtime() -> ContainerRuntime {
-        ContainerRuntime {
-            kind: RuntimeKind::Podman,
-            dry_run: false,
-        }
-    }
 
     fn make_test_config(dir: &TempDir) -> AppConfig {
         let home = dir.path().to_path_buf();
@@ -948,35 +895,6 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(json["theme"], "dark");
         assert_eq!(json["verbosity"], "verbose");
-    }
-
-    #[test]
-    fn rendered_skill_contains_container_preamble_for_podman() {
-        let rt = test_runtime();
-        let skill = AiPodSkill {
-            display_name: rt.display_name(),
-            host_gateway: rt.host_gateway(),
-        };
-        let rendered = skill.render().unwrap();
-        assert!(rendered.contains("host.containers.internal"));
-        assert!(rendered.contains("Podman container"));
-        assert!(rendered.contains("MCP"));
-    }
-
-    #[test]
-    fn rendered_skill_contains_container_preamble_for_docker() {
-        let rt = ContainerRuntime {
-            kind: RuntimeKind::Docker,
-            dry_run: false,
-        };
-        let skill = AiPodSkill {
-            display_name: rt.display_name(),
-            host_gateway: rt.host_gateway(),
-        };
-        let rendered = skill.render().unwrap();
-        assert!(rendered.contains("host.docker.internal"));
-        assert!(rendered.contains("Docker container"));
-        assert!(rendered.contains("MCP"));
     }
 
     #[test]
