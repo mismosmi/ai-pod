@@ -19,7 +19,7 @@ fn make_state(config_dir: &std::path::Path) -> AppState {
         projects: Arc::new(Mutex::new(HashMap::new())),
         config_dir: config_dir.to_path_buf(),
         approval_lock: Arc::new(Mutex::new(())),
-        daemons: Arc::new(Mutex::new(HashMap::new())),
+        commands: Arc::new(Mutex::new(HashMap::new())),
         runtime: ContainerRuntime {
             kind: RuntimeKind::Podman,
             dry_run: false,

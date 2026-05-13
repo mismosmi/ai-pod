@@ -29,13 +29,10 @@ tempfile = "3"
 tokio-stream = "0.1"
 futures-util = "0.3"
 subtle = "2"
-askama = "0.16"
 regex = "1"
 tower_governor = "0.8"
-
-[[bin]]
-name = "host-tools"
-path = "src/bin/host_tools.rs"
+ratatui = "0.29"
+crossterm = "0.28"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

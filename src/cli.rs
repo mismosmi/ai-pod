@@ -89,17 +89,49 @@ pub enum Command {
         args: Vec<String>,
     },
 
-    /// View and inspect running daemons for this workspace
-    Daemons,
+    /// View and manage host commands for the current workspace
+    Commands {
+        #[command(subcommand)]
+        action: Option<CommandsAction>,
+    },
 
-    /// Manage the whitelist of always-allowed commands for a workspace
+    /// Manage the whitelist of always-allowed commands for a workspace.
+    /// Run with no subcommand to open an interactive TUI.
     Allowed {
         #[command(subcommand)]
-        action: AllowedAction,
+        action: Option<AllowedAction>,
     },
 
     /// Update ai-pod to the latest release
     Update,
+}
+
+#[derive(Subcommand)]
+pub enum CommandsAction {
+    /// Plain list (one row per command)
+    List {
+        /// Show commands across all sessions for this workspace.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Run a host command (same approval flow as MCP `run_command`)
+    Run {
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+    /// Stop a running command
+    Kill {
+        command_id: String,
+        /// Session id (optional; resolved from list if omitted)
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Print stdout/stderr/exit for a command
+    Logs {
+        command_id: String,
+        #[arg(long)]
+        session: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]

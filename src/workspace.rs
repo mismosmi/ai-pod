@@ -12,10 +12,30 @@ pub fn container_prefix(workspace: &Path) -> String {
     format!("ai-pod-{}", workspace_hash(workspace))
 }
 
+/// Generate a fresh 8-char session id (the suffix of a new container name).
+pub fn new_session_id() -> String {
+    uuid::Uuid::new_v4().to_string().replace("-", "")[..8].to_string()
+}
+
+/// Compose a container name from the workspace prefix and a session id.
+pub fn container_name_for(workspace: &Path, session_id: &str) -> String {
+    format!("{}-{}", container_prefix(workspace), session_id)
+}
+
 /// Unique container name for a new session.
 pub fn new_container_name(workspace: &Path) -> String {
-    let suffix = &uuid::Uuid::new_v4().to_string().replace("-", "")[..8];
-    format!("{}-{}", container_prefix(workspace), suffix)
+    container_name_for(workspace, &new_session_id())
+}
+
+/// Extract the trailing session id from a container name, if it matches the
+/// `ai-pod-{hash}-{session}` pattern.
+pub fn session_id_from_container_name(name: &str) -> Option<String> {
+    let suffix = name.rsplit_once('-')?.1;
+    if suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(suffix.to_string())
+    } else {
+        None
+    }
 }
 
 pub fn volume_name(workspace: &Path) -> String {

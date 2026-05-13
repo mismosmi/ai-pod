@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use askama::Template;
 use colored::Colorize;
 use dialoguer;
 use std::path::Path;
@@ -7,14 +6,9 @@ use std::process::Stdio;
 
 use crate::config::AppConfig;
 use crate::runtime::ContainerRuntime;
-use crate::workspace::{container_prefix, new_container_name, volume_name as gen_volume_name};
-
-#[derive(Template)]
-#[template(path = "skill.md")]
-struct AiPodSkill<'a> {
-    display_name: &'a str,
-    host_gateway: &'a str,
-}
+use crate::workspace::{
+    container_name_for, container_prefix, new_session_id, volume_name as gen_volume_name,
+};
 
 /// Home directory of the `ai-pod` user inside every container image.
 /// The Dockerfile template creates this user with this home path, so the
@@ -69,11 +63,18 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
         serde_json::json!({})
     };
 
+    let notify_curl = |msg: &str| {
+        format!(
+            "curl -fsS -X POST -H \"X-Api-Key: $AI_POD_API_KEY\" -H 'Content-Type: application/json' -d '{{\"project_id\":\"'\"$AI_POD_PROJECT_ID\"'\",\"message\":\"{}\"}}' \"$AI_POD_SERVER_URL/notify_user\" >/dev/null || true",
+            msg
+        )
+    };
+
     let stop_hook = serde_json::json!([{
         "matcher": "*",
         "hooks": [{
             "type": "command",
-            "command": "/usr/local/bin/host-tools daemon stop-all || true; /usr/local/bin/host-tools notify-user \"Task completed\" || true"
+            "command": notify_curl("Task completed"),
         }]
     }]);
 
@@ -81,7 +82,7 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
         "matcher": "*",
         "hooks": [{
             "type": "command",
-            "command": "/usr/local/bin/host-tools notify-user \"Claude needs your approval\" || true"
+            "command": notify_curl("Claude needs your approval"),
         }]
     }]);
 
@@ -110,6 +111,42 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
     std::fs::write(&config.runtime_settings, output).context("Failed to write runtime settings")?;
 
     Ok(())
+}
+
+/// MCP server entry consumed by Claude Code. Lives under `mcpServers.ai-pod`
+/// inside `~/.claude.json`. We bake the api key and session id in as literals
+/// (rather than `${VAR}` placeholders) because `claude doctor` eagerly
+/// validates referenced env vars and warns if any context can't see them.
+fn claude_mcp_entry(server_url: &str, api_key: &str, session_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "http",
+        "url": format!("{}/mcp", server_url),
+        "headers": {
+            "X-Api-Key": api_key,
+            "X-Ai-Pod-Session-Id": session_id,
+        }
+    })
+}
+
+/// Full inline config injected into OpenCode via the `OPENCODE_CONFIG_CONTENT`
+/// env var. Since the env var is set per-launch, we can bake the literal
+/// values in directly — no interpolation needed.
+fn opencode_config_content(server_url: &str, api_key: &str, session_id: &str) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "$schema": "https://opencode.ai/config.json",
+        "mcp": {
+            "ai-pod": {
+                "type": "remote",
+                "url": format!("{}/mcp", server_url),
+                "enabled": true,
+                "headers": {
+                    "X-Api-Key": api_key,
+                    "X-Ai-Pod-Session-Id": session_id,
+                }
+            }
+        }
+    }))
+    .expect("serialize opencode config content")
 }
 
 fn read_git_global(key: &str) -> Option<String> {
@@ -160,6 +197,9 @@ fn write_gitconfig_to_volume(
 /// Populate a home volume via a temporary stopped container.
 /// Handles directory creation, runtime config, skill file, opencode config, and git identity.
 /// Set `copy_claude_json` to copy `~/.claude.json` (first-time init only; skipped on reseed).
+///
+/// Note: the `mcpServers.ai-pod` entry is *not* written here — `refresh_claude_mcp_in_volume`
+/// handles that on every launch with the current session id baked in.
 fn seed_home_volume(
     rt: &ContainerRuntime,
     config: &AppConfig,
@@ -187,13 +227,13 @@ fn seed_home_volume(
     }
 
     if copy_claude_json {
-        let claude_json = config.home_dir.join(".claude.json");
-        if claude_json.exists() {
+        let host_claude_json = config.home_dir.join(".claude.json");
+        if host_claude_json.exists() {
             let _ = rt
                 .command()
                 .args([
                     "cp",
-                    &claude_json.to_string_lossy(),
+                    &host_claude_json.to_string_lossy(),
                     &format!("{}:{}/", init_container, CONTAINER_HOME),
                 ])
                 .status();
@@ -211,10 +251,7 @@ fn seed_home_volume(
             "mkdir",
             "-p",
             &format!("{}/.claude", CONTAINER_HOME),
-            &format!("{}/.claude/skills/ai-pod", CONTAINER_HOME),
             &format!("{}/.config", CONTAINER_HOME),
-            &format!("{}/.config/opencode/skills/ai-pod", CONTAINER_HOME),
-            &format!("{}/.config/opencode/plugins", CONTAINER_HOME),
             &format!("{}/.config/opencode/plugins", CONTAINER_HOME),
         ])
         .status();
@@ -243,40 +280,6 @@ fn seed_home_volume(
             .status();
     }
 
-    let skill = AiPodSkill {
-        display_name: rt.display_name(),
-        host_gateway: rt.host_gateway(),
-    };
-    let skill_md = skill
-        .render()
-        .expect("failed to render ai-pod skill template");
-    let skill_path = config.config_dir.join("skill.md");
-    std::fs::write(&skill_path, skill_md)?;
-
-    let _ = rt
-        .command()
-        .args([
-            "cp",
-            skill_path.to_str().unwrap(),
-            &format!(
-                "{}:{}/.claude/skills/ai-pod/SKILL.md",
-                init_container, CONTAINER_HOME
-            ),
-        ])
-        .status();
-
-    let _ = rt
-        .command()
-        .args([
-            "cp",
-            skill_path.to_str().unwrap(),
-            &format!(
-                "{}:{}/.config/opencode/skills/ai-pod/SKILL.md",
-                init_container, CONTAINER_HOME
-            ),
-        ])
-        .status();
-
     let opencode_plugin = config.config_dir.join("opencode-plugin.js");
     if opencode_plugin.exists() {
         let _ = rt
@@ -296,6 +299,84 @@ fn seed_home_volume(
 
     let _ = rt.command().args(["rm", &init_container]).status();
 
+    Ok(())
+}
+
+/// Update the `mcpServers.ai-pod` entry in the volume's `~/.claude.json`
+/// with literal api_key + session_id values. Runs on every launch so the
+/// in-volume config matches the env the agent will see.
+fn refresh_claude_mcp_in_volume(
+    rt: &ContainerRuntime,
+    config: &AppConfig,
+    volume_name: &str,
+    container_name: &str,
+    image: &str,
+    server_url: &str,
+    api_key: &str,
+    session_id: &str,
+) -> Result<()> {
+    let init_container = format!("{}-mcp", container_name);
+    let status = rt
+        .command()
+        .args([
+            "create",
+            "--name",
+            &init_container,
+            "-v",
+            &format!("{}:{}", volume_name, CONTAINER_HOME),
+            image,
+            "true",
+        ])
+        .status()
+        .context("Failed to create mcp-refresh container")?;
+    if !status.success() {
+        anyhow::bail!("Failed to create mcp-refresh container");
+    }
+
+    // Pull the existing .claude.json out of the volume (may not exist yet).
+    let tmp_in = config.config_dir.join("claude-in.json");
+    let _ = std::fs::remove_file(&tmp_in);
+    let _ = rt
+        .command()
+        .args([
+            "cp",
+            &format!("{}:{}/.claude.json", init_container, CONTAINER_HOME),
+            tmp_in.to_str().unwrap(),
+        ])
+        .status();
+
+    let mut value: serde_json::Value = std::fs::read_to_string(&tmp_in)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let obj = value
+        .as_object_mut()
+        .expect("claude.json root must be an object");
+    let servers = obj
+        .entry("mcpServers".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    servers
+        .as_object_mut()
+        .expect("mcpServers must be an object")
+        .insert(
+            "ai-pod".to_string(),
+            claude_mcp_entry(server_url, api_key, session_id),
+        );
+
+    let tmp_out = config.config_dir.join("claude-out.json");
+    std::fs::write(&tmp_out, serde_json::to_string_pretty(&value)?)?;
+    let _ = rt
+        .command()
+        .args([
+            "cp",
+            tmp_out.to_str().unwrap(),
+            &format!("{}:{}/.claude.json", init_container, CONTAINER_HOME),
+        ])
+        .status();
+
+    let _ = rt.command().args(["rm", &init_container]).status();
+    let _ = std::fs::remove_file(&tmp_in);
+    let _ = std::fs::remove_file(&tmp_out);
     Ok(())
 }
 
@@ -408,12 +489,28 @@ pub fn launch_container(
         )?;
     }
 
-    let container_name = new_container_name(workspace);
+    let session_id = new_session_id();
+    let container_name = container_name_for(workspace, &session_id);
     println!("{} {}", "Starting container:".blue().bold(), container_name);
+
+    refresh_claude_mcp_in_volume(
+        rt,
+        config,
+        &volume_name,
+        &prefix,
+        image,
+        &rt.server_url(),
+        api_key,
+        &session_id,
+    )?;
 
     let add_host = rt.add_host_arg();
     let host_gw_env = format!("HOST_GATEWAY={}", rt.host_gateway());
     let server_url_env = format!("AI_POD_SERVER_URL={}", rt.server_url());
+    let opencode_config_env = format!(
+        "OPENCODE_CONFIG_CONTENT={}",
+        opencode_config_content(&rt.server_url(), api_key, &session_id)
+    );
 
     let mut run_cmd = rt.command();
     run_cmd.args(["run", "--rm", "-it"]);
@@ -434,7 +531,11 @@ pub fn launch_container(
         "-e",
         &format!("AI_POD_API_KEY={}", api_key),
         "-e",
+        &format!("AI_POD_SESSION_ID={}", session_id),
+        "-e",
         &server_url_env,
+        "-e",
+        &opencode_config_env,
     ]);
     run_cmd.arg(image);
     run_cmd
@@ -457,7 +558,8 @@ pub fn run_in_container(
     command: &str,
     args: &[String],
 ) -> Result<()> {
-    let container_name = new_container_name(workspace);
+    let session_id = new_session_id();
+    let container_name = container_name_for(workspace, &session_id);
     let volume_name = gen_volume_name(workspace);
     let workspace_str = workspace.to_string_lossy();
 
@@ -473,6 +575,17 @@ pub fn run_in_container(
             api_key,
         )?;
     }
+
+    refresh_claude_mcp_in_volume(
+        rt,
+        config,
+        &volume_name,
+        &container_name,
+        image,
+        &rt.server_url(),
+        api_key,
+        &session_id,
+    )?;
 
     println!(
         "{} {} {}",
@@ -501,7 +614,14 @@ pub fn run_in_container(
         "-e".into(),
         format!("AI_POD_API_KEY={}", api_key),
         "-e".into(),
+        format!("AI_POD_SESSION_ID={}", session_id),
+        "-e".into(),
         format!("AI_POD_SERVER_URL={}", rt.server_url()),
+        "-e".into(),
+        format!(
+            "OPENCODE_CONFIG_CONTENT={}",
+            opencode_config_content(&rt.server_url(), api_key, &session_id)
+        ),
         "--entrypoint".into(),
         command.to_string(),
         image.to_string(),
@@ -643,17 +763,9 @@ pub fn clean_container(rt: &ContainerRuntime, workspace: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::RuntimeKind;
     use crate::workspace::{container_prefix, new_container_name, volume_name};
     use std::path::Path;
     use tempfile::TempDir;
-
-    fn test_runtime() -> ContainerRuntime {
-        ContainerRuntime {
-            kind: RuntimeKind::Podman,
-            dry_run: false,
-        }
-    }
 
     fn make_test_config(dir: &TempDir) -> AppConfig {
         let home = dir.path().to_path_buf();
@@ -723,12 +835,12 @@ mod tests {
         let stop = &json["hooks"]["Stop"];
         assert!(stop.is_array(), "hooks.Stop should be an array");
         let cmd = stop[0]["hooks"][0]["command"].as_str().unwrap();
-        assert!(cmd.contains("host-tools"));
-        assert!(cmd.contains("notify-user"));
+        assert!(cmd.contains("notify_user"));
+        assert!(cmd.contains("$AI_POD_SERVER_URL"));
     }
 
     #[test]
-    fn runtime_settings_stop_hook_calls_host_tools() {
+    fn runtime_settings_stop_hook_uses_curl() {
         let dir = TempDir::new().unwrap();
         let config = make_test_config(&dir);
         generate_runtime_settings(&config).unwrap();
@@ -738,7 +850,7 @@ mod tests {
         let cmd = json["hooks"]["Stop"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap();
-        assert!(cmd.contains("host-tools"));
+        assert!(cmd.starts_with("curl"));
     }
 
     #[test]
@@ -786,31 +898,25 @@ mod tests {
     }
 
     #[test]
-    fn rendered_skill_contains_container_preamble_for_podman() {
-        let rt = test_runtime();
-        let skill = AiPodSkill {
-            display_name: rt.display_name(),
-            host_gateway: rt.host_gateway(),
-        };
-        let rendered = skill.render().unwrap();
-        assert!(rendered.contains("host.containers.internal"));
-        assert!(rendered.contains("Podman container"));
-        assert!(rendered.contains("/usr/local/bin/host-tools"));
+    fn claude_mcp_entry_bakes_literal_values() {
+        let entry = claude_mcp_entry("http://host.containers.internal:7822", "k1", "s2");
+        assert_eq!(entry["type"], "http");
+        assert_eq!(entry["url"], "http://host.containers.internal:7822/mcp");
+        assert_eq!(entry["headers"]["X-Api-Key"], "k1");
+        assert_eq!(entry["headers"]["X-Ai-Pod-Session-Id"], "s2");
     }
 
     #[test]
-    fn rendered_skill_contains_container_preamble_for_docker() {
-        let rt = ContainerRuntime {
-            kind: RuntimeKind::Docker,
-            dry_run: false,
-        };
-        let skill = AiPodSkill {
-            display_name: rt.display_name(),
-            host_gateway: rt.host_gateway(),
-        };
-        let rendered = skill.render().unwrap();
-        assert!(rendered.contains("host.docker.internal"));
-        assert!(rendered.contains("Docker container"));
-        assert!(rendered.contains("/usr/local/bin/host-tools"));
+    fn opencode_config_content_bakes_literal_values() {
+        let s = opencode_config_content("http://host.containers.internal:7822", "k1", "s2");
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["mcp"]["ai-pod"]["type"], "remote");
+        assert_eq!(
+            v["mcp"]["ai-pod"]["url"],
+            "http://host.containers.internal:7822/mcp"
+        );
+        assert_eq!(v["mcp"]["ai-pod"]["enabled"], true);
+        assert_eq!(v["mcp"]["ai-pod"]["headers"]["X-Api-Key"], "k1");
+        assert_eq!(v["mcp"]["ai-pod"]["headers"]["X-Ai-Pod-Session-Id"], "s2");
     }
 }

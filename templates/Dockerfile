@@ -3,11 +3,8 @@ FROM {{BASE_IMAGE}}
 {{INSTALL_PACKAGES}}
 {{EXTRA_COMMANDS}}
 ARG HOST_GATEWAY
-RUN curl -fsSL "http://${HOST_GATEWAY}:7822/host-tools" \
-      -o /usr/local/bin/host-tools && chmod +x /usr/local/bin/host-tools
-
 ARG AI_POD_VERSION
-RUN host-tools install {{AGENT}}
+RUN curl -fsSL "http://${HOST_GATEWAY}:7822/install/{{AGENT}}.sh" | bash
 
 WORKDIR /app
 
