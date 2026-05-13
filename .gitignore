@@ -1,1 +1,4 @@
 /target
+.ai-pod/commands
+
+.claude/*.lock

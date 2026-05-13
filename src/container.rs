@@ -121,22 +121,40 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
-/// Render the MCP client config that points the in-container agent at the
-/// shared host server. Env-var interpolation in the headers means the same
-/// config works for every container session.
-fn mcp_config_json(server_url: &str) -> serde_json::Value {
+/// MCP server entry consumed by Claude Code. Lives under `mcpServers.ai-pod`
+/// inside `~/.claude.json`. We bake the api key and session id in as literals
+/// (rather than `${VAR}` placeholders) because `claude doctor` eagerly
+/// validates referenced env vars and warns if any context can't see them.
+fn claude_mcp_entry(server_url: &str, api_key: &str, session_id: &str) -> serde_json::Value {
     serde_json::json!({
-        "mcpServers": {
+        "type": "http",
+        "url": format!("{}/mcp", server_url),
+        "headers": {
+            "X-Api-Key": api_key,
+            "X-Ai-Pod-Session-Id": session_id,
+        }
+    })
+}
+
+/// Full inline config injected into OpenCode via the `OPENCODE_CONFIG_CONTENT`
+/// env var. Since the env var is set per-launch, we can bake the literal
+/// values in directly — no interpolation needed.
+fn opencode_config_content(server_url: &str, api_key: &str, session_id: &str) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "$schema": "https://opencode.ai/config.json",
+        "mcp": {
             "ai-pod": {
-                "type": "http",
+                "type": "remote",
                 "url": format!("{}/mcp", server_url),
+                "enabled": true,
                 "headers": {
-                    "X-Api-Key": "${AI_POD_API_KEY}",
-                    "X-Ai-Pod-Session-Id": "${AI_POD_SESSION_ID}"
+                    "X-Api-Key": api_key,
+                    "X-Ai-Pod-Session-Id": session_id,
                 }
             }
         }
-    })
+    }))
+    .expect("serialize opencode config content")
 }
 
 fn read_git_global(key: &str) -> Option<String> {
@@ -187,6 +205,9 @@ fn write_gitconfig_to_volume(
 /// Populate a home volume via a temporary stopped container.
 /// Handles directory creation, runtime config, skill file, opencode config, and git identity.
 /// Set `copy_claude_json` to copy `~/.claude.json` (first-time init only; skipped on reseed).
+///
+/// Note: the `mcpServers.ai-pod` entry is *not* written here — `refresh_claude_mcp_in_volume`
+/// handles that on every launch with the current session id baked in.
 fn seed_home_volume(
     rt: &ContainerRuntime,
     config: &AppConfig,
@@ -195,7 +216,6 @@ fn seed_home_volume(
     image: &str,
     copy_claude_json: bool,
 ) -> Result<()> {
-    let server_url = rt.server_url();
     let init_container = format!("{}-init", container_name);
     let status = rt
         .command()
@@ -215,13 +235,13 @@ fn seed_home_volume(
     }
 
     if copy_claude_json {
-        let claude_json = config.home_dir.join(".claude.json");
-        if claude_json.exists() {
+        let host_claude_json = config.home_dir.join(".claude.json");
+        if host_claude_json.exists() {
             let _ = rt
                 .command()
                 .args([
                     "cp",
-                    &claude_json.to_string_lossy(),
+                    &host_claude_json.to_string_lossy(),
                     &format!("{}:{}/", init_container, CONTAINER_HOME),
                 ])
                 .status();
@@ -320,24 +340,88 @@ fn seed_home_volume(
             .status();
     }
 
-    // MCP client config — copied into both Claude Code and OpenCode config
-    // locations so either agent can talk to the host MCP server.
-    let mcp_path = config.config_dir.join("ai-pod-mcp.json");
-    std::fs::write(&mcp_path, serde_json::to_string_pretty(&mcp_config_json(&server_url))?)?;
-
-    let _ = rt
-        .command()
-        .args([
-            "cp",
-            mcp_path.to_str().unwrap(),
-            &format!("{}:{}/.mcp.json", init_container, CONTAINER_HOME),
-        ])
-        .status();
-
     write_gitconfig_to_volume(rt, config, &init_container)?;
 
     let _ = rt.command().args(["rm", &init_container]).status();
 
+    Ok(())
+}
+
+/// Update the `mcpServers.ai-pod` entry in the volume's `~/.claude.json`
+/// with literal api_key + session_id values. Runs on every launch so the
+/// in-volume config matches the env the agent will see.
+fn refresh_claude_mcp_in_volume(
+    rt: &ContainerRuntime,
+    config: &AppConfig,
+    volume_name: &str,
+    container_name: &str,
+    image: &str,
+    server_url: &str,
+    api_key: &str,
+    session_id: &str,
+) -> Result<()> {
+    let init_container = format!("{}-mcp", container_name);
+    let status = rt
+        .command()
+        .args([
+            "create",
+            "--name",
+            &init_container,
+            "-v",
+            &format!("{}:{}", volume_name, CONTAINER_HOME),
+            image,
+            "true",
+        ])
+        .status()
+        .context("Failed to create mcp-refresh container")?;
+    if !status.success() {
+        anyhow::bail!("Failed to create mcp-refresh container");
+    }
+
+    // Pull the existing .claude.json out of the volume (may not exist yet).
+    let tmp_in = config.config_dir.join("claude-in.json");
+    let _ = std::fs::remove_file(&tmp_in);
+    let _ = rt
+        .command()
+        .args([
+            "cp",
+            &format!("{}:{}/.claude.json", init_container, CONTAINER_HOME),
+            tmp_in.to_str().unwrap(),
+        ])
+        .status();
+
+    let mut value: serde_json::Value = std::fs::read_to_string(&tmp_in)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let obj = value
+        .as_object_mut()
+        .expect("claude.json root must be an object");
+    let servers = obj
+        .entry("mcpServers".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    servers
+        .as_object_mut()
+        .expect("mcpServers must be an object")
+        .insert(
+            "ai-pod".to_string(),
+            claude_mcp_entry(server_url, api_key, session_id),
+        );
+
+    let tmp_out = config.config_dir.join("claude-out.json");
+    std::fs::write(&tmp_out, serde_json::to_string_pretty(&value)?)?;
+    let _ = rt
+        .command()
+        .args([
+            "cp",
+            tmp_out.to_str().unwrap(),
+            &format!("{}:{}/.claude.json", init_container, CONTAINER_HOME),
+        ])
+        .status();
+
+    let _ = rt.command().args(["rm", &init_container]).status();
+    let _ = std::fs::remove_file(&tmp_in);
+    let _ = std::fs::remove_file(&tmp_out);
     Ok(())
 }
 
@@ -454,9 +538,24 @@ pub fn launch_container(
     let container_name = container_name_for(workspace, &session_id);
     println!("{} {}", "Starting container:".blue().bold(), container_name);
 
+    refresh_claude_mcp_in_volume(
+        rt,
+        config,
+        &volume_name,
+        &prefix,
+        image,
+        &rt.server_url(),
+        api_key,
+        &session_id,
+    )?;
+
     let add_host = rt.add_host_arg();
     let host_gw_env = format!("HOST_GATEWAY={}", rt.host_gateway());
     let server_url_env = format!("AI_POD_SERVER_URL={}", rt.server_url());
+    let opencode_config_env = format!(
+        "OPENCODE_CONFIG_CONTENT={}",
+        opencode_config_content(&rt.server_url(), api_key, &session_id)
+    );
 
     let mut run_cmd = rt.command();
     run_cmd.args(["run", "--rm", "-it"]);
@@ -480,6 +579,8 @@ pub fn launch_container(
         &format!("AI_POD_SESSION_ID={}", session_id),
         "-e",
         &server_url_env,
+        "-e",
+        &opencode_config_env,
     ]);
     run_cmd.arg(image);
     run_cmd
@@ -520,6 +621,17 @@ pub fn run_in_container(
         )?;
     }
 
+    refresh_claude_mcp_in_volume(
+        rt,
+        config,
+        &volume_name,
+        &container_name,
+        image,
+        &rt.server_url(),
+        api_key,
+        &session_id,
+    )?;
+
     println!(
         "{} {} {}",
         "Running in container:".blue().bold(),
@@ -550,6 +662,11 @@ pub fn run_in_container(
         format!("AI_POD_SESSION_ID={}", session_id),
         "-e".into(),
         format!("AI_POD_SERVER_URL={}", rt.server_url()),
+        "-e".into(),
+        format!(
+            "OPENCODE_CONFIG_CONTENT={}",
+            opencode_config_content(&rt.server_url(), api_key, &session_id)
+        ),
         "--entrypoint".into(),
         command.to_string(),
         image.to_string(),
@@ -863,18 +980,25 @@ mod tests {
     }
 
     #[test]
-    fn mcp_config_points_at_host_server() {
-        let cfg = mcp_config_json("http://host.containers.internal:7822");
+    fn claude_mcp_entry_bakes_literal_values() {
+        let entry = claude_mcp_entry("http://host.containers.internal:7822", "k1", "s2");
+        assert_eq!(entry["type"], "http");
+        assert_eq!(entry["url"], "http://host.containers.internal:7822/mcp");
+        assert_eq!(entry["headers"]["X-Api-Key"], "k1");
+        assert_eq!(entry["headers"]["X-Ai-Pod-Session-Id"], "s2");
+    }
+
+    #[test]
+    fn opencode_config_content_bakes_literal_values() {
+        let s = opencode_config_content("http://host.containers.internal:7822", "k1", "s2");
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["mcp"]["ai-pod"]["type"], "remote");
         assert_eq!(
-            cfg["mcpServers"]["ai-pod"]["url"],
+            v["mcp"]["ai-pod"]["url"],
             "http://host.containers.internal:7822/mcp"
         );
-        assert_eq!(cfg["mcpServers"]["ai-pod"]["type"], "http");
-        assert!(
-            cfg["mcpServers"]["ai-pod"]["headers"]["X-Api-Key"]
-                .as_str()
-                .unwrap()
-                .contains("AI_POD_API_KEY")
-        );
+        assert_eq!(v["mcp"]["ai-pod"]["enabled"], true);
+        assert_eq!(v["mcp"]["ai-pod"]["headers"]["X-Api-Key"], "k1");
+        assert_eq!(v["mcp"]["ai-pod"]["headers"]["X-Ai-Pod-Session-Id"], "s2");
     }
 }
