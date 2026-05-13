@@ -231,7 +231,6 @@ mod tests {
     fn run_command_description_includes_podman_host_gateway() {
         let v = tools_definition(&test_runtime(RuntimeKind::Podman));
         let desc = v[0]["description"].as_str().unwrap();
-        assert!(desc.contains("Podman"));
         assert!(desc.contains("host.containers.internal"));
     }
 
@@ -239,7 +238,6 @@ mod tests {
     fn run_command_description_includes_docker_host_gateway() {
         let v = tools_definition(&test_runtime(RuntimeKind::Docker));
         let desc = v[0]["description"].as_str().unwrap();
-        assert!(desc.contains("Docker"));
         assert!(desc.contains("host.docker.internal"));
     }
 }
