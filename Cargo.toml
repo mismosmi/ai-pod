@@ -31,7 +31,7 @@ futures-util = "0.3"
 subtle = "2"
 regex = "1"
 tower_governor = "0.8"
-ratatui = "0.29"
+ratatui = "0.30"
 crossterm = "0.28"
 
 [dev-dependencies]
