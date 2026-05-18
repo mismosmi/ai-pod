@@ -6,8 +6,10 @@ use std::process::Stdio;
 
 use crate::config::AppConfig;
 use crate::runtime::ContainerRuntime;
+use crate::server::lifecycle::ProjectState;
 use crate::workspace::{
-    container_name_for, container_prefix, new_session_id, volume_name as gen_volume_name,
+    container_name_for, container_prefix, mask_volume_name, new_session_id,
+    volume_name as gen_volume_name, workspace_hash,
 };
 
 /// Home directory of the `ai-pod` user inside every container image.
@@ -52,6 +54,107 @@ pub fn volume_exists(rt: &ContainerRuntime, name: &str) -> Result<bool> {
         .status()
         .context("Failed to check if volume exists")?;
     Ok(status.success())
+}
+
+/// Create a fresh mask volume and chown its root to the container's `ai-pod` user
+/// so the unprivileged in-container user can write under /app/<dir>.
+fn seed_mask_volume(rt: &ContainerRuntime, image: &str, vol: &str, dir: &str) -> Result<()> {
+    let mount_path = format!("/app/{}", dir);
+    let status = rt
+        .command()
+        .args([
+            "run",
+            "--rm",
+            "--user",
+            "0",
+            "-v",
+            &format!("{}:{}:Z", vol, mount_path),
+            "--entrypoint",
+            "chown",
+            image,
+            "ai-pod:ai-pod",
+            &mount_path,
+        ])
+        .status()
+        .context("Failed to seed mask volume")?;
+    if !status.success() {
+        anyhow::bail!("Failed to chown mask volume {}", vol);
+    }
+    Ok(())
+}
+
+/// Ensure a per-mask volume exists (creating + seeding ownership on first use)
+/// and return its name. Idempotent.
+fn ensure_mask_volume(
+    rt: &ContainerRuntime,
+    workspace: &Path,
+    image: &str,
+    dir: &str,
+) -> Result<String> {
+    let vol = mask_volume_name(workspace, dir);
+    if !volume_exists(rt, &vol)? {
+        println!("{} {}", "Creating mask volume:".blue().bold(), vol);
+        let status = rt
+            .command()
+            .args(["volume", "create", &vol])
+            .status()
+            .context("Failed to create mask volume")?;
+        if !status.success() {
+            anyhow::bail!("Failed to create mask volume {}", vol);
+        }
+        seed_mask_volume(rt, image, &vol, dir)?;
+    }
+    Ok(vol)
+}
+
+/// Build the additional `-v` arg pairs that shadow-mount each masked top-level
+/// directory under /app with its own per-workspace named volume. Returned as a
+/// flat list of strings (`-v`, `vol:/app/dir:Z`, ...) ready to splice into the
+/// container run command, after the workspace bind so the shadowing is unambiguous.
+fn mask_mount_args(
+    rt: &ContainerRuntime,
+    workspace: &Path,
+    image: &str,
+    masks: &[String],
+) -> Result<Vec<String>> {
+    let mut out = Vec::with_capacity(masks.len() * 2);
+    for dir in masks {
+        let vol = ensure_mask_volume(rt, workspace, image, dir)?;
+        out.push("-v".to_string());
+        out.push(format!("{}:/app/{}:Z", vol, dir));
+    }
+    Ok(out)
+}
+
+/// Best-effort removal of a single mask volume. Prints a message on success and
+/// a warning if the volume is in use (e.g. another container still mounts it).
+pub fn remove_mask_volume(rt: &ContainerRuntime, workspace: &Path, dir: &str) -> Result<()> {
+    let vol = mask_volume_name(workspace, dir);
+    if !volume_exists(rt, &vol)? {
+        return Ok(());
+    }
+    let output = rt
+        .command()
+        .args(["volume", "rm", &vol])
+        .output()
+        .context("Failed to remove mask volume")?;
+    if output.status.success() {
+        println!("{} {}", "Removed volume:".red().bold(), vol);
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        println!(
+            "{} could not remove {} ({})",
+            "Warning:".yellow().bold(),
+            vol,
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+fn load_project_state(config: &AppConfig, workspace: &Path) -> ProjectState {
+    let hash = workspace_hash(workspace);
+    ProjectState::load(&config.project_state_file(&hash))
 }
 
 fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
@@ -512,6 +615,9 @@ pub fn launch_container(
         opencode_config_content(&rt.server_url(), api_key, &session_id)
     );
 
+    let project_state = load_project_state(config, workspace);
+    let mask_args = mask_mount_args(rt, workspace, image, &project_state.masked_directories)?;
+
     let mut run_cmd = rt.command();
     run_cmd.args(["run", "--rm", "-it"]);
     run_cmd.args([
@@ -523,6 +629,11 @@ pub fn launch_container(
         &format!("{}:{}:z", volume_name, CONTAINER_HOME),
         "-v",
         &format!("{}:/app:Z", workspace_str),
+    ]);
+    for arg in &mask_args {
+        run_cmd.arg(arg);
+    }
+    run_cmd.args([
         &add_host,
         "-e",
         &host_gw_env,
@@ -594,6 +705,9 @@ pub fn run_in_container(
         command
     );
 
+    let project_state = load_project_state(config, workspace);
+    let mask_args = mask_mount_args(rt, workspace, image, &project_state.masked_directories)?;
+
     let mut run_args: Vec<String> = vec![
         "run".into(),
         "--rm".into(),
@@ -606,6 +720,9 @@ pub fn run_in_container(
         format!("{}:{}:z", volume_name, CONTAINER_HOME),
         "-v".into(),
         format!("{}:/app:Z", workspace_str),
+    ]);
+    run_args.extend(mask_args);
+    run_args.extend_from_slice(&[
         rt.add_host_arg(),
         "-e".into(),
         format!("HOST_GATEWAY={}", rt.host_gateway()),
@@ -728,7 +845,11 @@ pub fn attach_container(rt: &ContainerRuntime) -> Result<()> {
     Ok(())
 }
 
-pub fn clean_container(rt: &ContainerRuntime, workspace: &Path) -> Result<()> {
+pub fn clean_container(
+    rt: &ContainerRuntime,
+    config: &AppConfig,
+    workspace: &Path,
+) -> Result<()> {
     let prefix = container_prefix(workspace);
     let volume_name = gen_volume_name(workspace);
 
@@ -755,6 +876,14 @@ pub fn clean_container(rt: &ContainerRuntime, workspace: &Path) -> Result<()> {
         if status.success() {
             println!("{}", "Volume removed.".green());
         }
+    }
+
+    // Remove per-mask volumes recorded in this workspace's state. Config (the
+    // list of masked dirs) is preserved so the volumes are re-created on next
+    // launch — `clean` resets runtime state, not user config.
+    let state = load_project_state(config, workspace);
+    for dir in &state.masked_directories {
+        let _ = remove_mask_volume(rt, workspace, dir);
     }
 
     Ok(())

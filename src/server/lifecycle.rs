@@ -36,6 +36,8 @@ pub struct ProjectState {
     pub api_key: String,
     #[serde(default)]
     pub ignored_credential_files: Vec<String>,
+    #[serde(default)]
+    pub masked_directories: Vec<String>,
 }
 
 impl ProjectState {
@@ -86,6 +88,20 @@ impl ProjectState {
         if !self.is_credential_ignored(rel_path) {
             self.ignored_credential_files.push(rel_path.to_string());
         }
+    }
+
+    pub fn is_masked(&self, dir: &str) -> bool {
+        self.masked_directories.iter().any(|d| d == dir)
+    }
+
+    pub fn add_masked(&mut self, dir: &str) {
+        if !self.is_masked(dir) {
+            self.masked_directories.push(dir.to_string());
+        }
+    }
+
+    pub fn remove_masked(&mut self, dir: &str) {
+        self.masked_directories.retain(|d| d != dir);
     }
 }
 
@@ -340,6 +356,7 @@ mod tests {
             allowed_commands: vec![],
             api_key: "secret".into(),
             ignored_credential_files: vec![],
+            masked_directories: vec![],
         };
         state.save(&path).unwrap();
         let perms = std::fs::metadata(&path).unwrap().permissions();
@@ -373,6 +390,7 @@ mod tests {
             allowed_commands: vec!["make build".into()],
             api_key: "deadbeef1234567890abcdef12345678".into(),
             ignored_credential_files: vec![],
+            masked_directories: vec![],
         };
         state.save(&path).unwrap();
         let loaded = ProjectState::load(&path);
@@ -403,6 +421,21 @@ mod tests {
         state.add_allowed("npm test");
         state.add_allowed("npm test");
         assert_eq!(state.allowed_commands.len(), 1);
+    }
+
+    #[test]
+    fn mask_helpers_round_trip() {
+        let mut state = ProjectState::default();
+        assert!(!state.is_masked("node_modules"));
+        state.add_masked("node_modules");
+        state.add_masked("node_modules");
+        state.add_masked("target");
+        assert!(state.is_masked("node_modules"));
+        assert!(state.is_masked("target"));
+        assert_eq!(state.masked_directories.len(), 2);
+        state.remove_masked("node_modules");
+        assert!(!state.is_masked("node_modules"));
+        assert!(state.is_masked("target"));
     }
 
     #[test]

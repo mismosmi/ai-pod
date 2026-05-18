@@ -102,6 +102,26 @@ pub enum Command {
         action: Option<AllowedAction>,
     },
 
+    /// Shadow-mount a top-level workspace directory with an isolated per-workspace volume.
+    /// The masked directory inside the container is backed by a named volume instead of
+    /// the host's workspace, so container-only artifacts (e.g. node_modules) don't leak out.
+    Mask {
+        /// Top-level directory name under /app (e.g. node_modules, target)
+        dir: String,
+        /// Workspace path (default: cwd)
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+    },
+
+    /// Remove a directory from the mask list and delete its shadow volume.
+    Unmask {
+        /// Top-level directory name to stop masking
+        dir: String,
+        /// Workspace path (default: cwd)
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+    },
+
     /// Update ai-pod to the latest release
     Update,
 }

@@ -89,6 +89,8 @@ ai-pod --workdir /path/to/project
 | `run <command> [args...]` | Run a command in the container instead of the default |
 | `commands [list\|run\|kill\|logs]` | View/manage host commands (interactive TUI if no subcommand) |
 | `allowed [list\|add\|remove]` | Manage the always-allowed command whitelist (interactive TUI if no subcommand) |
+| `mask <dir> [--workdir PATH]` | Shadow-mount `/app/<dir>` with an isolated per-workspace volume |
+| `unmask <dir> [--workdir PATH]` | Stop masking `<dir>` and delete its shadow volume |
 | `serve` | Start the shared MCP server manually (normally auto-started) |
 | `update` | Fetch the latest install script and run it to upgrade |
 
@@ -98,6 +100,23 @@ ai-pod --workdir /path/to/project
 ai-pod run claude resume   # resume the last Claude session
 ai-pod run bash            # open a bash shell in the container
 ```
+
+### Masking host directories
+
+Some directories — `node_modules`, `target`, `.venv`, `dist` — contain
+artifacts the container produces and the host can't (or shouldn't) reuse.
+Mask them so the container gets its own per-workspace storage instead of
+overlaying the host's:
+
+```sh
+ai-pod mask node_modules    # next launch mounts an isolated volume at /app/node_modules
+ai-pod unmask node_modules  # stop masking and delete the volume
+```
+
+The shadow volume is named `ai-pod-<workspace-hash>-mask-<dir>` and is
+removed automatically by `ai-pod clean`. Only top-level directory names are
+accepted (no slashes, no hidden dirs). Changes apply to the next container
+launch; a warning is printed if a container is currently running.
 
 ---
 
