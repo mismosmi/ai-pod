@@ -73,6 +73,18 @@ pub fn command_dir(workspace: &Path, session_id: &str, command_id: &str) -> Path
     commands_root(workspace).join(session_id).join(command_id)
 }
 
+/// In-container view of the stdout/stderr/exit files. The workspace is bind-mounted
+/// at `/app` (see `src/container.rs`), so this is the path the agent inside the
+/// container sees and can pass to its file Read tool.
+pub fn container_paths(session_id: &str, command_id: &str) -> (String, String, String) {
+    let base = format!("/app/.ai-pod/commands/{session_id}/{command_id}");
+    (
+        format!("{base}/stdout"),
+        format!("{base}/stderr"),
+        format!("{base}/exit"),
+    )
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -482,6 +494,14 @@ mod tests {
         assert!(outcome.exit_code.is_none());
         // stop the leftover process so the test directory can be cleaned up
         let _ = stop(&state, "deadbeef", &outcome.command_id).await;
+    }
+
+    #[test]
+    fn container_paths_uses_app_mount() {
+        let (out, err, exit) = container_paths("abcd1234", "efgh5678");
+        assert_eq!(out, "/app/.ai-pod/commands/abcd1234/efgh5678/stdout");
+        assert_eq!(err, "/app/.ai-pod/commands/abcd1234/efgh5678/stderr");
+        assert_eq!(exit, "/app/.ai-pod/commands/abcd1234/efgh5678/exit");
     }
 
     #[test]

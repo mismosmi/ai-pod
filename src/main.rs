@@ -11,6 +11,33 @@ use cli::{AllowedAction, Cli, Command, CommandsAction};
 use config::AppConfig;
 use runtime::ContainerRuntime;
 
+/// Validate a mask target: must be a single top-level directory name, not a
+/// hidden dir or path traversal, and must only contain characters that are
+/// already legal in a podman/docker volume name suffix.
+fn validate_mask_dir(dir: &str) -> Result<()> {
+    if dir.is_empty() {
+        anyhow::bail!("Directory name must not be empty");
+    }
+    if dir == "." || dir == ".." {
+        anyhow::bail!("Directory name must not be '.' or '..'");
+    }
+    if dir.starts_with('.') {
+        anyhow::bail!("Directory name must not start with '.'");
+    }
+    if dir.contains('/') || dir.contains('\\') {
+        anyhow::bail!("Directory name must be a single top-level segment (no slashes)");
+    }
+    if !dir
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        anyhow::bail!(
+            "Directory name may only contain ASCII letters, digits, '_', '-' or '.'"
+        );
+    }
+    Ok(())
+}
+
 fn resolve_workspace(workdir: &Option<std::path::PathBuf>) -> Result<std::path::PathBuf> {
     match workdir {
         Some(p) => std::fs::canonicalize(p).context("Invalid workspace path"),
@@ -362,9 +389,67 @@ async fn main() -> Result<()> {
             container::list_containers(&rt)?;
         }
         Some(Command::Clean { workdir }) => {
+            let config = AppConfig::new()?;
             let ws = workdir.clone().or_else(|| cli.workdir.clone());
             let workspace = resolve_workspace(&ws)?;
-            container::clean_container(&rt, &workspace)?;
+            container::clean_container(&rt, &config, &workspace)?;
+        }
+        Some(Command::Mask { dir, workdir }) => {
+            let config = AppConfig::new()?;
+            config.init()?;
+            let ws = workdir.clone().or_else(|| cli.workdir.clone());
+            let workspace = resolve_workspace(&ws)?;
+            validate_mask_dir(dir)?;
+
+            let hash = workspace::workspace_hash(&workspace);
+            let state_path = config.project_state_file(&hash);
+            let mut state = server::lifecycle::ProjectState::load(&state_path);
+            if state.is_masked(dir) {
+                println!("Already masked: {}", dir);
+                return Ok(());
+            }
+            state.add_masked(dir);
+            state.save(&state_path)?;
+            println!("{} {}", "Masked:".green().bold(), dir);
+
+            let prefix = workspace::container_prefix(&workspace);
+            if !container::containers_for_prefix(&rt, &prefix, true)?.is_empty() {
+                println!(
+                    "{} a container is running for this workspace; the new mount applies on next launch.",
+                    "Note:".yellow().bold()
+                );
+            }
+        }
+        Some(Command::Unmask { dir, workdir }) => {
+            let config = AppConfig::new()?;
+            config.init()?;
+            let ws = workdir.clone().or_else(|| cli.workdir.clone());
+            let workspace = resolve_workspace(&ws)?;
+            validate_mask_dir(dir)?;
+
+            let hash = workspace::workspace_hash(&workspace);
+            let state_path = config.project_state_file(&hash);
+            let mut state = server::lifecycle::ProjectState::load(&state_path);
+            if !state.is_masked(dir) {
+                println!("Not masked: {}", dir);
+                return Ok(());
+            }
+            state.remove_masked(dir);
+            state.save(&state_path)?;
+
+            let prefix = workspace::container_prefix(&workspace);
+            let container_running =
+                !container::containers_for_prefix(&rt, &prefix, true)?.is_empty();
+            if container_running {
+                println!(
+                    "{} a container is running for this workspace; the volume will be left in place. Stop the container and re-run `ai-pod unmask {}` (or `ai-pod clean`) to delete its data.",
+                    "Note:".yellow().bold(),
+                    dir
+                );
+            } else {
+                container::remove_mask_volume(&rt, &workspace, dir)?;
+            }
+            println!("{} {}", "Unmasked:".green().bold(), dir);
         }
         Some(Command::Run { command, args }) => {
             let config = AppConfig::new()?;
@@ -436,4 +521,43 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_mask_dir;
+
+    #[test]
+    fn accepts_typical_top_level_names() {
+        for ok in ["node_modules", "target", "dist", "build", "out", "vendor"] {
+            assert!(validate_mask_dir(ok).is_ok(), "{ok} should be accepted");
+        }
+    }
+
+    #[test]
+    fn rejects_empty_and_dots() {
+        assert!(validate_mask_dir("").is_err());
+        assert!(validate_mask_dir(".").is_err());
+        assert!(validate_mask_dir("..").is_err());
+    }
+
+    #[test]
+    fn rejects_hidden_dirs() {
+        assert!(validate_mask_dir(".git").is_err());
+        assert!(validate_mask_dir(".cache").is_err());
+    }
+
+    #[test]
+    fn rejects_path_traversal_and_slashes() {
+        assert!(validate_mask_dir("../etc").is_err());
+        assert!(validate_mask_dir("foo/bar").is_err());
+        assert!(validate_mask_dir("foo\\bar").is_err());
+    }
+
+    #[test]
+    fn rejects_disallowed_characters() {
+        assert!(validate_mask_dir("foo bar").is_err());
+        assert!(validate_mask_dir("foo:bar").is_err());
+        assert!(validate_mask_dir("foo*bar").is_err());
+    }
 }

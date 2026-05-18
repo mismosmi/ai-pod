@@ -66,7 +66,7 @@ fn tool_error(text: String) -> Value {
 
 fn tools_definition(runtime: &ContainerRuntime) -> Value {
     let run_command_description = format!(
-        "Run a shell command on the host (outside this container). From inside the container, reach host services via `{}` instead of `localhost`. Waits up to 5 seconds; returns the result inline if finished, otherwise returns a command_id for polling. Output is always written to {{workspace}}/.ai-pod/commands/{{session_id}}/{{command_id}}/{{stdout,stderr,exit}}, read directly from there. Do not start commands with `cd /`. Do not pipe to `| head`/`| tail` on the host — trim output in the container instead. Keep commands as simple as possible.",
+        "Run a shell command on the host (outside this container). From inside the container, reach host services via `{}` instead of `localhost`. Waits up to 5 seconds; returns the result inline if finished, otherwise returns a command_id for polling.\n\nOutput goes to `/app/.ai-pod/commands/{{session_id}}/{{command_id}}/{{stdout,stderr,exit}}` — these files live on THIS container's filesystem (the workspace is mounted at `/app`). Read them with your regular file Read tool, not via bash on the host. Re-Read `stdout`/`exit` to poll progress; you do not need to keep calling `command_status`.\n\nDo not start commands with `cd /`. Do not pipe to `| head`/`| tail` on the host — trim output in the container instead. Keep commands as simple as possible.",
         runtime.host_gateway(),
     );
     json!([
@@ -81,7 +81,7 @@ fn tools_definition(runtime: &ContainerRuntime) -> Value {
         },
         {
             "name": "command_status",
-            "description": "Check the status of a previously started command. Returns running/finished/killed plus the last 10 lines of stdout and stderr.",
+            "description": "Check the status of a previously started command. Returns running/finished/killed plus the last 10 lines of stdout/stderr. Full streams are at `/app/.ai-pod/commands/{session_id}/{command_id}/{stdout,stderr,exit}` on this container's filesystem — read them with your file Read tool.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "command_id": { "type": "string" } },
@@ -240,6 +240,41 @@ mod tests {
         let desc = v[0]["description"].as_str().unwrap();
         assert!(desc.contains("host.docker.internal"));
     }
+
+    #[test]
+    fn run_command_description_points_at_in_container_log_path() {
+        let v = tools_definition(&test_runtime(RuntimeKind::Podman));
+        let desc = v[0]["description"].as_str().unwrap();
+        assert!(
+            desc.contains("/app/.ai-pod/commands/"),
+            "description should reference the in-container log path, got: {desc}"
+        );
+        assert!(
+            desc.contains("Read tool"),
+            "description should tell the agent to use its Read tool, got: {desc}"
+        );
+    }
+
+    #[test]
+    fn command_status_description_points_at_in_container_log_path() {
+        let v = tools_definition(&test_runtime(RuntimeKind::Podman));
+        let desc = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "command_status")
+            .unwrap()["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            desc.contains("/app/.ai-pod/commands/"),
+            "description should reference the in-container log path, got: {desc}"
+        );
+        assert!(
+            desc.contains("Read tool"),
+            "description should tell the agent to use its Read tool, got: {desc}"
+        );
+    }
 }
 
 async fn handle_tool_call(
@@ -267,14 +302,23 @@ async fn handle_tool_call(
                 }
                 commands::ApprovalOutcome::Approved | commands::ApprovalOutcome::AlwaysAllow => {
                     match runner::spawn_and_wait(state, workspace, session_id, cmd).await {
-                        Ok(outcome) => json!({
-                            "content": [{
-                                "type": "text",
-                                "text": serde_json::to_string_pretty(&outcome).unwrap_or_default()
-                            }],
-                            "isError": false,
-                            "structuredContent": outcome,
-                        }),
+                        Ok(mut outcome) => {
+                            let (s, e, x) = runner::container_paths(
+                                &outcome.session_id,
+                                &outcome.command_id,
+                            );
+                            outcome.stdout_path = s;
+                            outcome.stderr_path = e;
+                            outcome.exit_path = x;
+                            json!({
+                                "content": [{
+                                    "type": "text",
+                                    "text": serde_json::to_string_pretty(&outcome).unwrap_or_default()
+                                }],
+                                "isError": false,
+                                "structuredContent": outcome,
+                            })
+                        }
                         Err(e) => tool_error(format!("Failed to run command: {e}")),
                     }
                 }
@@ -286,14 +330,20 @@ async fn handle_tool_call(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             match runner::status_for(state, workspace, session_id, cid).await {
-                Some(o) => json!({
-                    "content": [{
-                        "type": "text",
-                        "text": serde_json::to_string_pretty(&o).unwrap_or_default()
-                    }],
-                    "isError": false,
-                    "structuredContent": o,
-                }),
+                Some(mut o) => {
+                    let (s, e, x) = runner::container_paths(&o.session_id, &o.command_id);
+                    o.stdout_path = s;
+                    o.stderr_path = e;
+                    o.exit_path = x;
+                    json!({
+                        "content": [{
+                            "type": "text",
+                            "text": serde_json::to_string_pretty(&o).unwrap_or_default()
+                        }],
+                        "isError": false,
+                        "structuredContent": o,
+                    })
+                }
                 None => tool_error(format!("Unknown command_id: {cid}")),
             }
         }
