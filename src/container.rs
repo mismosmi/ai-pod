@@ -11,6 +11,7 @@ use crate::workspace::{
     container_name_for, container_prefix, mask_volume_name, new_session_id,
     volume_name as gen_volume_name, workspace_hash,
 };
+use crate::worktree;
 
 /// Home directory of the `ai-pod` user inside every container image.
 /// The Dockerfile template creates this user with this home path, so the
@@ -617,6 +618,18 @@ pub fn launch_container(
 
     let project_state = load_project_state(config, workspace);
     let mask_args = mask_mount_args(rt, workspace, image, &project_state.masked_directories)?;
+    let worktree_info = worktree::detect(workspace)?;
+    let worktree_args = worktree_info
+        .as_ref()
+        .map(worktree::mount_args)
+        .unwrap_or_default();
+    if let Some(info) = &worktree_info {
+        println!(
+            "{} {}",
+            "Worktree detected, mounting main .git:".blue().bold(),
+            info.main_git_dir.display()
+        );
+    }
 
     let mut run_cmd = rt.command();
     run_cmd.args(["run", "--rm", "-it"]);
@@ -630,6 +643,9 @@ pub fn launch_container(
         "-v",
         &format!("{}:/app:Z", workspace_str),
     ]);
+    for arg in &worktree_args {
+        run_cmd.arg(arg);
+    }
     for arg in &mask_args {
         run_cmd.arg(arg);
     }
@@ -707,6 +723,18 @@ pub fn run_in_container(
 
     let project_state = load_project_state(config, workspace);
     let mask_args = mask_mount_args(rt, workspace, image, &project_state.masked_directories)?;
+    let worktree_info = worktree::detect(workspace)?;
+    let worktree_args = worktree_info
+        .as_ref()
+        .map(worktree::mount_args)
+        .unwrap_or_default();
+    if let Some(info) = &worktree_info {
+        println!(
+            "{} {}",
+            "Worktree detected, mounting main .git:".blue().bold(),
+            info.main_git_dir.display()
+        );
+    }
 
     let mut run_args: Vec<String> = vec![
         "run".into(),
@@ -721,6 +749,7 @@ pub fn run_in_container(
         "-v".into(),
         format!("{}:/app:Z", workspace_str),
     ]);
+    run_args.extend(worktree_args);
     run_args.extend(mask_args);
     run_args.extend_from_slice(&[
         rt.add_host_arg(),

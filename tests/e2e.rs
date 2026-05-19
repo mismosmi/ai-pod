@@ -9,6 +9,7 @@ use ai_pod::image;
 use ai_pod::runtime::ContainerRuntime;
 use ai_pod::server;
 use ai_pod::workspace;
+use ai_pod::worktree;
 
 use lazy_static::lazy_static;
 use std::path::Path;
@@ -584,6 +585,157 @@ async fn e2e_server_reachable_from_container() {
     );
 
     server_handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Worktree tests
+// ---------------------------------------------------------------------------
+
+/// Initialise a git repo in `dir` with one commit so `git worktree add` works.
+fn init_git_repo_with_commit(dir: &Path) {
+    let run = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("failed to run git");
+        assert!(status.success(), "git {:?} failed", args);
+    };
+    run(&["init", "-q", "-b", "main"]);
+    run(&["config", "user.email", "test@example.com"]);
+    run(&["config", "user.name", "test"]);
+    std::fs::write(dir.join("README"), "hi\n").unwrap();
+    run(&["add", "README"]);
+    run(&["commit", "-q", "-m", "init"]);
+}
+
+/// Run a command inside a transient container with the workspace mounted at
+/// `/app` plus any extra mount args. Returns `(success, stdout, stderr)`.
+fn run_in_container_with_mounts(
+    rt: &ContainerRuntime,
+    image: &str,
+    workspace: &Path,
+    extra_mounts: &[String],
+    cmd: &[&str],
+) -> (bool, String, String) {
+    let workspace_str = workspace.to_string_lossy().to_string();
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "--rm".into(),
+        "-v".into(),
+        format!("{}:/app:Z", workspace_str),
+    ];
+    args.extend_from_slice(extra_mounts);
+    // safe.directory='*' so git doesn't refuse to operate on host-owned mounts
+    args.extend_from_slice(&[
+        "-e".into(),
+        "GIT_CONFIG_COUNT=1".into(),
+        "-e".into(),
+        "GIT_CONFIG_KEY_0=safe.directory".into(),
+        "-e".into(),
+        "GIT_CONFIG_VALUE_0=*".into(),
+    ]);
+    args.push(image.to_string());
+    args.extend(cmd.iter().map(|s| s.to_string()));
+
+    let output = rt
+        .command()
+        .args(&args)
+        .output()
+        .expect("failed to run container");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+/// Plain (non-worktree) repos must not trigger worktree mounting and `git
+/// status` should keep working with just the workspace bind.
+#[test]
+fn e2e_worktree_plain_repo_unchanged() {
+    let rt = require_runtime!();
+    let tag = shared_image_tag(&rt);
+
+    let ws = tempfile::TempDir::new().unwrap();
+    init_git_repo_with_commit(ws.path());
+
+    assert!(
+        worktree::detect(ws.path()).unwrap().is_none(),
+        "plain repo must not be detected as a worktree"
+    );
+
+    let (ok, stdout, stderr) =
+        run_in_container_with_mounts(&rt, tag, ws.path(), &[], &["git", "status"]);
+    assert!(
+        ok,
+        "git status failed in plain repo: stdout={} stderr={}",
+        stdout, stderr
+    );
+    assert!(
+        stdout.contains("On branch main") || stdout.contains("main"),
+        "expected branch info in output: {}",
+        stdout
+    );
+}
+
+/// In a real linked worktree, the worktree-mount args produced by
+/// `worktree::mount_args` must make `git status` work inside the container.
+#[test]
+fn e2e_worktree_happy_path() {
+    let rt = require_runtime!();
+    let tag = shared_image_tag(&rt);
+
+    let root = tempfile::TempDir::new().unwrap();
+    let main = root.path().join("main");
+    std::fs::create_dir_all(&main).unwrap();
+    init_git_repo_with_commit(&main);
+
+    let wt = root.path().join("wt");
+    let status = std::process::Command::new("git")
+        .args([
+            "-C",
+            main.to_str().unwrap(),
+            "worktree",
+            "add",
+            wt.to_str().unwrap(),
+            "-b",
+            "feature",
+        ])
+        .status()
+        .expect("git worktree add");
+    assert!(status.success(), "git worktree add failed");
+
+    let info = worktree::detect(&wt).unwrap().expect("worktree must be detected");
+    let main_git_canonical = std::fs::canonicalize(main.join(".git")).unwrap();
+    assert_eq!(
+        std::fs::canonicalize(&info.main_git_dir).unwrap(),
+        main_git_canonical
+    );
+
+    let mounts = worktree::mount_args(&info);
+    let (ok, stdout, stderr) =
+        run_in_container_with_mounts(&rt, tag, &wt, &mounts, &["git", "status"]);
+    assert!(
+        ok,
+        "git status failed in worktree with mount: stdout={} stderr={}",
+        stdout, stderr
+    );
+    assert!(
+        stdout.contains("feature"),
+        "expected branch 'feature' in output: {}",
+        stdout
+    );
+
+    // Without the extra mount, the same setup should fail — proves the mount
+    // is the thing that makes git work, not something incidental.
+    let (ok_no_mount, _stdout_no_mount, stderr_no_mount) =
+        run_in_container_with_mounts(&rt, tag, &wt, &[], &["git", "status"]);
+    assert!(
+        !ok_no_mount,
+        "git status unexpectedly succeeded without the worktree mount; stderr={}",
+        stderr_no_mount
+    );
 }
 
 // Agent install tests (claude + opencode across all base images) are in

@@ -13,6 +13,7 @@ ai-pod manages per-workspace containers that run Claude Code or OpenCode. It wor
 - **Workspace isolation** — each directory gets its own container, named by a hash of its path; projects can't interfere with each other
 - **Persistent agent state** — a named volume preserves `~/.claude` and `~/.config/opencode` (login, memory, settings) across container restarts
 - **Credential scanning** — scans the workspace for secrets before mounting it; prompts you to review or abort
+- **Git worktree support** — if the workspace is a [git worktree](https://git-scm.com/docs/git-worktree), ai-pod auto-detects it and additionally bind-mounts the main repo's `.git` directory (at the same absolute host path) so `git` works normally inside the container. The extra mount uses SELinux `:Z` relabelling, matching the workspace mount.
 - **Custom Dockerfiles per project** — drop an `ai-pod.Dockerfile` in any project to install extra runtimes, tools, or MCP servers
 - **AI-driven skill file** — container environment context and host-command usage are delivered via an auto-generated ai-pod skill loaded by Claude and OpenCode
 - **Host command execution via MCP** — the in-container agent talks to the shared host server over MCP (`http://host.containers.internal:7822/mcp`); every host command requires your explicit approval with a persistent allowlist

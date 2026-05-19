@@ -8,3 +8,4 @@ pub mod runtime;
 pub mod server;
 pub mod update;
 pub mod workspace;
+pub mod worktree;
