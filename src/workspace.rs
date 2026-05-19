@@ -42,6 +42,11 @@ pub fn volume_name(workspace: &Path) -> String {
     format!("ai-pod-{}-home", workspace_hash(workspace))
 }
 
+/// Per-workspace named volume that shadow-mounts /app/{dir} inside the container.
+pub fn mask_volume_name(workspace: &Path, dir: &str) -> String {
+    format!("ai-pod-{}-mask-{}", workspace_hash(workspace), dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +87,24 @@ mod tests {
     fn volume_name_uses_workspace_hash() {
         let p = Path::new("/home/user/myproject");
         assert_eq!(volume_name(p), format!("ai-pod-{}-home", workspace_hash(p)));
+    }
+
+    #[test]
+    fn mask_volume_name_includes_hash_and_dir() {
+        let p = Path::new("/home/user/myproject");
+        let name = mask_volume_name(p, "node_modules");
+        assert_eq!(
+            name,
+            format!("ai-pod-{}-mask-node_modules", workspace_hash(p))
+        );
+    }
+
+    #[test]
+    fn mask_volume_names_differ_per_workspace_and_dir() {
+        let a = Path::new("/home/user/project-a");
+        let b = Path::new("/home/user/project-b");
+        assert_ne!(mask_volume_name(a, "target"), mask_volume_name(b, "target"));
+        assert_ne!(mask_volume_name(a, "target"), mask_volume_name(a, "dist"));
     }
 
     #[test]

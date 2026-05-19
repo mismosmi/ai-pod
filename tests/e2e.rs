@@ -412,7 +412,8 @@ fn e2e_clean_container_removes_all() {
     );
 
     // Production clean_container should remove both
-    container::clean_container(&rt, ws.path()).unwrap();
+    let (_cfg_dir, cfg) = make_test_config();
+    container::clean_container(&rt, &cfg, ws.path()).unwrap();
 
     assert!(
         !container::volume_exists(&rt, &vol).unwrap(),
