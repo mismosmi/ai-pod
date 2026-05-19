@@ -296,7 +296,7 @@ async fn handle_tool_call(
                 commands::ApprovalOutcome::Rejected => tool_error(format!(
                     "Command rejected — matches forbidden pattern. Do not use `cd /` or `| head`/`| tail` on the host."
                 )),
-                commands::ApprovalOutcome::Denied => tool_error("Command denied by user".into()),
+                commands::ApprovalOutcome::Denied(reason) => tool_error(reason.message().into()),
                 commands::ApprovalOutcome::Timeout => {
                     tool_error("Permission request timed out after 60 seconds.".into())
                 }
