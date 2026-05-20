@@ -90,6 +90,10 @@ impl ProjectState {
         }
     }
 
+    pub fn remove_ignored_credential(&mut self, rel_path: &str) {
+        self.ignored_credential_files.retain(|p| p != rel_path);
+    }
+
     pub fn is_masked(&self, dir: &str) -> bool {
         self.masked_directories.iter().any(|d| d == dir)
     }

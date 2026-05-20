@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use colored::Colorize;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -6,6 +6,26 @@ use walkdir::WalkDir;
 use crate::config::AppConfig;
 use crate::server::lifecycle::ProjectState;
 use crate::workspace::workspace_hash;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvFileStatus {
+    /// Symlink in workspace pointing into ~/.env-files/<slug>/ — AI cannot read.
+    Hidden,
+    /// Regular file in workspace, not in the ignore list — AI can read, warns at startup.
+    Exposed,
+    /// Regular file in workspace, in the ignore list — AI can read, no warning.
+    Ignored,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnvFileEntry {
+    pub rel_path: String,
+    pub abs_path: PathBuf,
+    pub status: EnvFileStatus,
+    /// For Hidden entries: where the real file lives.
+    /// For other entries: where it would be moved if hidden.
+    pub destination: PathBuf,
+}
 
 const CREDENTIAL_PATTERNS: &[&str] = &[
     ".env",
@@ -180,12 +200,17 @@ pub fn check_credentials(workspace: &Path, config: &AppConfig) -> Result<bool> {
 
     println!(
         "\n{}",
-        "⚠  Potential credential files found in workspace:"
+        "⚠  Potentially sensitive files detected in workspace:"
             .yellow()
             .bold()
     );
+    println!(
+        "  {}",
+        "The workspace is mounted into the AI container, so these files will be readable by the AI."
+            .dimmed()
+    );
 
-    let mut any_kept = false;
+    let mut any_exposed = false;
     let mut state_changed = false;
 
     for path in &pending {
@@ -193,35 +218,35 @@ pub fn check_credentials(workspace: &Path, config: &AppConfig) -> Result<bool> {
         println!("\n  {} {}", "•".yellow(), rel.display());
 
         let choices = &[
-            "Keep (allow in container, warn next time)",
-            "Ignore (never warn for this file again)",
-            "Move to ~/.env-files/<slug>/ and symlink",
+            "Hide from AI  (move to home directory, keep symlink for host tools)",
+            "Expose to AI  (keep in workspace, suppress future warnings)",
+            "Expose to AI  (keep in workspace, warn again next time)",
         ];
         let selection = dialoguer::Select::new()
-            .with_prompt("What would you like to do?")
+            .with_prompt("This file will be readable inside the container — what would you like to do?")
             .items(choices)
             .default(0)
             .interact()?;
 
         match selection {
             0 => {
-                any_kept = true;
-            }
-            1 => {
-                state.add_ignored_credential(&rel.to_string_lossy());
-                state_changed = true;
-            }
-            2 => {
                 let dst_dir = config.env_files_project_dir(workspace);
-                let file_name = path.file_name().unwrap_or_default();
-                let dst = dst_dir.join(file_name);
+                let dst = dst_dir.join(rel);
                 move_and_symlink(path, &dst)?;
                 println!(
-                    "  {} Moved to {} and symlinked",
+                    "  {} Hidden: moved to {} and replaced with a symlink",
                     "✓".green(),
                     dst.display()
                 );
                 state_changed = true;
+            }
+            1 => {
+                state.add_ignored_credential(&rel.to_string_lossy());
+                state_changed = true;
+                any_exposed = true;
+            }
+            2 => {
+                any_exposed = true;
             }
             _ => unreachable!(),
         }
@@ -231,7 +256,7 @@ pub fn check_credentials(workspace: &Path, config: &AppConfig) -> Result<bool> {
         state.save(&state_path)?;
     }
 
-    if any_kept {
+    if any_exposed {
         let proceed = dialoguer::Confirm::new()
             .with_prompt("Continue anyway?")
             .default(false)
@@ -252,6 +277,160 @@ fn move_and_symlink(src: &Path, dst: &Path) -> Result<()> {
         std::fs::remove_file(src)?;
     }
     std::os::unix::fs::symlink(dst, src)?;
+    Ok(())
+}
+
+/// Enumerate every sensitive file in the workspace, classified by management
+/// status. Symlinks pointing into `~/.env-files/<slug>/` are reported as
+/// `Hidden`; regular files are reported as `Exposed` or `Ignored` depending on
+/// the project state's ignore list. The result is sorted by relative path.
+pub fn list_env_files(workspace: &Path, config: &AppConfig) -> Vec<EnvFileEntry> {
+    let workspace_buf =
+        std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let workspace = workspace_buf.as_path();
+    let env_dir = config.env_files_project_dir(workspace);
+    let hash = workspace_hash(workspace);
+    let state = ProjectState::load(&config.project_state_file(&hash));
+
+    let mut entries = Vec::new();
+
+    for ent in WalkDir::new(workspace)
+        .max_depth(5)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            !matches!(
+                name.as_ref(),
+                "node_modules" | ".git" | "target" | "__pycache__" | ".venv" | "venv"
+            )
+        })
+        .filter_map(|e| e.ok())
+    {
+        let path = ent.path();
+        if !is_credential_file(path) {
+            continue;
+        }
+        let ft = ent.file_type();
+        let rel = path
+            .strip_prefix(workspace)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+
+        if ft.is_symlink() {
+            let Ok(target) = std::fs::read_link(path) else {
+                continue;
+            };
+            let resolved = if target.is_absolute() {
+                target
+            } else {
+                path.parent().unwrap_or(workspace).join(&target)
+            };
+            if resolved.starts_with(&env_dir) {
+                entries.push(EnvFileEntry {
+                    rel_path: rel,
+                    abs_path: path.to_path_buf(),
+                    status: EnvFileStatus::Hidden,
+                    destination: resolved,
+                });
+            }
+        } else if ft.is_file() {
+            let status = if state.is_credential_ignored(&rel) {
+                EnvFileStatus::Ignored
+            } else {
+                EnvFileStatus::Exposed
+            };
+            let destination = env_dir.join(&rel);
+            entries.push(EnvFileEntry {
+                rel_path: rel,
+                abs_path: path.to_path_buf(),
+                status,
+                destination,
+            });
+        }
+    }
+
+    entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    entries
+}
+
+/// Verify a workspace-relative path is safe to join onto `~/.env-files/<slug>/`
+/// — it must not be absolute and must not contain any `..` components.
+fn validate_rel_path(rel_path: &str) -> Result<()> {
+    let p = Path::new(rel_path);
+    for c in p.components() {
+        match c {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            _ => anyhow::bail!(
+                "Invalid relative path (must not contain '..' or be absolute): {}",
+                rel_path
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Move a workspace file into `~/.env-files/<slug>/` and replace it with a
+/// symlink pointing at the new location. The file's path relative to the
+/// workspace root is preserved under the env-files dir, so nested files like
+/// `packages/a/.env` and `packages/b/.env` don't collide.
+/// Errors if the workspace path is already a symlink (i.e. the file is already
+/// hidden).
+pub fn hide_file(workspace: &Path, config: &AppConfig, rel_path: &str) -> Result<PathBuf> {
+    validate_rel_path(rel_path)?;
+    let src = workspace.join(rel_path);
+    let md = std::fs::symlink_metadata(&src)
+        .with_context(|| format!("File not found: {}", rel_path))?;
+    if md.file_type().is_symlink() {
+        anyhow::bail!("{} is already hidden", rel_path);
+    }
+    if !md.file_type().is_file() {
+        anyhow::bail!("{} is not a regular file", rel_path);
+    }
+    let dst_dir = config.env_files_project_dir(workspace);
+    let dst = dst_dir.join(rel_path);
+    move_and_symlink(&src, &dst)?;
+    Ok(dst)
+}
+
+/// Reverse of `hide_file`: resolve the symlink, move the real file back into
+/// the workspace, and remove the symlink. Errors if `rel_path` is not a
+/// symlink.
+pub fn unhide_file(workspace: &Path, rel_path: &str) -> Result<()> {
+    validate_rel_path(rel_path)?;
+    let src = workspace.join(rel_path);
+    let md = std::fs::symlink_metadata(&src)
+        .with_context(|| format!("File not found: {}", rel_path))?;
+    if !md.file_type().is_symlink() {
+        anyhow::bail!("{} is not hidden", rel_path);
+    }
+    let target = std::fs::read_link(&src)?;
+    let target = if target.is_absolute() {
+        target
+    } else {
+        src.parent().unwrap_or(workspace).join(target)
+    };
+    if !target.exists() {
+        anyhow::bail!(
+            "Symlink target is missing: {}. Refusing to remove the dangling symlink.",
+            target.display()
+        );
+    }
+    std::fs::remove_file(&src).context("Failed to remove workspace symlink")?;
+    if std::fs::rename(&target, &src).is_err() {
+        // Cross-device move fallback
+        std::fs::copy(&target, &src).context("Failed to copy file back into workspace")?;
+        std::fs::remove_file(&target).ok();
+    }
+    // Best-effort cleanup of now-empty parent dirs inside the env-files dir.
+    let mut parent = target.parent();
+    while let Some(p) = parent {
+        if std::fs::remove_dir(p).is_err() {
+            break;
+        }
+        parent = p.parent();
+    }
     Ok(())
 }
 
@@ -391,5 +570,169 @@ mod tests_scan {
         std::fs::write(sub.join("service-account.json"), r#"{}"#).unwrap();
         let found = scan_workspace(dir.path());
         assert_eq!(found.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod tests_env_files_management {
+    use super::*;
+    use crate::server::lifecycle::ProjectState;
+    use tempfile::TempDir;
+
+    fn temp_config(home: &Path) -> AppConfig {
+        let config_dir = home.join(".ai-pod");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        AppConfig {
+            runtime_settings: config_dir.join("runtime-settings.json"),
+            config_dir,
+            home_dir: home.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn remove_ignored_credential_removes_entry() {
+        let mut state = ProjectState::default();
+        state.add_ignored_credential(".env");
+        state.add_ignored_credential("id_rsa");
+        assert!(state.is_credential_ignored(".env"));
+        state.remove_ignored_credential(".env");
+        assert!(!state.is_credential_ignored(".env"));
+        assert!(state.is_credential_ignored("id_rsa"));
+    }
+
+    #[test]
+    fn hide_file_moves_and_symlinks() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let config = temp_config(home.path());
+
+        let src = workspace.path().join(".env");
+        std::fs::write(&src, "SECRET=123").unwrap();
+
+        let dst = hide_file(workspace.path(), &config, ".env").unwrap();
+
+        assert!(dst.exists(), "destination file should exist");
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "SECRET=123");
+
+        let md = std::fs::symlink_metadata(&src).unwrap();
+        assert!(md.file_type().is_symlink(), "workspace entry should be a symlink");
+        assert_eq!(std::fs::read_link(&src).unwrap(), dst);
+    }
+
+    #[test]
+    fn hide_file_refuses_already_hidden_file() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let config = temp_config(home.path());
+
+        let src = workspace.path().join(".env");
+        std::fs::write(&src, "SECRET=123").unwrap();
+        hide_file(workspace.path(), &config, ".env").unwrap();
+
+        let err = hide_file(workspace.path(), &config, ".env").unwrap_err();
+        assert!(err.to_string().contains("already hidden"));
+    }
+
+    #[test]
+    fn unhide_file_restores_real_file() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let config = temp_config(home.path());
+
+        let src = workspace.path().join(".env");
+        std::fs::write(&src, "SECRET=123").unwrap();
+        hide_file(workspace.path(), &config, ".env").unwrap();
+
+        unhide_file(workspace.path(), ".env").unwrap();
+
+        let md = std::fs::symlink_metadata(&src).unwrap();
+        assert!(md.file_type().is_file(), "workspace entry should be a regular file again");
+        assert_eq!(std::fs::read_to_string(&src).unwrap(), "SECRET=123");
+        let hidden = config.env_files_project_dir(workspace.path()).join(".env");
+        assert!(!hidden.exists(), "hidden file should be removed from env-files dir");
+    }
+
+    #[test]
+    fn unhide_file_refuses_regular_file() {
+        let workspace = TempDir::new().unwrap();
+        std::fs::write(workspace.path().join(".env"), "SECRET=123").unwrap();
+        let err = unhide_file(workspace.path(), ".env").unwrap_err();
+        assert!(err.to_string().contains("not hidden"));
+    }
+
+    #[test]
+    fn list_env_files_classifies_all_three_states() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let config = temp_config(home.path());
+
+        // Exposed file
+        std::fs::write(workspace.path().join(".env"), "A=1").unwrap();
+        // Ignored file
+        std::fs::write(workspace.path().join("id_rsa"), "key").unwrap();
+        // Hidden file
+        std::fs::write(workspace.path().join(".env.local"), "B=2").unwrap();
+        hide_file(workspace.path(), &config, ".env.local").unwrap();
+
+        // Mark id_rsa as ignored
+        let hash = workspace_hash(workspace.path());
+        let state_path = config.project_state_file(&hash);
+        let mut state = ProjectState::load(&state_path);
+        state.add_ignored_credential("id_rsa");
+        state.save(&state_path).unwrap();
+
+        let entries = list_env_files(workspace.path(), &config);
+        assert_eq!(entries.len(), 3);
+
+        let by_path: std::collections::HashMap<_, _> = entries
+            .iter()
+            .map(|e| (e.rel_path.clone(), e.status))
+            .collect();
+        assert_eq!(by_path[".env"], EnvFileStatus::Exposed);
+        assert_eq!(by_path["id_rsa"], EnvFileStatus::Ignored);
+        assert_eq!(by_path[".env.local"], EnvFileStatus::Hidden);
+    }
+
+    #[test]
+    fn hide_file_preserves_nested_path() {
+        // Regression: two files with the same basename in different
+        // subdirectories must NOT collide in ~/.env-files/<slug>/.
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let config = temp_config(home.path());
+
+        let a_dir = workspace.path().join("packages").join("a");
+        let b_dir = workspace.path().join("packages").join("b");
+        std::fs::create_dir_all(&a_dir).unwrap();
+        std::fs::create_dir_all(&b_dir).unwrap();
+        std::fs::write(a_dir.join(".env"), "A=1").unwrap();
+        std::fs::write(b_dir.join(".env"), "B=2").unwrap();
+
+        let dst_a = hide_file(workspace.path(), &config, "packages/a/.env").unwrap();
+        let dst_b = hide_file(workspace.path(), &config, "packages/b/.env").unwrap();
+
+        assert_ne!(dst_a, dst_b, "destinations must not collide");
+        assert_eq!(std::fs::read_to_string(&dst_a).unwrap(), "A=1");
+        assert_eq!(std::fs::read_to_string(&dst_b).unwrap(), "B=2");
+
+        // Symlinks in the workspace should still resolve to the right targets.
+        assert_eq!(std::fs::read_link(a_dir.join(".env")).unwrap(), dst_a);
+        assert_eq!(std::fs::read_link(b_dir.join(".env")).unwrap(), dst_b);
+
+        // And unhide should put each back correctly.
+        unhide_file(workspace.path(), "packages/a/.env").unwrap();
+        unhide_file(workspace.path(), "packages/b/.env").unwrap();
+        assert_eq!(std::fs::read_to_string(a_dir.join(".env")).unwrap(), "A=1");
+        assert_eq!(std::fs::read_to_string(b_dir.join(".env")).unwrap(), "B=2");
+    }
+
+    #[test]
+    fn hide_file_rejects_path_traversal() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let config = temp_config(home.path());
+        std::fs::write(workspace.path().join(".env"), "X=1").unwrap();
+        let err = hide_file(workspace.path(), &config, "../escape/.env").unwrap_err();
+        assert!(err.to_string().contains("Invalid"), "got: {}", err);
     }
 }

@@ -1,5 +1,6 @@
 use ai_pod::{
-    cli, commands_cli, config, container, credentials, image, runtime, server, update, workspace,
+    cli, commands_cli, config, container, credentials, env_files_cli, image, runtime, server,
+    update, workspace,
 };
 
 use anyhow::{Context, Result};
@@ -7,7 +8,7 @@ use clap::Parser;
 use colored::Colorize;
 use std::path::Path;
 
-use cli::{AllowedAction, Cli, Command, CommandsAction};
+use cli::{AllowedAction, Cli, Command, CommandsAction, EnvFilesAction};
 use config::AppConfig;
 use runtime::ContainerRuntime;
 
@@ -310,6 +311,29 @@ async fn main() -> Result<()> {
         }
         Some(Command::Update) => {
             update::run_update().await?;
+            return Ok(());
+        }
+        Some(Command::EnvFiles { action, workdir }) => {
+            let config = AppConfig::new()?;
+            config.init()?;
+            let ws = workdir.clone().or_else(|| cli.workdir.clone());
+            let workspace = resolve_workspace(&ws)?;
+            match action {
+                None => env_files_cli::run_tui(&config, &workspace)?,
+                Some(EnvFilesAction::List) => env_files_cli::run_list(&config, &workspace)?,
+                Some(EnvFilesAction::Hide { path }) => {
+                    env_files_cli::run_hide(&config, &workspace, path)?
+                }
+                Some(EnvFilesAction::Unhide { path }) => {
+                    env_files_cli::run_unhide(&workspace, path)?
+                }
+                Some(EnvFilesAction::Ignore { path }) => {
+                    env_files_cli::run_ignore(&config, &workspace, path)?
+                }
+                Some(EnvFilesAction::Unignore { path }) => {
+                    env_files_cli::run_unignore(&config, &workspace, path)?
+                }
+            }
             return Ok(());
         }
         Some(Command::Allowed { action }) => {
