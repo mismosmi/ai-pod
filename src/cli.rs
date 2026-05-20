@@ -102,6 +102,18 @@ pub enum Command {
         action: Option<AllowedAction>,
     },
 
+    /// Manage sensitive files in the workspace — hide them from the AI,
+    /// expose them, or silence startup warnings.
+    /// Run with no subcommand to open an interactive TUI.
+    EnvFiles {
+        #[command(subcommand)]
+        action: Option<EnvFilesAction>,
+
+        /// Workspace path (default: cwd)
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+    },
+
     /// Shadow-mount a top-level workspace directory with an isolated per-workspace volume.
     /// The masked directory inside the container is backed by a named volume instead of
     /// the host's workspace, so container-only artifacts (e.g. node_modules) don't leak out.
@@ -151,6 +163,32 @@ pub enum CommandsAction {
         command_id: String,
         #[arg(long)]
         session: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum EnvFilesAction {
+    /// Print a list of all detected sensitive files with their status
+    List,
+    /// Move a workspace file into ~/.env-files/<slug>/ and replace with a symlink
+    Hide {
+        /// Path relative to the workspace
+        path: String,
+    },
+    /// Restore a hidden file back into the workspace
+    Unhide {
+        /// Path relative to the workspace
+        path: String,
+    },
+    /// Suppress future startup warnings for a workspace file (keeps it readable by the AI)
+    Ignore {
+        /// Path relative to the workspace
+        path: String,
+    },
+    /// Re-enable startup warnings for a previously ignored file
+    Unignore {
+        /// Path relative to the workspace
+        path: String,
     },
 }
 
