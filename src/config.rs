@@ -45,7 +45,9 @@ impl AppConfig {
     /// Returns the directory for storing moved credential files for a given workspace.
     /// E.g., `/home/user/my-project` → `~/.env-files/home-user-my-project/`
     pub fn env_files_project_dir(&self, workspace: &Path) -> PathBuf {
-        let slug = workspace
+        let canonical =
+            std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+        let slug = canonical
             .to_string_lossy()
             .trim_start_matches('/')
             .replace('/', "-");

@@ -285,9 +285,6 @@ fn move_and_symlink(src: &Path, dst: &Path) -> Result<()> {
 /// `Hidden`; regular files are reported as `Exposed` or `Ignored` depending on
 /// the project state's ignore list. The result is sorted by relative path.
 pub fn list_env_files(workspace: &Path, config: &AppConfig) -> Vec<EnvFileEntry> {
-    let workspace_buf =
-        std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
-    let workspace = workspace_buf.as_path();
     let env_dir = config.env_files_project_dir(workspace);
     let hash = workspace_hash(workspace);
     let state = ProjectState::load(&config.project_state_file(&hash));
