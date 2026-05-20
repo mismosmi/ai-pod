@@ -59,6 +59,58 @@ async fn version_handler() -> Json<serde_json::Value> {
 const INSTALL_CLAUDE_SH: &str = include_str!("../../templates/install-claude.sh");
 const INSTALL_OPENCODE_SH: &str = include_str!("../../templates/install-opencode.sh");
 
+/// Stub returned when an outdated `ai-pod.Dockerfile` still tries to fetch
+/// `/host-tools`. The bundled `host-tools` binary was removed in 0.11.0 in
+/// favour of inline install scripts. Old Dockerfiles will write this script
+/// to /usr/local/bin/host-tools and then invoke `host-tools install <agent>`,
+/// which will print the upgrade instructions below and fail the build.
+const HOST_TOOLS_DEPRECATED_STUB: &str = r#"#!/bin/sh
+cat >&2 <<'EOF'
+
+================================================================================
+  ai-pod: your ai-pod.Dockerfile is out of date
+================================================================================
+
+  The `host-tools` helper binary was removed in ai-pod 0.11.0. The server no
+  longer ships it, so your Dockerfile cannot build.
+
+  To upgrade, replace your project's ai-pod.Dockerfile with the current
+  template. For a default claude pod it looks like this:
+
+    FROM rust:latest
+
+    ARG HOST_GATEWAY
+    RUN curl -fsSL "http://${HOST_GATEWAY}:7822/install/claude.sh" | bash
+
+    WORKDIR /app
+    RUN useradd -ms /bin/bash ai-pod
+    RUN chown -R ai-pod /app
+
+    RUN git config --system user.email "ai-pod@ai-pod" && \
+        git config --system user.name "ai-pod"
+
+    USER ai-pod
+    ENV PATH="/home/ai-pod/.local/bin:${PATH}"
+
+    CMD ["claude"]
+
+  Swap `claude` for `opencode` if that is the agent you use. See the project
+  README for the full template.
+
+================================================================================
+EOF
+exit 1
+"#;
+
+async fn host_tools_deprecated_handler() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
+        HOST_TOOLS_DEPRECATED_STUB,
+    )
+        .into_response()
+}
+
 async fn install_script_handler(AxumPath(name): AxumPath<String>) -> Response {
     let body = match name.as_str() {
         "claude.sh" => INSTALL_CLAUDE_SH,
@@ -126,6 +178,7 @@ pub fn build_app(state: AppState) -> Router {
     // Unthrottled: install scripts (fetched at image build time, idempotent)
     Router::new()
         .route("/install/{name}", get(install_script_handler))
+        .route("/host-tools", get(host_tools_deprecated_handler))
         .merge(rate_limited)
         .with_state(state)
 }
