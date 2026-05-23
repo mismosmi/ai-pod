@@ -649,12 +649,18 @@ pub fn launch_container(
         &opencode_config_env,
     ]);
     run_cmd.arg(image);
-    run_cmd
+    let run_status = run_cmd
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
         .context("Failed to run container")?;
+
+    // Main container has exited (cleanly or otherwise); tear down anything the
+    // agent started for this session. Best-effort: this is also covered by the
+    // server's periodic orphan sweep if the CLI was killed.
+    crate::service::cleanup_services_for_session(rt, &session_id);
+    let _ = run_status;
 
     Ok(())
 }
@@ -753,6 +759,8 @@ pub fn run_in_container(
         .stderr(Stdio::inherit())
         .status()
         .context("Failed to run command in container")?;
+
+    crate::service::cleanup_services_for_session(rt, &session_id);
 
     if !status.success() {
         anyhow::bail!("Command exited with non-zero status");
@@ -885,6 +893,9 @@ pub fn clean_container(
     for dir in &state.masked_directories {
         let _ = remove_mask_volume(rt, workspace, dir);
     }
+
+    // Remove the per-workspace service-container network if it exists.
+    crate::service::remove_service_network(rt, workspace);
 
     Ok(())
 }

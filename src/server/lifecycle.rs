@@ -38,6 +38,10 @@ pub struct ProjectState {
     pub ignored_credential_files: Vec<String>,
     #[serde(default)]
     pub masked_directories: Vec<String>,
+    /// Canonical "image with env [KEYS]" strings the user has approved for
+    /// `start_service` requests. See `commands::service_approval_key`.
+    #[serde(default)]
+    pub allowed_services: Vec<String>,
 }
 
 impl ProjectState {
@@ -106,6 +110,16 @@ impl ProjectState {
 
     pub fn remove_masked(&mut self, dir: &str) {
         self.masked_directories.retain(|d| d != dir);
+    }
+
+    pub fn is_service_allowed(&self, key: &str) -> bool {
+        self.allowed_services.iter().any(|k| k == key)
+    }
+
+    pub fn add_allowed_service(&mut self, key: &str) {
+        if !self.is_service_allowed(key) {
+            self.allowed_services.push(key.to_string());
+        }
     }
 }
 
@@ -361,6 +375,7 @@ mod tests {
             api_key: "secret".into(),
             ignored_credential_files: vec![],
             masked_directories: vec![],
+            allowed_services: vec![],
         };
         state.save(&path).unwrap();
         let perms = std::fs::metadata(&path).unwrap().permissions();
@@ -395,6 +410,7 @@ mod tests {
             api_key: "deadbeef1234567890abcdef12345678".into(),
             ignored_credential_files: vec![],
             masked_directories: vec![],
+            allowed_services: vec![],
         };
         state.save(&path).unwrap();
         let loaded = ProjectState::load(&path);
@@ -425,6 +441,39 @@ mod tests {
         state.add_allowed("npm test");
         state.add_allowed("npm test");
         assert_eq!(state.allowed_commands.len(), 1);
+    }
+
+    #[test]
+    fn service_helpers_round_trip() {
+        let mut state = ProjectState::default();
+        assert!(!state.is_service_allowed("postgres:16"));
+        state.add_allowed_service("postgres:16");
+        state.add_allowed_service("postgres:16");
+        state.add_allowed_service("redis:7");
+        assert!(state.is_service_allowed("postgres:16"));
+        assert!(state.is_service_allowed("redis:7"));
+        assert_eq!(state.allowed_services.len(), 2);
+    }
+
+    #[test]
+    fn allowed_services_default_loads_when_field_missing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy.json");
+        // Simulate a state file written by an older version (no allowed_services).
+        std::fs::write(
+            &path,
+            r#"{
+              "workspace": "/home/user/proj",
+              "allowed_commands": [],
+              "api_key": "abc",
+              "ignored_credential_files": [],
+              "masked_directories": []
+            }"#,
+        )
+        .unwrap();
+        let loaded = ProjectState::load(&path);
+        assert_eq!(loaded.workspace, "/home/user/proj");
+        assert!(loaded.allowed_services.is_empty());
     }
 
     #[test]
