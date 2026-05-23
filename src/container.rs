@@ -4,7 +4,7 @@ use dialoguer;
 use std::path::Path;
 use std::process::Stdio;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, GlobalConfig, MountSpec};
 use crate::runtime::ContainerRuntime;
 use crate::server::lifecycle::ProjectState;
 use crate::workspace::{
@@ -122,6 +122,54 @@ fn mask_mount_args(
         let vol = ensure_mask_volume(rt, workspace, image, dir)?;
         out.push("-v".to_string());
         out.push(format!("{}:/app/{}:Z", vol, dir));
+    }
+    Ok(out)
+}
+
+/// Resolve the in-container target path for a user-defined mount.
+///
+/// - If `spec.container` is set, returns it verbatim (already validated at `mount add`).
+/// - Otherwise, requires `spec.host` to be under `home_dir` and mirrors the
+///   path under `CONTAINER_HOME`. E.g. `~/.claude/skills` → `/home/ai-pod/.claude/skills`.
+pub(crate) fn resolve_container_target(spec: &MountSpec, home_dir: &Path) -> Result<String> {
+    if let Some(c) = &spec.container {
+        return Ok(c.clone());
+    }
+    let host = Path::new(&spec.host);
+    let rel = host.strip_prefix(home_dir).map_err(|_| {
+        anyhow::anyhow!(
+            "mount {} is outside $HOME; specify an explicit container path with host:container",
+            spec.host
+        )
+    })?;
+    Ok(format!("{}/{}", CONTAINER_HOME, rel.display()))
+}
+
+/// Build `-v` arg pairs for global host bind-mounts. Returned as a flat list
+/// (`-v`, `host:target:opts`, ...) ready to splice into the container run
+/// command after the workspace bind. Missing host paths are skipped with a
+/// stderr warning so a temporarily-absent host directory doesn't brick every
+/// project.
+///
+/// Uses the `:z` SELinux label (shared) to match the home-volume mount, so the
+/// host user retains access to e.g. `~/.claude/skills` after the container
+/// touches it. Read-only mounts get `:z,ro`.
+pub(crate) fn build_mount_args(home_dir: &Path, mounts: &[MountSpec]) -> Result<Vec<String>> {
+    let mut out = Vec::with_capacity(mounts.len() * 2);
+    for m in mounts {
+        let host = Path::new(&m.host);
+        if !host.exists() {
+            eprintln!(
+                "{} mount source {} does not exist; skipping",
+                "warning:".yellow().bold(),
+                m.host
+            );
+            continue;
+        }
+        let target = resolve_container_target(m, home_dir)?;
+        let opts = if m.writable { "z" } else { "z,ro" };
+        out.push("-v".to_string());
+        out.push(format!("{}:{}:{}", m.host, target, opts));
     }
     Ok(out)
 }
@@ -617,6 +665,8 @@ pub fn launch_container(
 
     let project_state = load_project_state(config, workspace);
     let mask_args = mask_mount_args(rt, workspace, image, &project_state.masked_directories)?;
+    let global = GlobalConfig::load(config);
+    let user_mount_args = build_mount_args(&config.home_dir, &global.mounts)?;
 
     let mut run_cmd = rt.command();
     run_cmd.args(["run", "--rm", "-it"]);
@@ -630,6 +680,9 @@ pub fn launch_container(
         "-v",
         &format!("{}:/app:Z", workspace_str),
     ]);
+    for arg in &user_mount_args {
+        run_cmd.arg(arg);
+    }
     for arg in &mask_args {
         run_cmd.arg(arg);
     }
@@ -707,6 +760,8 @@ pub fn run_in_container(
 
     let project_state = load_project_state(config, workspace);
     let mask_args = mask_mount_args(rt, workspace, image, &project_state.masked_directories)?;
+    let global = GlobalConfig::load(config);
+    let user_mount_args = build_mount_args(&config.home_dir, &global.mounts)?;
 
     let mut run_args: Vec<String> = vec![
         "run".into(),
@@ -721,6 +776,7 @@ pub fn run_in_container(
         "-v".into(),
         format!("{}:/app:Z", workspace_str),
     ]);
+    run_args.extend(user_mount_args);
     run_args.extend(mask_args);
     run_args.extend_from_slice(&[
         rt.add_host_arg(),
@@ -1047,5 +1103,114 @@ mod tests {
         assert_eq!(v["mcp"]["ai-pod"]["enabled"], true);
         assert_eq!(v["mcp"]["ai-pod"]["headers"]["X-Api-Key"], "k1");
         assert_eq!(v["mcp"]["ai-pod"]["headers"]["X-Ai-Pod-Session-Id"], "s2");
+    }
+
+    #[test]
+    fn resolve_container_target_uses_explicit_path() {
+        let spec = MountSpec {
+            host: "/whatever".into(),
+            container: Some("/run/secrets/key".into()),
+            writable: false,
+        };
+        let t = resolve_container_target(&spec, Path::new("/home/user")).unwrap();
+        assert_eq!(t, "/run/secrets/key");
+    }
+
+    #[test]
+    fn resolve_container_target_mirrors_home_paths() {
+        let spec = MountSpec {
+            host: "/home/user/.claude/skills".into(),
+            container: None,
+            writable: false,
+        };
+        let t = resolve_container_target(&spec, Path::new("/home/user")).unwrap();
+        assert_eq!(t, "/home/ai-pod/.claude/skills");
+    }
+
+    #[test]
+    fn resolve_container_target_errors_for_paths_outside_home() {
+        let spec = MountSpec {
+            host: "/etc/foo".into(),
+            container: None,
+            writable: false,
+        };
+        let err = resolve_container_target(&spec, Path::new("/home/user")).unwrap_err();
+        assert!(err.to_string().contains("outside $HOME"), "got: {err}");
+    }
+
+    #[test]
+    fn build_mount_args_emits_readonly_by_default() {
+        let dir = TempDir::new().unwrap();
+        let host_path = dir.path().join("skills");
+        std::fs::create_dir(&host_path).unwrap();
+        let host_str = host_path.to_string_lossy().to_string();
+        let mounts = vec![MountSpec {
+            host: host_str.clone(),
+            container: Some("/home/ai-pod/.claude/skills".into()),
+            writable: false,
+        }];
+        let args = build_mount_args(dir.path(), &mounts).unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "-v".to_string(),
+                format!("{}:/home/ai-pod/.claude/skills:z,ro", host_str),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_mount_args_emits_writable_when_flagged() {
+        let dir = TempDir::new().unwrap();
+        let host_path = dir.path().join("skills");
+        std::fs::create_dir(&host_path).unwrap();
+        let host_str = host_path.to_string_lossy().to_string();
+        let mounts = vec![MountSpec {
+            host: host_str.clone(),
+            container: Some("/home/ai-pod/.claude/skills".into()),
+            writable: true,
+        }];
+        let args = build_mount_args(dir.path(), &mounts).unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "-v".to_string(),
+                format!("{}:/home/ai-pod/.claude/skills:z", host_str),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_mount_args_resolves_home_relative_target() {
+        let dir = TempDir::new().unwrap();
+        let host_path = dir.path().join(".claude").join("skills");
+        std::fs::create_dir_all(&host_path).unwrap();
+        let host_str = host_path.to_string_lossy().to_string();
+        let mounts = vec![MountSpec {
+            host: host_str.clone(),
+            container: None,
+            writable: false,
+        }];
+        let args = build_mount_args(dir.path(), &mounts).unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "-v".to_string(),
+                format!("{}:/home/ai-pod/.claude/skills:z,ro", host_str),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_mount_args_skips_missing_host_paths() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let mounts = vec![MountSpec {
+            host: missing.to_string_lossy().to_string(),
+            container: Some("/home/ai-pod/x".into()),
+            writable: false,
+        }];
+        let args = build_mount_args(dir.path(), &mounts).unwrap();
+        assert!(args.is_empty(), "missing host path should be skipped");
     }
 }

@@ -1,6 +1,6 @@
 use ai_pod::{
-    cli, commands_cli, config, container, credentials, env_files_cli, image, runtime, server,
-    update, workspace,
+    cli, commands_cli, config, container, credentials, env_files_cli, image, mount_cli, runtime,
+    server, update, workspace,
 };
 
 use anyhow::{Context, Result};
@@ -8,7 +8,7 @@ use clap::Parser;
 use colored::Colorize;
 use std::path::Path;
 
-use cli::{AllowedAction, Cli, Command, CommandsAction, EnvFilesAction};
+use cli::{AllowedAction, Cli, Command, CommandsAction, EnvFilesAction, MountAction};
 use config::AppConfig;
 use runtime::ContainerRuntime;
 
@@ -333,6 +333,18 @@ async fn main() -> Result<()> {
                 Some(EnvFilesAction::Unignore { path }) => {
                     env_files_cli::run_unignore(&config, &workspace, path)?
                 }
+            }
+            return Ok(());
+        }
+        Some(Command::Mount { action }) => {
+            let config = AppConfig::new()?;
+            config.init()?;
+            match action {
+                MountAction::List => mount_cli::run_list(&config)?,
+                MountAction::Add { spec, writable } => {
+                    mount_cli::run_add(&config, spec, *writable)?
+                }
+                MountAction::Remove { host } => mount_cli::run_remove(&config, host)?,
             }
             return Ok(());
         }
