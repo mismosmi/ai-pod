@@ -163,6 +163,19 @@ pub(crate) fn validate_container_path(p: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve `host` through any symlink chain and return the canonical
+/// absolute path as a string. Returns `None` if the path does not exist
+/// yet (canonicalize requires every component to exist) or if resolution
+/// fails for any other reason. The intentional design point of `MountSpec`
+/// is that the *stored* host string keeps the user's literal symlink
+/// path; this helper exists so the validators and warn-list can also see
+/// where that path *actually* points.
+pub(crate) fn canonical_host(host: &str) -> Option<String> {
+    std::fs::canonicalize(host)
+        .ok()
+        .map(|p| p.display().to_string())
+}
+
 /// Re-run all validators against a stored `MountSpec`, returning the resolved
 /// container target on success. Called both at `mount add` time (via
 /// [`parse_spec`]) and at every container launch by
@@ -170,6 +183,24 @@ pub(crate) fn validate_container_path(p: &str) -> Result<()> {
 /// can't bypass the security and footgun checks.
 pub(crate) fn validate_spec(spec: &MountSpec, home_dir: &Path) -> Result<String> {
     validate_host_path(&spec.host)?;
+    // If the host source resolves through symlinks to a different path,
+    // re-run the host-side string checks against the *resolved* target so
+    // a pre-existing `~/innocent → /etc` (or `→ /`) can't slip past. The
+    // stored `MountSpec.host` is left as the literal user input by design
+    // — this only gates the security/footgun rules. Skipped when the path
+    // doesn't exist yet; launch time gets another shot.
+    if let Some(canonical) = canonical_host(&spec.host) {
+        if canonical != spec.host {
+            validate_host_path(&canonical).map_err(|e| {
+                anyhow::anyhow!(
+                    "host path {} resolves via symlinks to {}: {}",
+                    spec.host,
+                    canonical,
+                    e
+                )
+            })?;
+        }
+    }
     if let Some(c) = &spec.container {
         validate_container_path(c)?;
     } else {
@@ -201,8 +232,25 @@ pub(crate) fn validate_spec(spec: &MountSpec, home_dir: &Path) -> Result<String>
 /// This is the place to teach ai-pod about new risky paths — every entry
 /// becomes an interactive confirmation gate at `mount add` time.
 pub(crate) fn warn_for_spec(spec: &MountSpec, target: &str, home_dir: &Path) -> Vec<String> {
+    let mut out = collect_host_warnings(&spec.host, target, home_dir);
+    if let Some(canonical) = canonical_host(&spec.host) {
+        if canonical != spec.host {
+            for w in collect_host_warnings(&canonical, target, home_dir) {
+                let tagged = format!(
+                    "[host {} resolves via symlinks to {}] {}",
+                    spec.host, canonical, w
+                );
+                if !out.iter().any(|existing| existing == &tagged) {
+                    out.push(tagged);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn collect_host_warnings(host: &str, target: &str, home_dir: &Path) -> Vec<String> {
     let mut out = Vec::new();
-    let host = spec.host.as_str();
 
     // 1. Well-known credential dirs / files under $HOME. These are the
     //    obvious sources of host-wide compromise if exposed to the agent.
@@ -244,6 +292,14 @@ pub(crate) fn warn_for_spec(spec: &MountSpec, target: &str, home_dir: &Path) -> 
         "/root",
         "/var/lib/docker",
         "/var/lib/containers",
+        // macOS canonicalizes /etc → /private/etc, /var/run → /private/var/run,
+        // /tmp → /private/tmp. Include the resolved forms so the
+        // symlink-resolution path of `warn_for_spec` lights up the same way
+        // as on Linux.
+        "/private/etc",
+        "/private/var/run",
+        "/private/var/lib/docker",
+        "/private/var/lib/containers",
     ];
     for sys in system_prefixes {
         if host == sys || host.starts_with(&format!("{}/", sys)) {
@@ -835,6 +891,52 @@ mod tests {
                 w
             );
         }
+    }
+
+    #[test]
+    fn validate_spec_rejects_symlink_to_filesystem_root() {
+        // The original #1 bypass: a `mount add ~/innocent` where the
+        // host path is itself a symlink to `/`. Without canonical-host
+        // re-validation this would have been accepted and podman would
+        // bind-mount the entire host filesystem.
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        let link = dir.path().join("innocent");
+        symlink("/", &link).unwrap();
+        let spec = MountSpec {
+            host: link.display().to_string(),
+            container: Some("/home/ai-pod/innocent".into()),
+            writable: false,
+        };
+        let err = validate_spec(&spec, dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("resolves via symlinks to"),
+            "expected canonical-resolved rejection, got: {}",
+            err
+        );
+        assert!(err.to_string().contains("filesystem root"), "got: {}", err);
+    }
+
+    #[test]
+    fn warn_fires_when_symlink_resolves_to_system_path() {
+        // `~/notes → /etc`: warn-list must look through the symlink, not
+        // just the literal path string.
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        let link = dir.path().join("notes");
+        symlink("/etc", &link).unwrap();
+        let spec = MountSpec {
+            host: link.display().to_string(),
+            container: Some("/home/ai-pod/notes".into()),
+            writable: false,
+        };
+        let w = warn_for_spec(&spec, "/home/ai-pod/notes", dir.path());
+        assert!(
+            w.iter().any(|m| m.contains("resolves via symlinks to")
+                && m.contains("system path")),
+            "expected canonical-tagged system-path warning, got: {:?}",
+            w
+        );
     }
 
     #[test]
