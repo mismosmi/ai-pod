@@ -15,33 +15,66 @@ const CONTAINER_HOME: &str = "/home/ai-pod";
 const RESERVED_CONTAINER_PREFIXES: &[&str] =
     &["/proc", "/sys", "/dev", "/etc", "/tmp", "/run", "/var/run"];
 
+/// Exact container paths that ai-pod itself seeds into the home volume
+/// (see `seed_home_volume` in container.rs). Mounting a host path on top of
+/// any of these would silently replace ai-pod's Stop hook / MCP wiring /
+/// opencode plugin and produce a container that looks fine but no longer
+/// communicates with the host. Sub-paths are allowed (e.g.
+/// `/home/ai-pod/.claude/skills` is the advertised use case).
+const SEEDED_CONTAINER_TARGETS: &[&str] = &[
+    "/home/ai-pod/.claude",
+    "/home/ai-pod/.config/opencode/plugins",
+];
+
 /// Parse a user-provided `host[:container]` spec. The host portion is
-/// tilde-expanded against `home_dir`.
+/// tilde-expanded against `home_dir`; both halves are normalized (trailing
+/// slashes trimmed) before validation so dedup and the seeded-path /
+/// reserved-prefix checks can't be bypassed by writing `~/x/` vs `~/x` or
+/// `/home/ai-pod/` vs `/home/ai-pod`.
 pub(crate) fn parse_spec(s: &str, writable: bool, home_dir: &Path) -> Result<MountSpec> {
-    let (host_raw, container) = match s.split_once(':') {
-        Some((h, c)) => (h, Some(c.to_string())),
+    let (host_raw, container_raw) = match s.split_once(':') {
+        Some((h, c)) => (h, Some(c)),
         None => (s, None),
     };
-    let host = expand_tilde(host_raw, home_dir);
-    validate_host_path(&host)?;
-    if let Some(c) = &container {
-        validate_container_path(c)?;
-    }
-    Ok(MountSpec {
+    let host = normalize_host(host_raw, home_dir);
+    let container = container_raw.map(normalize_container);
+    let spec = MountSpec {
         host,
         container,
         writable,
-    })
+    };
+    validate_spec(&spec, home_dir)?;
+    Ok(spec)
 }
 
-pub(crate) fn expand_tilde(s: &str, home_dir: &Path) -> String {
-    if s == "~" {
-        return home_dir.display().to_string();
+/// Expand a leading `~` / `~/` against `home_dir` and strip any trailing
+/// slashes. Used as the single normalization point for both `mount add` and
+/// `mount remove` so they look at exactly the same string.
+pub(crate) fn normalize_host(s: &str, home_dir: &Path) -> String {
+    let expanded = if s == "~" {
+        home_dir.display().to_string()
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        home_dir.join(rest).display().to_string()
+    } else {
+        s.to_string()
+    };
+    trim_trailing_slashes(&expanded)
+}
+
+pub(crate) fn normalize_container(s: &str) -> String {
+    trim_trailing_slashes(s)
+}
+
+fn trim_trailing_slashes(s: &str) -> String {
+    let trimmed = s.trim_end_matches('/');
+    if trimmed.is_empty() {
+        // Preserve "/" so the host-root check in `validate_host_path` can
+        // reject it explicitly rather than producing a misleading
+        // "must not be empty" error.
+        "/".to_string()
+    } else {
+        trimmed.to_string()
     }
-    if let Some(rest) = s.strip_prefix("~/") {
-        return home_dir.join(rest).display().to_string();
-    }
-    s.to_string()
 }
 
 pub(crate) fn validate_host_path(p: &str) -> Result<()> {
@@ -51,6 +84,19 @@ pub(crate) fn validate_host_path(p: &str) -> Result<()> {
     if p.contains('\0') {
         anyhow::bail!("Host path must not contain null bytes");
     }
+    if p.contains(':') {
+        // The `-v` arg uses `:` to separate host:container:opts. A host path
+        // with a `:` either smuggles in mount options (e.g. host
+        // `/x:rw,suid`) or is silently truncated to the first colon, both
+        // of which surprise the user.
+        anyhow::bail!("Host path must not contain ':' (collides with -v separator)");
+    }
+    if p == "/" {
+        anyhow::bail!(
+            "Host path '/' (filesystem root) is not allowed; mounting it would expose \
+             the entire host filesystem to the container"
+        );
+    }
     let path = Path::new(p);
     if !path.is_absolute() {
         anyhow::bail!(
@@ -58,7 +104,10 @@ pub(crate) fn validate_host_path(p: &str) -> Result<()> {
             p
         );
     }
-    if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         anyhow::bail!("Host path must not contain '..' segments");
     }
     Ok(())
@@ -71,11 +120,17 @@ pub(crate) fn validate_container_path(p: &str) -> Result<()> {
     if p.contains('\0') {
         anyhow::bail!("Container path must not contain null bytes");
     }
+    if p.contains(':') {
+        anyhow::bail!("Container path must not contain ':' (collides with -v separator)");
+    }
     let path = Path::new(p);
     if !path.is_absolute() {
         anyhow::bail!("Container path must be absolute (got {})", p);
     }
-    if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         anyhow::bail!("Container path must not contain '..' segments");
     }
     if p == "/" {
@@ -95,17 +150,34 @@ pub(crate) fn validate_container_path(p: &str) -> Result<()> {
             anyhow::bail!("Container target {} is reserved", p);
         }
     }
+    for seeded in SEEDED_CONTAINER_TARGETS {
+        if p == *seeded {
+            anyhow::bail!(
+                "Container target {} is seeded by ai-pod and would silently shadow \
+                 the in-container settings. Mount a sub-path instead (e.g. {}/skills).",
+                p,
+                p
+            );
+        }
+    }
     Ok(())
 }
 
-pub fn run_add(config: &AppConfig, spec_str: &str, writable: bool) -> Result<()> {
-    let spec = parse_spec(spec_str, writable, &config.home_dir)?;
-
-    // If no explicit container path is given, ensure host is under $HOME so
-    // the launch-time resolver won't fail later.
-    if spec.container.is_none() {
+/// Re-run all validators against a stored `MountSpec`, returning the resolved
+/// container target on success. Called both at `mount add` time (via
+/// [`parse_spec`]) and at every container launch by
+/// `container::build_mount_args` so that a hand-edited `~/.ai-pod/config.json`
+/// can't bypass the security and footgun checks.
+pub(crate) fn validate_spec(spec: &MountSpec, home_dir: &Path) -> Result<String> {
+    validate_host_path(&spec.host)?;
+    if let Some(c) = &spec.container {
+        validate_container_path(c)?;
+    } else {
+        // Auto-mode: host must be under $HOME so the resolver can mirror it.
+        // We check here (in addition to inside `resolve_container_target`)
+        // so the error is actionable at `mount add` time.
         let host = Path::new(&spec.host);
-        if host.strip_prefix(&config.home_dir).is_err() {
+        if host.strip_prefix(home_dir).is_err() {
             anyhow::bail!(
                 "Host path {} is outside $HOME. Supply an explicit container path: \
                  ai-pod mount add {}:<container-path>",
@@ -114,16 +186,58 @@ pub fn run_add(config: &AppConfig, spec_str: &str, writable: bool) -> Result<()>
             );
         }
     }
+    let target = crate::container::resolve_container_target(spec, home_dir)?;
+    // Re-validate the *resolved* target so the seeded-path / reserved /
+    // /home/ai-pod-root checks apply to auto-mode mounts too — e.g.
+    // `mount add ~/.claude` resolves to `/home/ai-pod/.claude` and gets
+    // rejected as a seeded prefix.
+    validate_container_path(&target)?;
+    Ok(target)
+}
+
+pub fn run_add(config: &AppConfig, spec_str: &str, writable: bool) -> Result<()> {
+    let spec = parse_spec(spec_str, writable, &config.home_dir)?;
+    let target = crate::container::resolve_container_target(&spec, &config.home_dir)?;
 
     let mut gc = GlobalConfig::load(config);
-    if !gc.add(spec.clone()) {
+
+    if let Some(existing) = gc.mounts.iter().find(|m| m.host == spec.host) {
+        if existing.writable != spec.writable {
+            anyhow::bail!(
+                "{} is already mounted as {}. Run `ai-pod mount remove {}` first, \
+                 then re-add{}.",
+                spec.host,
+                if existing.writable { "rw" } else { "ro" },
+                spec.host,
+                if spec.writable { " with --writable" } else { "" }
+            );
+        }
         println!("{} {}", "Already mounted:".yellow(), spec.host);
         return Ok(());
     }
+
+    for existing in &gc.mounts {
+        let existing_target = match crate::container::resolve_container_target(
+            existing,
+            &config.home_dir,
+        ) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if existing_target == target {
+            anyhow::bail!(
+                "Container target {} is already used by mount {}; pick a different \
+                 container path with `ai-pod mount add {}:<other-path>`.",
+                target,
+                existing.host,
+                spec.host
+            );
+        }
+    }
+
+    gc.add(spec.clone());
     gc.save(config)?;
 
-    let target = crate::container::resolve_container_target(&spec, &config.home_dir)
-        .unwrap_or_else(|_| "(invalid)".to_string());
     println!(
         "{} {} → {} ({})",
         "Mounted:".green().bold(),
@@ -132,19 +246,19 @@ pub fn run_add(config: &AppConfig, spec_str: &str, writable: bool) -> Result<()>
         if spec.writable { "rw" } else { "ro" }
     );
 
-    warn_if_unreadable(&spec)?;
+    warn_if_unreadable(&spec);
     Ok(())
 }
 
 pub fn run_remove(config: &AppConfig, host: &str) -> Result<()> {
-    let expanded = expand_tilde(host, &config.home_dir);
+    let normalized = normalize_host(host, &config.home_dir);
     let mut gc = GlobalConfig::load(config);
-    if !gc.remove(&expanded) {
-        println!("{} {}", "Not mounted:".yellow(), expanded);
+    if !gc.remove(&normalized) {
+        println!("{} {}", "Not mounted:".yellow(), normalized);
         return Ok(());
     }
     gc.save(config)?;
-    println!("{} {}", "Unmounted:".green().bold(), expanded);
+    println!("{} {}", "Unmounted:".green().bold(), normalized);
     Ok(())
 }
 
@@ -162,7 +276,7 @@ pub fn run_list(config: &AppConfig) -> Result<()> {
         let target = crate::container::resolve_container_target(m, &config.home_dir)
             .unwrap_or_else(|_| "(invalid)".to_string());
         let mode = if m.writable { "rw" } else { "ro" };
-        let exists = if Path::new(&m.host).exists() {
+        let exists = if Path::new(&m.host).symlink_metadata().is_ok() {
             ""
         } else {
             "  (missing — will be skipped at launch)"
@@ -172,21 +286,21 @@ pub fn run_list(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
-/// One-line warning for `mount add` when the host file is mode-restricted in a
-/// way that the in-container `ai-pod` user is unlikely to be able to read it.
-/// Best-effort; silent on any error.
-fn warn_if_unreadable(spec: &MountSpec) -> Result<()> {
+/// One-line warning for `mount add` when the host file is mode-restricted in
+/// a way that the in-container `ai-pod` user is unlikely to be able to read
+/// it. Best-effort; silent on any error.
+fn warn_if_unreadable(spec: &MountSpec) {
     let path = Path::new(&spec.host);
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
-        Err(_) => return Ok(()),
+        Err(_) => return,
     };
     if !meta.is_file() {
-        return Ok(());
+        return;
     }
     let mode = meta.permissions().mode() & 0o777;
     if mode & 0o004 != 0 {
-        return Ok(());
+        return;
     }
     eprintln!(
         "{} {} has mode {:o}; the container user may not be able to read it under \
@@ -196,7 +310,6 @@ fn warn_if_unreadable(spec: &MountSpec) -> Result<()> {
         mode,
         spec.host
     );
-    Ok(())
 }
 
 #[cfg(test)]
@@ -204,11 +317,23 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn make_config(home: &Path) -> AppConfig {
+        let config_dir = home.join(".ai-pod");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        AppConfig {
+            runtime_settings: config_dir.join("runtime-settings.json"),
+            config_dir,
+            home_dir: home.to_path_buf(),
+        }
+    }
+
     #[test]
     fn parse_spec_host_only() {
         let dir = TempDir::new().unwrap();
-        let spec = parse_spec("/abs/path", false, dir.path()).unwrap();
-        assert_eq!(spec.host, "/abs/path");
+        std::fs::create_dir_all(dir.path().join("abs/path")).unwrap();
+        let host = dir.path().join("abs/path");
+        let spec = parse_spec(&host.display().to_string(), false, dir.path()).unwrap();
+        assert_eq!(spec.host, host.display().to_string());
         assert_eq!(spec.container, None);
         assert!(!spec.writable);
     }
@@ -263,7 +388,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         for r in ["/proc", "/proc/sys", "/sys", "/dev/null", "/etc/passwd"] {
             let err = parse_spec(&format!("/host:{}", r), false, dir.path()).unwrap_err();
-            assert!(err.to_string().contains("reserved"), "target {} should be reserved", r);
+            assert!(
+                err.to_string().contains("reserved"),
+                "target {} should be reserved",
+                r
+            );
         }
     }
 
@@ -282,25 +411,121 @@ mod tests {
     }
 
     #[test]
-    fn expand_tilde_only_at_start() {
+    fn parse_spec_rejects_filesystem_root_host() {
+        let dir = TempDir::new().unwrap();
+        let err = parse_spec("/:/host", false, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("filesystem root"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_spec_rejects_filesystem_root_host_alone() {
+        let dir = TempDir::new().unwrap();
+        let err = parse_spec("/", false, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("filesystem root"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_spec_rejects_colon_smuggling_in_container() {
+        // `split_once(':')` puts everything after the first colon into the
+        // container portion, so this would otherwise smuggle `rw,suid` into
+        // the podman -v opts.
+        let dir = TempDir::new().unwrap();
+        let err = parse_spec("/tmp/x:/foo:rw,suid", false, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("':'"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_spec_normalizes_trailing_slash_in_host() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let spec = parse_spec("~/x/", false, home).unwrap();
+        assert_eq!(spec.host, home.join("x").display().to_string());
+        assert!(!spec.host.ends_with('/'));
+    }
+
+    #[test]
+    fn parse_spec_normalizes_trailing_slash_in_container() {
+        let dir = TempDir::new().unwrap();
+        let spec = parse_spec("/host:/foo/bar/", false, dir.path()).unwrap();
+        assert_eq!(spec.container.as_deref(), Some("/foo/bar"));
+    }
+
+    #[test]
+    fn parse_spec_rejects_trailing_slash_bypass_of_container_home() {
+        let dir = TempDir::new().unwrap();
+        // Without normalization, "/home/ai-pod/" would slip past the
+        // `p == CONTAINER_HOME` exact-match check.
+        let err = parse_spec("/host:/home/ai-pod/", false, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("home volume"));
+    }
+
+    #[test]
+    fn parse_spec_rejects_trailing_slash_bypass_of_app() {
+        let dir = TempDir::new().unwrap();
+        let err = parse_spec("/host:/app/", false, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("/app"));
+    }
+
+    #[test]
+    fn parse_spec_rejects_trailing_slash_bypass_of_reserved() {
+        let dir = TempDir::new().unwrap();
+        let err = parse_spec("/host:/etc/", false, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("reserved"));
+    }
+
+    #[test]
+    fn parse_spec_rejects_seeded_dot_claude() {
+        let dir = TempDir::new().unwrap();
+        let err = parse_spec("/host:/home/ai-pod/.claude", false, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("seeded"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_spec_rejects_seeded_opencode_plugins() {
+        let dir = TempDir::new().unwrap();
+        let err = parse_spec(
+            "/host:/home/ai-pod/.config/opencode/plugins",
+            false,
+            dir.path(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("seeded"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_spec_rejects_auto_mode_dot_claude() {
+        // `~/.claude` in auto-mode resolves to `/home/ai-pod/.claude`, which
+        // is a seeded prefix. Without re-validating the resolved target,
+        // this would silently shadow the Stop hook + MCP wiring.
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        let err = parse_spec("~/.claude", false, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("seeded"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_spec_rejects_auto_mode_home_root() {
+        // `mount add ~` resolves to `/home/ai-pod`, shadowing the home volume.
+        let dir = TempDir::new().unwrap();
+        let err = parse_spec("~", false, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("home volume"), "got: {err}");
+    }
+
+    #[test]
+    fn normalize_host_only_at_start() {
         let home = Path::new("/H");
-        assert_eq!(expand_tilde("~", home), "/H");
-        assert_eq!(expand_tilde("~/foo", home), "/H/foo");
-        assert_eq!(expand_tilde("/abs/~/foo", home), "/abs/~/foo");
-        assert_eq!(expand_tilde("/abs", home), "/abs");
+        assert_eq!(normalize_host("~", home), "/H");
+        assert_eq!(normalize_host("~/foo", home), "/H/foo");
+        assert_eq!(normalize_host("~/foo/", home), "/H/foo");
+        assert_eq!(normalize_host("/abs/~/foo", home), "/abs/~/foo");
+        assert_eq!(normalize_host("/abs", home), "/abs");
+        assert_eq!(normalize_host("/", home), "/");
     }
 
     #[test]
     fn run_add_rejects_no_container_outside_home() {
         let dir = TempDir::new().unwrap();
-        let home = dir.path().to_path_buf();
-        let config_dir = home.join(".ai-pod");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let config = AppConfig {
-            runtime_settings: config_dir.join("runtime-settings.json"),
-            config_dir,
-            home_dir: home,
-        };
+        let config = make_config(dir.path());
         let err = run_add(&config, "/etc/foo", false).unwrap_err();
         assert!(err.to_string().contains("outside $HOME"));
     }
@@ -308,27 +533,20 @@ mod tests {
     #[test]
     fn run_add_and_remove_round_trip() {
         let dir = TempDir::new().unwrap();
-        let home = dir.path().to_path_buf();
-        let config_dir = home.join(".ai-pod");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let config = AppConfig {
-            runtime_settings: config_dir.join("runtime-settings.json"),
-            config_dir,
-            home_dir: home.clone(),
-        };
-        std::fs::create_dir_all(home.join(".claude/skills")).unwrap();
+        let config = make_config(dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude/skills")).unwrap();
 
         run_add(&config, "~/.claude/skills", false).unwrap();
         let gc = GlobalConfig::load(&config);
         assert_eq!(gc.mounts.len(), 1);
         assert_eq!(
             gc.mounts[0].host,
-            home.join(".claude/skills").display().to_string()
+            dir.path().join(".claude/skills").display().to_string()
         );
 
         run_remove(
             &config,
-            &home.join(".claude/skills").display().to_string(),
+            &dir.path().join(".claude/skills").display().to_string(),
         )
         .unwrap();
         let gc = GlobalConfig::load(&config);
@@ -336,22 +554,64 @@ mod tests {
     }
 
     #[test]
-    fn run_add_dedups_by_host() {
+    fn run_remove_normalizes_trailing_slash() {
+        // Symmetric with parse_spec normalization: a user who types
+        // `~/x/` for `mount remove` should find the entry stored as `~/x`.
         let dir = TempDir::new().unwrap();
-        let home = dir.path().to_path_buf();
-        let config_dir = home.join(".ai-pod");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let config = AppConfig {
-            runtime_settings: config_dir.join("runtime-settings.json"),
-            config_dir,
-            home_dir: home.clone(),
-        };
-        std::fs::create_dir_all(home.join(".claude/skills")).unwrap();
+        let config = make_config(dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude/skills")).unwrap();
+        run_add(&config, "~/.claude/skills", false).unwrap();
+
+        run_remove(&config, "~/.claude/skills/").unwrap();
+        let gc = GlobalConfig::load(&config);
+        assert!(gc.mounts.is_empty(), "remove should find the entry");
+    }
+
+    #[test]
+    fn run_add_dedups_by_host_when_writable_matches() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config(dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude/skills")).unwrap();
 
         run_add(&config, "~/.claude/skills", false).unwrap();
-        run_add(&config, "~/.claude/skills", true).unwrap();
+        run_add(&config, "~/.claude/skills", false).unwrap();
         let gc = GlobalConfig::load(&config);
         assert_eq!(gc.mounts.len(), 1, "duplicate host should not be added");
-        assert!(!gc.mounts[0].writable, "first add wins");
+        assert!(!gc.mounts[0].writable);
+    }
+
+    #[test]
+    fn run_add_errors_on_writable_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config(dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude/skills")).unwrap();
+
+        run_add(&config, "~/.claude/skills", false).unwrap();
+        let err = run_add(&config, "~/.claude/skills", true).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("already mounted"), "got: {msg}");
+        assert!(msg.contains("remove"), "should hint to remove first: {msg}");
+
+        let gc = GlobalConfig::load(&config);
+        assert_eq!(gc.mounts.len(), 1);
+        assert!(!gc.mounts[0].writable, "stored entry should be unchanged");
+    }
+
+    #[test]
+    fn run_add_rejects_colliding_container_target() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config(dir.path());
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        let a = dir.path().join("a").display().to_string();
+        let b = dir.path().join("b").display().to_string();
+
+        run_add(&config, &format!("{}:/home/ai-pod/shared", a), false).unwrap();
+        let err = run_add(&config, &format!("{}:/home/ai-pod/shared", b), false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("already used"), "got: {msg}");
+
+        let gc = GlobalConfig::load(&config);
+        assert_eq!(gc.mounts.len(), 1, "colliding mount should not be stored");
     }
 }

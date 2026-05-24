@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub struct AppConfig {
@@ -79,6 +79,11 @@ impl GlobalConfig {
         file.write_all(json.as_bytes())
             .context("Failed to write global config contents")?;
         std::fs::rename(&tmp, &path).context("Failed to rename global config")?;
+        // `.mode(0o600)` only takes effect on O_CREAT; a stale tmp from a
+        // crashed earlier run keeps its old mode through truncate. Re-apply
+        // explicitly so the rename target is always 0o600.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .context("Failed to set permissions on global config")?;
         Ok(())
     }
 
@@ -315,5 +320,29 @@ mod tests {
         std::fs::write(GlobalConfig::path(&config), "{not valid json").unwrap();
         let loaded = GlobalConfig::load(&config);
         assert!(loaded.mounts.is_empty());
+    }
+
+    #[test]
+    fn global_config_save_overwrites_stale_tmp_with_0o600() {
+        // Simulate a stale tmp file from a crashed earlier save with
+        // permissive bits. The `.mode(0o600)` on OpenOptions only takes
+        // effect on O_CREAT, so without the explicit set_permissions after
+        // rename the final file would inherit the looser mode.
+        let dir = TempDir::new().unwrap();
+        let config = temp_config(&dir);
+        config.init().unwrap();
+        let tmp = GlobalConfig::path(&config).with_extension("tmp");
+        std::fs::write(&tmp, "stale").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let gc = GlobalConfig::default();
+        gc.save(&config).unwrap();
+
+        let mode = std::fs::metadata(GlobalConfig::path(&config))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "save must enforce 0o600 even over a stale tmp");
     }
 }

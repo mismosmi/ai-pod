@@ -142,6 +142,14 @@ pub(crate) fn resolve_container_target(spec: &MountSpec, home_dir: &Path) -> Res
             spec.host
         )
     })?;
+    if rel.as_os_str().is_empty() {
+        // host == home_dir → "/home/ai-pod/" would mount on top of the seeded
+        // home volume root, hiding .claude/settings.json, .claude.json, etc.
+        anyhow::bail!(
+            "mount {} resolves to the home volume root; mount a sub-path instead",
+            spec.host
+        );
+    }
     Ok(format!("{}/{}", CONTAINER_HOME, rel.display()))
 }
 
@@ -157,8 +165,26 @@ pub(crate) fn resolve_container_target(spec: &MountSpec, home_dir: &Path) -> Res
 pub(crate) fn build_mount_args(home_dir: &Path, mounts: &[MountSpec]) -> Result<Vec<String>> {
     let mut out = Vec::with_capacity(mounts.len() * 2);
     for m in mounts {
-        let host = Path::new(&m.host);
-        if !host.exists() {
+        // Re-validate against the current $HOME and the current rule set so
+        // a stale or hand-edited `~/.ai-pod/config.json` can't bypass the
+        // checks. Failures warn-and-skip so one bad entry doesn't brick
+        // every launch.
+        let target = match crate::mount_cli::validate_spec(m, home_dir) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "{} mount {}: {}; skipping",
+                    "warning:".yellow().bold(),
+                    m.host,
+                    e
+                );
+                continue;
+            }
+        };
+        // symlink_metadata so a dangling symlink (target temporarily missing)
+        // still counts as present — `MountSpec`'s doc comment says symlinks
+        // are intentionally not resolved.
+        if Path::new(&m.host).symlink_metadata().is_err() {
             eprintln!(
                 "{} mount source {} does not exist; skipping",
                 "warning:".yellow().bold(),
@@ -166,7 +192,6 @@ pub(crate) fn build_mount_args(home_dir: &Path, mounts: &[MountSpec]) -> Result<
             );
             continue;
         }
-        let target = resolve_container_target(m, home_dir)?;
         let opts = if m.writable { "z" } else { "z,ro" };
         out.push("-v".to_string());
         out.push(format!("{}:{}:{}", m.host, target, opts));
@@ -1212,5 +1237,69 @@ mod tests {
         }];
         let args = build_mount_args(dir.path(), &mounts).unwrap();
         assert!(args.is_empty(), "missing host path should be skipped");
+    }
+
+    #[test]
+    fn resolve_container_target_rejects_home_root() {
+        // mount add ~ → empty rel → would produce "/home/ai-pod/" and
+        // shadow the seeded volume.
+        let spec = MountSpec {
+            host: "/home/user".into(),
+            container: None,
+            writable: false,
+        };
+        let err = resolve_container_target(&spec, Path::new("/home/user")).unwrap_err();
+        assert!(err.to_string().contains("home volume root"), "got: {err}");
+    }
+
+    #[test]
+    fn build_mount_args_warn_skips_outside_home_when_no_container() {
+        // Regression for the "stored mount bricks every launch" issue:
+        // a hand-synced config.json where `container == None` and `host`
+        // falls outside the *current* $HOME must not error — it should
+        // warn-skip like a missing host.
+        let dir = TempDir::new().unwrap();
+        let outside = dir.path().join("..").join("outside");
+        let mounts = vec![MountSpec {
+            host: outside.display().to_string(),
+            container: None,
+            writable: false,
+        }];
+        let args = build_mount_args(dir.path(), &mounts).unwrap();
+        assert!(args.is_empty(), "invalid stored mount should be skipped");
+    }
+
+    #[test]
+    fn build_mount_args_warn_skips_invalid_stored_spec() {
+        // A spec that would have been rejected at `mount add` (here: `/` as
+        // host) but got past validation via hand-edited config.json must be
+        // dropped at launch.
+        let dir = TempDir::new().unwrap();
+        let mounts = vec![MountSpec {
+            host: "/".into(),
+            container: Some("/home/ai-pod/exploit".into()),
+            writable: false,
+        }];
+        let args = build_mount_args(dir.path(), &mounts).unwrap();
+        assert!(args.is_empty(), "stored invalid host should be warn-skipped");
+    }
+
+    #[test]
+    fn build_mount_args_keeps_dangling_symlinks() {
+        // MountSpec doc explicitly says symlinks are not resolved, so a
+        // symlink whose target is temporarily missing should still mount.
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        let link = dir.path().join("link-to-nothing");
+        symlink(dir.path().join("does-not-exist"), &link).unwrap();
+        let host_str = link.to_string_lossy().to_string();
+        let mounts = vec![MountSpec {
+            host: host_str.clone(),
+            container: Some("/home/ai-pod/.claude/skills".into()),
+            writable: false,
+        }];
+        let args = build_mount_args(dir.path(), &mounts).unwrap();
+        assert_eq!(args.len(), 2, "dangling symlink should still mount");
+        assert!(args[1].starts_with(&host_str));
     }
 }
