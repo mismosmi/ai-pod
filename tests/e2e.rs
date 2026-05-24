@@ -589,3 +589,259 @@ async fn e2e_server_reachable_from_container() {
 // Agent install tests (claude + opencode across all base images) are in
 // tests/e2e_agents.sh — a shell script that exercises `ai-pod init` for
 // every agent × image combination and verifies the agent binary runs.
+
+// ---------------------------------------------------------------------------
+// Service container tests
+// ---------------------------------------------------------------------------
+
+use ai_pod::service;
+
+fn cleanup_network(rt: &ContainerRuntime, name: &str) {
+    let _ = rt.command().args(["network", "rm", "-f", name]).output();
+}
+
+/// Stand up a fake "main" container (sleeping) named like an ai-pod container
+/// so the service module's helpers can find it.
+fn start_fake_main(rt: &ContainerRuntime, workspace: &Path, session_id: &str) -> String {
+    let name = workspace::container_name_for(workspace, session_id);
+    let img = SERVICE_TEST_IMAGE;
+    let _ = rt.command().args(["pull", img]).output();
+    let status = rt
+        .command()
+        .args([
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            &name,
+            "--label",
+            "managed-by=ai-pod",
+            img,
+            "sleep",
+            "600",
+        ])
+        .output()
+        .expect("spawn fake main");
+    assert!(
+        status.status.success(),
+        "fake main container failed to start: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    name
+}
+
+/// Container image used by the service e2e tests. Picked because the sandbox
+/// only allows the Microsoft Container Registry; Docker Hub's CDN is blocked.
+/// The image just needs `sh` and `sleep`/`getent` for the assertions below.
+const SERVICE_TEST_IMAGE: &str = "mcr.microsoft.com/cbl-mariner/base/core:2.0";
+
+/// `ensure_service_network` creates the network when missing and is idempotent.
+#[test]
+fn e2e_service_network_create_idempotent() {
+    let rt = require_runtime!();
+    let ws_dir = tempfile::TempDir::new().unwrap();
+    let workspace = ws_dir.path();
+    let net = workspace::service_network_name(workspace);
+    cleanup_network(&rt, &net);
+
+    let n1 = service::ensure_service_network(&rt, workspace).unwrap();
+    let n2 = service::ensure_service_network(&rt, workspace).unwrap();
+    assert_eq!(n1, net);
+    assert_eq!(n2, net);
+
+    let status = rt
+        .command()
+        .args(["network", "inspect", &net])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "network should exist after ensure");
+
+    cleanup_network(&rt, &net);
+}
+
+/// Start a service container, verify the main container can reach it by name,
+/// then tear it down via `cleanup_services_for_session`.
+#[test]
+fn e2e_service_start_reach_cleanup() {
+    let rt = require_runtime!();
+    let ws_dir = tempfile::TempDir::new().unwrap();
+    let workspace = ws_dir.path();
+    let session_id = "e2etest0";
+    let net = workspace::service_network_name(workspace);
+    let main_name = workspace::container_name_for(workspace, session_id);
+    let svc_container = workspace::service_container_name(workspace, session_id, "db");
+
+    cleanup_container(&rt, &main_name);
+    cleanup_container(&rt, &svc_container);
+    cleanup_network(&rt, &net);
+
+    let _ = start_fake_main(&rt, workspace, session_id);
+
+    let started = service::start_service(
+        &rt,
+        workspace,
+        session_id,
+        SERVICE_TEST_IMAGE,
+        "db",
+        &[("MARKER".to_string(), "hello".to_string())],
+        &["sleep".into(), "600".into()],
+    )
+    .expect("start_service");
+    assert_eq!(started.host, "db");
+    assert_eq!(started.container_name, svc_container);
+
+    // Verify the service has the right labels.
+    let inspect = rt
+        .command()
+        .args([
+            "inspect",
+            "--format",
+            "{{.Config.Labels}}",
+            &svc_container,
+        ])
+        .output()
+        .unwrap();
+    let labels = String::from_utf8_lossy(&inspect.stdout);
+    assert!(labels.contains("ai-pod-service:true"), "labels: {labels}");
+    assert!(
+        labels.contains(&format!("ai-pod-parent:{session_id}")),
+        "labels: {labels}"
+    );
+
+    // The main container should now resolve `db` to the service's IP via
+    // docker's embedded DNS on the per-workspace network. Retry briefly to
+    // give the DNS record time to propagate after `network connect`.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut resolved = false;
+    let mut last_output = String::new();
+    while std::time::Instant::now() < deadline {
+        let out = rt
+            .command()
+            .args(["exec", &main_name, "getent", "hosts", "db"])
+            .output();
+        if let Ok(o) = out {
+            if o.status.success() && !o.stdout.is_empty() {
+                resolved = true;
+                last_output = String::from_utf8_lossy(&o.stdout).into_owned();
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    assert!(
+        resolved,
+        "main container could not resolve `db` within 15s (last output: {last_output:?})"
+    );
+
+    // list_services should see exactly our one service for this session.
+    let listed = service::list_services(&rt, workspace, session_id).unwrap();
+    assert_eq!(listed.len(), 1, "expected 1 service, got {:?}", listed);
+    assert_eq!(listed[0].name, "db");
+    assert_eq!(listed[0].image, SERVICE_TEST_IMAGE);
+
+    // Cleanup: simulate session end.
+    service::cleanup_services_for_session(&rt, session_id);
+
+    let listed_after = service::list_services(&rt, workspace, session_id).unwrap();
+    assert!(
+        listed_after.is_empty(),
+        "service should be gone after cleanup: {:?}",
+        listed_after
+    );
+
+    cleanup_container(&rt, &main_name);
+    cleanup_network(&rt, &net);
+}
+
+/// `stop_service` refuses to touch a service tagged with a different parent.
+#[test]
+fn e2e_service_stop_respects_parent_label() {
+    let rt = require_runtime!();
+    let ws_dir = tempfile::TempDir::new().unwrap();
+    let workspace = ws_dir.path();
+    let session_a = "aaaa0001";
+    let session_b = "bbbb0002";
+    let net = workspace::service_network_name(workspace);
+    let main_a = workspace::container_name_for(workspace, session_a);
+    let svc_a = workspace::service_container_name(workspace, session_a, "svc");
+
+    cleanup_container(&rt, &main_a);
+    cleanup_container(&rt, &svc_a);
+    cleanup_network(&rt, &net);
+
+    let _ = start_fake_main(&rt, workspace, session_a);
+    service::start_service(
+        &rt,
+        workspace,
+        session_a,
+        SERVICE_TEST_IMAGE,
+        "svc",
+        &[],
+        &["sleep".into(), "600".into()],
+    )
+    .expect("start_service for session A");
+
+    // Session B tries to stop session A's service — same workspace, different
+    // session id. The derived container name won't match (session id is in
+    // the name), so stop_service returns false without touching anything.
+    let stopped = service::stop_service(&rt, workspace, session_b, "svc").unwrap();
+    assert!(!stopped, "session B should not be able to stop A's service");
+    // Service still alive.
+    let listed = service::list_services(&rt, workspace, session_a).unwrap();
+    assert_eq!(listed.len(), 1);
+
+    // Session A can stop its own.
+    let stopped_a = service::stop_service(&rt, workspace, session_a, "svc").unwrap();
+    assert!(stopped_a);
+
+    cleanup_container(&rt, &main_a);
+    cleanup_network(&rt, &net);
+}
+
+/// `start_service` rejects a second start with the same name in the same session.
+#[test]
+fn e2e_service_name_collision_within_session() {
+    let rt = require_runtime!();
+    let ws_dir = tempfile::TempDir::new().unwrap();
+    let workspace = ws_dir.path();
+    let session_id = "coll0001";
+    let net = workspace::service_network_name(workspace);
+    let main_name = workspace::container_name_for(workspace, session_id);
+    let svc_container = workspace::service_container_name(workspace, session_id, "dup");
+
+    cleanup_container(&rt, &main_name);
+    cleanup_container(&rt, &svc_container);
+    cleanup_network(&rt, &net);
+
+    let _ = start_fake_main(&rt, workspace, session_id);
+    service::start_service(
+        &rt,
+        workspace,
+        session_id,
+        SERVICE_TEST_IMAGE,
+        "dup",
+        &[],
+        &["sleep".into(), "600".into()],
+    )
+    .expect("first start");
+
+    let err = service::start_service(
+        &rt,
+        workspace,
+        session_id,
+        SERVICE_TEST_IMAGE,
+        "dup",
+        &[],
+        &["sleep".into(), "600".into()],
+    )
+    .expect_err("second start should fail");
+    assert!(
+        err.to_string().contains("already exists"),
+        "expected name-collision error, got: {err}"
+    );
+
+    service::cleanup_services_for_session(&rt, session_id);
+    cleanup_container(&rt, &main_name);
+    cleanup_network(&rt, &net);
+}
