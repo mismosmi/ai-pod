@@ -211,6 +211,10 @@ pub enum MountAction {
         /// Mount as read-write (default: read-only)
         #[arg(long)]
         writable: bool,
+        /// Skip the interactive confirmation when the path matches a built-in
+        /// warn-list (credentials, system paths, ai-pod's own state, etc.).
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Remove a mount by host path (use the exact host path from `mount list`).
     Remove {

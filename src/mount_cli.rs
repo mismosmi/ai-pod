@@ -195,9 +195,159 @@ pub(crate) fn validate_spec(spec: &MountSpec, home_dir: &Path) -> Result<String>
     Ok(target)
 }
 
-pub fn run_add(config: &AppConfig, spec_str: &str, writable: bool) -> Result<()> {
+/// Path-specific warnings for `mount add`. Returns a list of human-readable
+/// reasons the mount is risky; an empty vec means "no concerns".
+///
+/// This is the place to teach ai-pod about new risky paths — every entry
+/// becomes an interactive confirmation gate at `mount add` time.
+pub(crate) fn warn_for_spec(spec: &MountSpec, target: &str, home_dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let host = spec.host.as_str();
+
+    // 1. Well-known credential dirs / files under $HOME. These are the
+    //    obvious sources of host-wide compromise if exposed to the agent.
+    let cred_subpaths = [
+        ".ssh",
+        ".aws",
+        ".gnupg",
+        ".config/gh",
+        ".config/gcloud",
+        ".config/git/credentials",
+        ".docker/config.json",
+        ".netrc",
+        ".kube",
+        ".password-store",
+    ];
+    for sub in cred_subpaths {
+        let p = home_dir.join(sub).display().to_string();
+        if host == p || host.starts_with(&format!("{}/", p)) {
+            out.push(format!(
+                "{} holds credentials — the in-container agent would gain full \
+                 access to them, including ability to authenticate as you to \
+                 remote services.",
+                host
+            ));
+            break;
+        }
+    }
+
+    // 2. System / runtime paths on the host. These either expose host-wide
+    //    state or hand the container a root-equivalent control plane.
+    let system_prefixes = [
+        "/etc",
+        "/var/run",
+        "/run",
+        "/proc",
+        "/sys",
+        "/dev",
+        "/boot",
+        "/root",
+        "/var/lib/docker",
+        "/var/lib/containers",
+    ];
+    for sys in system_prefixes {
+        if host == sys || host.starts_with(&format!("{}/", sys)) {
+            out.push(format!(
+                "{} is a host system path — mounting it can leak host secrets \
+                 (e.g. /etc/shadow) or grant container-escape primitives (e.g. \
+                 /var/run/docker.sock, /dev/*, /proc/*).",
+                host
+            ));
+            break;
+        }
+    }
+
+    // 3. ai-pod's own config dir. A writable mount here lets a compromised
+    //    container rewrite the global mount list for the next launch — a
+    //    confused-deputy escalation that compounds with all other risks.
+    let ai_pod = home_dir.join(".ai-pod").display().to_string();
+    if host == ai_pod || host.starts_with(&format!("{}/", ai_pod)) {
+        out.push(format!(
+            "{} is ai-pod's own config directory. Mounting it (especially \
+             writable) lets a container modify the global mount list and \
+             escalate to other host paths on the next launch.",
+            host
+        ));
+    }
+
+    // 4. Container target overrides files that ai-pod itself seeds. The
+    //    settings.json hooks carry $AI_POD_API_KEY; .claude.json holds the
+    //    MCP URL. Replacing either lets a hostile host file hijack the agent.
+    let seeded_files = [
+        "/home/ai-pod/.claude/settings.json",
+        "/home/ai-pod/.claude.json",
+        "/home/ai-pod/.claude/CLAUDE.md",
+        "/home/ai-pod/.gitconfig",
+    ];
+    if seeded_files.contains(&target) {
+        out.push(format!(
+            "Container target {} is seeded by ai-pod (Stop hook, MCP URL, \
+             api-key carrier). Overriding it can hijack the agent's host \
+             call-back or silently disable safety hooks.",
+            target
+        ));
+    }
+
+    // 5. Container target inside a system binary / library tree. The
+    //    runtime-settings Stop hook is a `curl` invocation; replacing the
+    //    binary or libc underneath the agent is full code execution as the
+    //    `ai-pod` user with the api key in env.
+    let bin_prefixes = [
+        "/usr/bin",
+        "/usr/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        "/boot",
+    ];
+    for bp in bin_prefixes {
+        if target == bp || target.starts_with(&format!("{}/", bp)) {
+            out.push(format!(
+                "Container target {} shadows a system binary/library path. \
+                 The agent will execute whatever host file you mount there.",
+                target
+            ));
+            break;
+        }
+    }
+
+    out
+}
+
+pub fn run_add(config: &AppConfig, spec_str: &str, writable: bool, assume_yes: bool) -> Result<()> {
     let spec = parse_spec(spec_str, writable, &config.home_dir)?;
     let target = crate::container::resolve_container_target(&spec, &config.home_dir)?;
+
+    let warnings = warn_for_spec(&spec, &target, &config.home_dir);
+    if !warnings.is_empty() {
+        eprintln!(
+            "{} this mount is on ai-pod's risky-path warn-list:",
+            "warning:".yellow().bold()
+        );
+        for w in &warnings {
+            eprintln!("  • {}", w);
+        }
+        if !assume_yes {
+            let confirm = dialoguer::Confirm::new()
+                .with_prompt(format!(
+                    "Proceed with mount {} → {} ({})?",
+                    spec.host,
+                    target,
+                    if spec.writable { "rw" } else { "ro" }
+                ))
+                .default(false)
+                .interact()
+                .unwrap_or(false);
+            if !confirm {
+                anyhow::bail!("Mount cancelled by user");
+            }
+        }
+    }
 
     let mut gc = GlobalConfig::load(config);
 
@@ -526,7 +676,7 @@ mod tests {
     fn run_add_rejects_no_container_outside_home() {
         let dir = TempDir::new().unwrap();
         let config = make_config(dir.path());
-        let err = run_add(&config, "/etc/foo", false).unwrap_err();
+        let err = run_add(&config, "/etc/foo", false, true).unwrap_err();
         assert!(err.to_string().contains("outside $HOME"));
     }
 
@@ -536,7 +686,7 @@ mod tests {
         let config = make_config(dir.path());
         std::fs::create_dir_all(dir.path().join(".claude/skills")).unwrap();
 
-        run_add(&config, "~/.claude/skills", false).unwrap();
+        run_add(&config, "~/.claude/skills", false, true).unwrap();
         let gc = GlobalConfig::load(&config);
         assert_eq!(gc.mounts.len(), 1);
         assert_eq!(
@@ -560,7 +710,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = make_config(dir.path());
         std::fs::create_dir_all(dir.path().join(".claude/skills")).unwrap();
-        run_add(&config, "~/.claude/skills", false).unwrap();
+        run_add(&config, "~/.claude/skills", false, true).unwrap();
 
         run_remove(&config, "~/.claude/skills/").unwrap();
         let gc = GlobalConfig::load(&config);
@@ -573,8 +723,8 @@ mod tests {
         let config = make_config(dir.path());
         std::fs::create_dir_all(dir.path().join(".claude/skills")).unwrap();
 
-        run_add(&config, "~/.claude/skills", false).unwrap();
-        run_add(&config, "~/.claude/skills", false).unwrap();
+        run_add(&config, "~/.claude/skills", false, true).unwrap();
+        run_add(&config, "~/.claude/skills", false, true).unwrap();
         let gc = GlobalConfig::load(&config);
         assert_eq!(gc.mounts.len(), 1, "duplicate host should not be added");
         assert!(!gc.mounts[0].writable);
@@ -586,8 +736,8 @@ mod tests {
         let config = make_config(dir.path());
         std::fs::create_dir_all(dir.path().join(".claude/skills")).unwrap();
 
-        run_add(&config, "~/.claude/skills", false).unwrap();
-        let err = run_add(&config, "~/.claude/skills", true).unwrap_err();
+        run_add(&config, "~/.claude/skills", false, true).unwrap();
+        let err = run_add(&config, "~/.claude/skills", true, true).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("already mounted"), "got: {msg}");
         assert!(msg.contains("remove"), "should hint to remove first: {msg}");
@@ -595,6 +745,138 @@ mod tests {
         let gc = GlobalConfig::load(&config);
         assert_eq!(gc.mounts.len(), 1);
         assert!(!gc.mounts[0].writable, "stored entry should be unchanged");
+    }
+
+    fn spec(host: &str, container: Option<&str>) -> MountSpec {
+        MountSpec {
+            host: host.to_string(),
+            container: container.map(|c| c.to_string()),
+            writable: false,
+        }
+    }
+
+    #[test]
+    fn warn_flags_ssh_aws_gnupg_under_home() {
+        let home = Path::new("/H");
+        for sub in [".ssh", ".aws", ".gnupg", ".config/gh", ".netrc"] {
+            let host = format!("/H/{}", sub);
+            let target = format!("/home/ai-pod/{}", sub);
+            let w = warn_for_spec(&spec(&host, Some(&target)), &target, home);
+            assert!(!w.is_empty(), "{} should warn", sub);
+            assert!(w.iter().any(|m| m.contains("credentials")), "got {:?}", w);
+        }
+    }
+
+    #[test]
+    fn warn_flags_system_host_paths() {
+        let home = Path::new("/H");
+        for sys in [
+            "/etc/hosts",
+            "/var/run/docker.sock",
+            "/dev/null",
+            "/proc/1",
+            "/sys/kernel",
+            "/root/x",
+        ] {
+            let w = warn_for_spec(&spec(sys, Some("/x")), "/x", home);
+            assert!(!w.is_empty(), "{} should warn", sys);
+            assert!(w.iter().any(|m| m.contains("system path")), "got {:?}", w);
+        }
+    }
+
+    #[test]
+    fn warn_flags_ai_pod_self_mount() {
+        let home = Path::new("/H");
+        let w = warn_for_spec(&spec("/H/.ai-pod", None), "/home/ai-pod/.ai-pod", home);
+        assert!(w.iter().any(|m| m.contains("ai-pod's own")), "got {:?}", w);
+
+        let w = warn_for_spec(
+            &spec("/H/.ai-pod/config.json", Some("/home/ai-pod/cfg")),
+            "/home/ai-pod/cfg",
+            home,
+        );
+        assert!(w.iter().any(|m| m.contains("ai-pod's own")), "got {:?}", w);
+    }
+
+    #[test]
+    fn warn_flags_seeded_target_files() {
+        let home = Path::new("/H");
+        for t in [
+            "/home/ai-pod/.claude/settings.json",
+            "/home/ai-pod/.claude.json",
+            "/home/ai-pod/.claude/CLAUDE.md",
+        ] {
+            let w = warn_for_spec(&spec("/H/x", Some(t)), t, home);
+            assert!(
+                w.iter().any(|m| m.contains("seeded by ai-pod")),
+                "{} should warn, got {:?}",
+                t,
+                w
+            );
+        }
+    }
+
+    #[test]
+    fn warn_flags_binary_shadow_targets() {
+        let home = Path::new("/H");
+        for t in [
+            "/usr/bin/curl",
+            "/bin/sh",
+            "/sbin/init",
+            "/usr/local/bin/foo",
+            "/lib/x86_64-linux-gnu/libc.so.6",
+            "/boot/vmlinuz",
+        ] {
+            let w = warn_for_spec(&spec("/H/x", Some(t)), t, home);
+            assert!(
+                w.iter().any(|m| m.contains("system binary/library")),
+                "{} should warn, got {:?}",
+                t,
+                w
+            );
+        }
+    }
+
+    #[test]
+    fn warn_silent_on_benign_skills_mount() {
+        let home = Path::new("/H");
+        let w = warn_for_spec(
+            &spec("/H/.claude/skills", None),
+            "/home/ai-pod/.claude/skills",
+            home,
+        );
+        assert!(w.is_empty(), "skills mount should be silent, got {:?}", w);
+    }
+
+    #[test]
+    fn run_add_aborts_risky_mount_without_yes() {
+        // Non-interactive: dialoguer::Confirm falls back to its default
+        // (false), so the add must bail rather than succeed silently.
+        let dir = TempDir::new().unwrap();
+        let config = make_config(dir.path());
+        let ssh = dir.path().join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+
+        let err = run_add(&config, &ssh.display().to_string(), false, false).unwrap_err();
+        assert!(
+            err.to_string().contains("cancelled"),
+            "expected cancellation, got: {}",
+            err
+        );
+        let gc = GlobalConfig::load(&config);
+        assert!(gc.mounts.is_empty(), "risky mount must not be stored");
+    }
+
+    #[test]
+    fn run_add_allows_risky_mount_with_yes() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config(dir.path());
+        let ssh = dir.path().join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+
+        run_add(&config, &ssh.display().to_string(), false, true).unwrap();
+        let gc = GlobalConfig::load(&config);
+        assert_eq!(gc.mounts.len(), 1);
     }
 
     #[test]
@@ -606,8 +888,8 @@ mod tests {
         let a = dir.path().join("a").display().to_string();
         let b = dir.path().join("b").display().to_string();
 
-        run_add(&config, &format!("{}:/home/ai-pod/shared", a), false).unwrap();
-        let err = run_add(&config, &format!("{}:/home/ai-pod/shared", b), false).unwrap_err();
+        run_add(&config, &format!("{}:/home/ai-pod/shared", a), false, true).unwrap();
+        let err = run_add(&config, &format!("{}:/home/ai-pod/shared", b), false, true).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("already used"), "got: {msg}");
 

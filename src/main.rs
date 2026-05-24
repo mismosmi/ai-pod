@@ -341,8 +341,8 @@ async fn main() -> Result<()> {
             config.init()?;
             match action {
                 MountAction::List => mount_cli::run_list(&config)?,
-                MountAction::Add { spec, writable } => {
-                    mount_cli::run_add(&config, spec, *writable)?
+                MountAction::Add { spec, writable, yes } => {
+                    mount_cli::run_add(&config, spec, *writable, *yes)?
                 }
                 MountAction::Remove { host } => mount_cli::run_remove(&config, host)?,
             }
