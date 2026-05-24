@@ -58,72 +58,15 @@ pub fn ensure_service_network(rt: &ContainerRuntime, workspace: &std::path::Path
     Ok(net)
 }
 
-/// Find the running main container for `(workspace, session_id)`. Returns the
-/// container name. Errors if no such container is running.
-pub fn find_main_container(
-    rt: &ContainerRuntime,
-    workspace: &std::path::Path,
-    session_id: &str,
-) -> Result<String> {
-    let expected = crate::workspace::container_name_for(workspace, session_id);
-    let output = rt
-        .command()
-        .args([
-            "ps",
-            "--filter",
-            &format!("name=^{}$", expected),
-            "--filter",
-            "label=managed-by=ai-pod",
-            "--format",
-            "{{.Names}}",
-        ])
-        .output()
-        .context("failed to list main container")?;
-    let name = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find(|l| !l.is_empty())
-        .map(|l| l.to_string());
-    match name {
-        Some(n) => Ok(n),
-        None => anyhow::bail!(
-            "no running main container for session {} (expected {})",
-            session_id,
-            expected
-        ),
-    }
-}
-
-/// Attach the main container to the workspace network. Idempotent: a second
-/// call swallows the "already attached" error.
-pub fn connect_main_to_network(
-    rt: &ContainerRuntime,
-    workspace: &std::path::Path,
-    session_id: &str,
-) -> Result<()> {
-    let net = service_network_name(workspace);
-    let main = find_main_container(rt, workspace, session_id)?;
-    let output = rt
-        .command()
-        .args(["network", "connect", &net, &main])
-        .output()
-        .context("failed to connect main container to service network")?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
-    if stderr.contains("already") {
-        return Ok(());
-    }
-    anyhow::bail!(
-        "failed to connect main container to network {}: {}",
-        net,
-        stderr.trim()
-    );
-}
-
 /// Start a detached service container on the workspace network with a DNS
 /// alias matching `name`. Returns the host the agent should use plus the
 /// container's full name.
+///
+/// The main container is expected to already be attached to the workspace
+/// network — `container::launch_container` puts it there at launch time
+/// because lazy attach (`podman network connect ... main`) does not work for
+/// rootless slirp4netns containers. Sessions started by an older ai-pod must
+/// be relaunched before they can use service containers.
 pub fn start_service(
     rt: &ContainerRuntime,
     workspace: &std::path::Path,
@@ -134,8 +77,6 @@ pub fn start_service(
     command: &[String],
 ) -> Result<StartedService> {
     let net = ensure_service_network(rt, workspace)?;
-    connect_main_to_network(rt, workspace, session_id)?;
-
     let container_name = service_container_name(workspace, session_id, name);
 
     // Refuse to silently clobber an existing service of the same name.

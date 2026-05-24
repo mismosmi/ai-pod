@@ -601,9 +601,12 @@ fn cleanup_network(rt: &ContainerRuntime, name: &str) {
 }
 
 /// Stand up a fake "main" container (sleeping) named like an ai-pod container
-/// so the service module's helpers can find it.
+/// so the service module's helpers can find it. Mirrors what production's
+/// `container::launch_container` does: ensures the per-workspace service
+/// network exists and attaches the main to it at launch time.
 fn start_fake_main(rt: &ContainerRuntime, workspace: &Path, session_id: &str) -> String {
     let name = workspace::container_name_for(workspace, session_id);
+    let net = service::ensure_service_network(rt, workspace).expect("ensure service network");
     let img = SERVICE_TEST_IMAGE;
     let _ = rt.command().args(["pull", img]).output();
     let status = rt
@@ -616,6 +619,8 @@ fn start_fake_main(rt: &ContainerRuntime, workspace: &Path, session_id: &str) ->
             &name,
             "--label",
             "managed-by=ai-pod",
+            "--network",
+            &net,
             img,
             "sleep",
             "600",
