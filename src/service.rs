@@ -48,14 +48,23 @@ pub fn ensure_service_network(rt: &ContainerRuntime, workspace: &std::path::Path
     let create = rt
         .command()
         .args(["network", "create", &net])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+        .output()
         .context("failed to create network")?;
-    if !create.success() {
-        anyhow::bail!("failed to create service network {}", net);
+    if create.status.success() {
+        return Ok(net);
     }
-    Ok(net)
+    // Two concurrent sessions both passing the inspect-then-create check
+    // would otherwise both bail here. Treat "already exists" as success so
+    // the second caller (and our own retries) succeed.
+    let stderr = String::from_utf8_lossy(&create.stderr).to_lowercase();
+    if stderr.contains("already exists") || stderr.contains("already in use") {
+        return Ok(net);
+    }
+    anyhow::bail!(
+        "failed to create service network {}: {}",
+        net,
+        stderr.trim()
+    );
 }
 
 /// Start a detached service container on the workspace network with a DNS

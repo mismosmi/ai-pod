@@ -82,9 +82,8 @@ pub fn validate_service_name(name: &str) -> Result<&str, String> {
             name.len()
         ));
     }
-    let mut chars = name.chars();
-    let first = chars.next().unwrap();
-    if !first.is_ascii_alphanumeric() {
+    let first = name.chars().next().unwrap();
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
         return Err(format!(
             "service name '{}' must start with a lowercase letter or digit",
             name
@@ -220,6 +219,15 @@ mod tests {
         assert!(validate_service_name("pg/x").is_err());
         assert!(validate_service_name("pg_x").is_err());
         assert!(validate_service_name("pg.x").is_err());
+    }
+
+    #[test]
+    fn validate_service_name_uppercase_first_char_message_blames_first_char() {
+        let err = validate_service_name("Postgres").unwrap_err();
+        assert!(
+            err.contains("must start with a lowercase letter or digit"),
+            "expected first-char error for uppercase first letter, got: {err}"
+        );
     }
 
     #[test]

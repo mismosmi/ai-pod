@@ -186,6 +186,11 @@ pub fn build_app(state: AppState) -> Router {
 /// Find live `ai-pod-parent={session_id}` labels whose corresponding main
 /// container is no longer running and remove the service containers tied to
 /// them.
+///
+/// Label format note: `ps --format "{{.Labels}}"` emits `k=v,k=v` (equals
+/// inside, commas between entries). This is distinct from `inspect --format
+/// "{{.Config.Labels}}"`, which uses Go's `map[k:v]` rendering with colons —
+/// don't reuse this parser for inspect output.
 async fn sweep_orphan_services(rt: &ContainerRuntime) {
     // Set of session ids currently backed by a live main container.
     let main_output = rt

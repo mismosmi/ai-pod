@@ -346,6 +346,9 @@ async fn handle_stop_service(
         Some(s) => s.to_string(),
         None => return tool_error("Missing `name`".into()),
     };
+    if let Err(e) = validate_service_name(&name) {
+        return tool_error(e);
+    }
     let rt = state.runtime.clone();
     let workspace_owned = workspace.to_path_buf();
     let session_owned = session_id.to_string();
@@ -400,6 +403,9 @@ async fn handle_service_logs(
         Some(s) => s.to_string(),
         None => return tool_error("Missing `name`".into()),
     };
+    if let Err(e) = validate_service_name(&name) {
+        return tool_error(e);
+    }
     let lines = args
         .get("lines")
         .and_then(|v| v.as_u64())
