@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 
 use crate::config::AppConfig;
@@ -41,6 +41,10 @@ pub struct AppState {
     pub commands: Arc<Mutex<HashMap<(String, String), CommandHandle>>>,
     pub runtime: ContainerRuntime,
     pub keep_alive_until: Arc<Mutex<Instant>>,
+    /// Triggers graceful shutdown. Notified by the periodic inactivity loop
+    /// and by the `/maybe-shutdown` endpoint when no managed containers are
+    /// running and the keep-alive timer has expired.
+    pub shutdown_notify: Arc<Notify>,
 }
 
 async fn health_handler() -> &'static str {
@@ -50,6 +54,46 @@ async fn health_handler() -> &'static str {
 async fn keep_alive_handler(State(state): State<AppState>) -> &'static str {
     *state.keep_alive_until.lock().await = Instant::now() + Duration::from_secs(30);
     "ok"
+}
+
+/// True if the server has nothing keeping it alive: no recent CLI traffic and
+/// no containers labelled `managed-by=ai-pod` are still running. Used by both
+/// the periodic inactivity loop and the `/maybe-shutdown` endpoint so they
+/// share one definition of "idle".
+async fn is_shutdown_eligible(rt: &ContainerRuntime, keep_alive_until: Instant) -> bool {
+    if Instant::now() < keep_alive_until {
+        return false;
+    }
+    let output = rt
+        .async_command()
+        .args([
+            "ps",
+            "--filter",
+            "label=managed-by=ai-pod",
+            "--format",
+            "{{.Names}}",
+        ])
+        .output()
+        .await;
+    let has_containers = output
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().any(|l| !l.is_empty()))
+        .unwrap_or(true);
+    !has_containers
+}
+
+/// Unauthenticated nudge: client calls this when an `ai-pod` session ends so
+/// the server can shut down immediately if it's idle, instead of waiting up
+/// to a minute for the periodic sweep. Returns `"shutting_down"` if the
+/// shutdown was triggered, `"keep_running"` otherwise. The response is
+/// best-effort — clients should not block on it.
+async fn maybe_shutdown_handler(State(state): State<AppState>) -> &'static str {
+    let keep_alive = *state.keep_alive_until.lock().await;
+    if is_shutdown_eligible(&state.runtime, keep_alive).await {
+        state.shutdown_notify.notify_one();
+        "shutting_down"
+    } else {
+        "keep_running"
+    }
 }
 
 async fn version_handler() -> Json<serde_json::Value> {
@@ -164,6 +208,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/health", get(health_handler))
         .route("/version", get(version_handler))
         .route("/keep-alive", post(keep_alive_handler))
+        .route("/maybe-shutdown", post(maybe_shutdown_handler))
         .route("/reload", post(reload_handler))
         .route("/notify_user", post(rest::notify_user_handler))
         .route("/list_allowed_commands", post(rest::list_allowed_commands_handler))
@@ -323,6 +368,7 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
         }
     }
 
+    let shutdown_notify = Arc::new(Notify::new());
     let state = AppState {
         projects: Arc::new(Mutex::new(projects)),
         config_dir: config.config_dir.clone(),
@@ -330,11 +376,12 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
         commands: Arc::new(Mutex::new(HashMap::new())),
         runtime: rt,
         keep_alive_until: Arc::new(Mutex::new(Instant::now() + Duration::from_secs(30))),
+        shutdown_notify: shutdown_notify.clone(),
     };
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let shutdown_rt = state.runtime.clone();
     let shutdown_keep_alive = state.keep_alive_until.clone();
+    let periodic_shutdown_notify = shutdown_notify.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
@@ -346,19 +393,9 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
             // containers would otherwise linger until `ai-pod clean`.
             sweep_orphan_services(&shutdown_rt).await;
 
-            if Instant::now() < *shutdown_keep_alive.lock().await {
-                continue;
-            }
-            let output = shutdown_rt
-                .async_command()
-                .args(["ps", "--filter", "label=managed-by=ai-pod", "--format", "{{.Names}}"])
-                .output()
-                .await;
-            let has_containers = output
-                .map(|o| String::from_utf8_lossy(&o.stdout).lines().any(|l| !l.is_empty()))
-                .unwrap_or(true);
-            if !has_containers {
-                let _ = shutdown_tx.send(());
+            let keep_alive = *shutdown_keep_alive.lock().await;
+            if is_shutdown_eligible(&shutdown_rt, keep_alive).await {
+                periodic_shutdown_notify.notify_one();
                 break;
             }
         }
@@ -374,8 +411,27 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(async { shutdown_rx.await.ok(); })
+    .with_graceful_shutdown(async move { shutdown_notify.notified().await })
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::RuntimeKind;
+
+    #[tokio::test]
+    async fn is_shutdown_eligible_returns_false_when_keep_alive_in_future() {
+        // `dry_run` makes `async_command` an `echo`, so the ps call would
+        // otherwise look like containers are running. The keep-alive check
+        // short-circuits before reaching it.
+        let rt = ContainerRuntime {
+            kind: RuntimeKind::Podman,
+            dry_run: true,
+        };
+        let keep_alive = Instant::now() + Duration::from_secs(30);
+        assert!(!is_shutdown_eligible(&rt, keep_alive).await);
+    }
 }

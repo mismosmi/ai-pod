@@ -465,6 +465,7 @@ mod tests {
             keep_alive_until: Arc::new(Mutex::new(
                 std::time::Instant::now() + std::time::Duration::from_secs(30),
             )),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 

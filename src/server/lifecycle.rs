@@ -203,6 +203,21 @@ pub async fn bump_keep_alive() {
         .await;
 }
 
+/// Best-effort POST to `/maybe-shutdown` to tell the shared server it may
+/// exit immediately if it has no other work. Called by the CLI right after a
+/// session ends so the user doesn't wait up to a full inactivity-sweep cycle
+/// (~60s) for the server to notice. Errors are intentionally swallowed: if
+/// the server is gone the next `ai-pod` run will start a fresh one, and if
+/// it's still busy the periodic sweep remains a backstop.
+pub async fn request_shutdown_if_idle() {
+    let url = format!("http://127.0.0.1:{}/maybe-shutdown", MCP_PORT);
+    let _ = reqwest::Client::new()
+        .post(&url)
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await;
+}
+
 /// Ensure the shared server is running. Starts it if not alive.
 pub async fn ensure_shared_server(config: &AppConfig) -> Result<()> {
     let state_path = config.server_state_file();

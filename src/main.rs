@@ -286,6 +286,10 @@ async fn launch_flow(cli: &Cli, rt: &ContainerRuntime) -> Result<()> {
         &state.api_key,
     )?;
 
+    // Session is over — nudge the shared server to exit immediately if it has
+    // no other live containers, instead of waiting for the periodic sweep.
+    server::lifecycle::request_shutdown_if_idle().await;
+
     Ok(())
 }
 
@@ -512,6 +516,9 @@ async fn main() -> Result<()> {
                 command,
                 args,
             )?;
+
+            // Session is over — nudge the shared server to exit immediately.
+            server::lifecycle::request_shutdown_if_idle().await;
         }
         Some(Command::Commands { action }) => {
             let config = AppConfig::new()?;
