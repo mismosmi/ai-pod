@@ -95,6 +95,13 @@ pub enum Command {
         action: Option<CommandsAction>,
     },
 
+    /// View and manage service containers (postgres, redis, etc.) started by
+    /// agents in the current workspace. Run with no subcommand for a TUI.
+    Services {
+        #[command(subcommand)]
+        action: Option<ServicesAction>,
+    },
+
     /// Manage the whitelist of always-allowed commands for a workspace.
     /// Run with no subcommand to open an interactive TUI.
     Allowed {
@@ -161,6 +168,29 @@ pub enum CommandsAction {
     /// Print stdout/stderr/exit for a command
     Logs {
         command_id: String,
+        #[arg(long)]
+        session: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ServicesAction {
+    /// Plain list (one row per service)
+    List,
+    /// Print recent log output for a service
+    Logs {
+        name: String,
+        /// Session id (optional; resolved from the workspace if exactly one session owns the name)
+        #[arg(long)]
+        session: Option<String>,
+        /// Number of trailing log lines to print
+        #[arg(long, default_value_t = 50)]
+        lines: usize,
+    },
+    /// Stop and remove a service container
+    Stop {
+        name: String,
+        /// Session id (optional; resolved from the workspace if exactly one session owns the name)
         #[arg(long)]
         session: Option<String>,
     },

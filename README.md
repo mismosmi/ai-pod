@@ -88,6 +88,7 @@ ai-pod --workdir /path/to/project
 | `clean [--workdir PATH]` | Stop and remove the container for a workspace |
 | `run <command> [args...]` | Run a command in the container instead of the default |
 | `commands [list\|run\|kill\|logs]` | View/manage host commands (interactive TUI if no subcommand) |
+| `services [list\|logs\|stop]` | View/manage service containers started by agents (interactive TUI if no subcommand) |
 | `allowed [list\|add\|remove]` | Manage the always-allowed command whitelist (interactive TUI if no subcommand) |
 | `mask <dir> [--workdir PATH]` | Shadow-mount `/app/<dir>` with an isolated per-workspace volume |
 | `unmask <dir> [--workdir PATH]` | Stop masking `<dir>` and delete its shadow volume |
@@ -184,6 +185,18 @@ session and discarded when the session ends; the service container
 itself is removed as soon as the main ai-pod container exits (or, as a
 backstop, by a periodic sweep in the shared server). `ai-pod clean`
 also removes the per-workspace network.
+
+#### Inspecting services from the host
+
+```sh
+ai-pod services                          # interactive TUI
+ai-pod services list                     # plain list across all sessions
+ai-pod services logs <name> [--lines N]  # tail logs of a service
+ai-pod services stop <name>              # stop a running service
+```
+
+The `--session <id>` flag disambiguates when the same name is in use
+across concurrent sessions on the same workspace.
 
 ### Command output files
 

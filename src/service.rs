@@ -20,6 +20,7 @@ pub const PARENT_LABEL_KEY: &str = "ai-pod-parent";
 
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct ServiceInfo {
+    pub session_id: String,
     pub name: String,
     pub container_name: String,
     pub image: String,
@@ -227,6 +228,68 @@ pub fn list_services(
             .unwrap_or(&container_name)
             .to_string();
         out.push(ServiceInfo {
+            session_id: session_id.to_string(),
+            name,
+            container_name,
+            image,
+            status,
+        });
+    }
+    Ok(out)
+}
+
+/// List every service container in `workspace`, across all sessions. Used by
+/// the host-side `ai-pod services` CLI: the host process is not bound to any
+/// one session, so this enumerates all of them and the caller decides what to
+/// do per-row.
+pub fn list_services_for_workspace(
+    rt: &ContainerRuntime,
+    workspace: &std::path::Path,
+) -> Result<Vec<ServiceInfo>> {
+    let workspace_prefix = format!("ai-pod-{}-", crate::workspace::workspace_hash(workspace));
+    let output = rt
+        .command()
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("name=^{}", workspace_prefix),
+            "--filter",
+            &format!("label={}", SERVICE_LABEL),
+            "--format",
+            "{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Labels}}",
+        ])
+        .output()
+        .context("failed to list workspace service containers")?;
+    let mut out = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(4, '\t');
+        let container_name = parts.next().unwrap_or("").to_string();
+        let image = parts.next().unwrap_or("").to_string();
+        let status = parts.next().unwrap_or("").to_string();
+        let labels = parts.next().unwrap_or("");
+
+        // Recover session_id from the parent label rather than parsing the
+        // name, so a future name-scheme tweak doesn't quietly break this.
+        let session_id = labels
+            .split(',')
+            .find_map(|kv| kv.trim().strip_prefix(&format!("{}=", PARENT_LABEL_KEY)))
+            .unwrap_or("")
+            .to_string();
+        if session_id.is_empty() {
+            continue;
+        }
+
+        let svc_prefix = format!("{}{}-svc-", workspace_prefix, session_id);
+        let name = container_name
+            .strip_prefix(&svc_prefix)
+            .unwrap_or(&container_name)
+            .to_string();
+        out.push(ServiceInfo {
+            session_id,
             name,
             container_name,
             image,
