@@ -21,6 +21,8 @@ use super::commands;
 use super::notify;
 use super::runner;
 use crate::runtime::ContainerRuntime;
+use crate::service;
+use crate::workspace::validate_service_name;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -120,6 +122,54 @@ fn tools_definition(runtime: &ContainerRuntime) -> Value {
             "name": "list_allowed_commands",
             "description": "List host commands previously approved by the user for this workspace.",
             "inputSchema": { "type": "object" }
+        },
+        {
+            "name": "start_service",
+            "description": "Start an auxiliary service container (e.g. `postgres:16`) on a per-workspace bridge network. The user must approve the image + env-var KEY set once per workspace. Reach the service from this container by the `name` you pass, on the service's standard port — e.g. `name=\"postgres\"` → `postgres:5432`. No host port mapping is created. The service is ephemeral: data lives only for this ai-pod session and is discarded when the session ends. Returns `{ host, container_name }`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "image": { "type": "string", "description": "Container image, e.g. `postgres:16`." },
+                    "name": { "type": "string", "description": "DNS alias used to reach the service from this container. Lowercase [a-z0-9-], 1-30 chars, starts with alphanumeric." },
+                    "env": {
+                        "type": "object",
+                        "description": "Environment variables for the container. Values are passed through unchanged; only the sorted KEY list is shown to the user during approval.",
+                        "additionalProperties": { "type": "string" }
+                    },
+                    "command": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional command override for the image."
+                    }
+                },
+                "required": ["image", "name"]
+            }
+        },
+        {
+            "name": "stop_service",
+            "description": "Stop and remove a service container started by this session. No-op if the name doesn't match a service this session owns.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "name": { "type": "string" } },
+                "required": ["name"]
+            }
+        },
+        {
+            "name": "list_services",
+            "description": "List service containers started by this session in this workspace.",
+            "inputSchema": { "type": "object" }
+        },
+        {
+            "name": "service_logs",
+            "description": "Read the tail of a service container's logs (stdout+stderr). Useful when a service fails to start.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "lines": { "type": "integer", "description": "Number of trailing lines to return (default 50)." }
+                },
+                "required": ["name"]
+            }
         }
     ])
 }
@@ -188,6 +238,193 @@ pub async fn mcp_handler(
     }
 }
 
+async fn handle_start_service(
+    state: &AppState,
+    workspace: &std::path::Path,
+    session_id: &str,
+    args: &Value,
+) -> Value {
+    let image = match args.get("image").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_error("Missing `image`".into()),
+    };
+    let name = match args.get("name").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return tool_error("Missing `name`".into()),
+    };
+    if let Err(e) = validate_service_name(name) {
+        return tool_error(e);
+    }
+    let name = name.to_string();
+
+    let env_pairs: Vec<(String, String)> = match args.get("env") {
+        Some(Value::Null) | None => Vec::new(),
+        Some(Value::Object(map)) => {
+            let mut out = Vec::with_capacity(map.len());
+            for (k, v) in map {
+                let val = match v {
+                    Value::String(s) => s.clone(),
+                    Value::Number(n) => n.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    _ => {
+                        return tool_error(format!(
+                            "env value for `{}` must be a string, number, or boolean",
+                            k
+                        ));
+                    }
+                };
+                out.push((k.clone(), val));
+            }
+            out
+        }
+        _ => return tool_error("`env` must be an object".into()),
+    };
+    let env_keys: Vec<String> = env_pairs.iter().map(|(k, _)| k.clone()).collect();
+
+    let command: Vec<String> = match args.get("command") {
+        Some(Value::Null) | None => Vec::new(),
+        Some(Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                match it.as_str() {
+                    Some(s) => out.push(s.to_string()),
+                    None => return tool_error("`command` entries must be strings".into()),
+                }
+            }
+            out
+        }
+        _ => return tool_error("`command` must be an array of strings".into()),
+    };
+
+    match commands::run_service_request(state, &image, &env_keys, workspace).await {
+        commands::ApprovalOutcome::Denied => return tool_error("Service start denied by user".into()),
+        commands::ApprovalOutcome::Timeout => {
+            return tool_error("Permission request timed out after 60 seconds.".into());
+        }
+        commands::ApprovalOutcome::Rejected => {
+            return tool_error("Service start rejected".into());
+        }
+        commands::ApprovalOutcome::Approved | commands::ApprovalOutcome::AlwaysAllow => {}
+    }
+
+    let rt = state.runtime.clone();
+    let workspace_owned = workspace.to_path_buf();
+    let session_owned = session_id.to_string();
+    let join = tokio::task::spawn_blocking(move || {
+        service::start_service(
+            &rt,
+            &workspace_owned,
+            &session_owned,
+            &image,
+            &name,
+            &env_pairs,
+            &command,
+        )
+    })
+    .await;
+    match join {
+        Err(_) => tool_error("internal error spawning service".into()),
+        Ok(Err(e)) => tool_error(format!("Failed to start service: {e}")),
+        Ok(Ok(started)) => json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::to_string_pretty(&started).unwrap_or_default()
+            }],
+            "isError": false,
+            "structuredContent": started,
+        }),
+    }
+}
+
+async fn handle_stop_service(
+    state: &AppState,
+    workspace: &std::path::Path,
+    session_id: &str,
+    args: &Value,
+) -> Value {
+    let name = match args.get("name").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return tool_error("Missing `name`".into()),
+    };
+    if let Err(e) = validate_service_name(&name) {
+        return tool_error(e);
+    }
+    let rt = state.runtime.clone();
+    let workspace_owned = workspace.to_path_buf();
+    let session_owned = session_id.to_string();
+    let join = tokio::task::spawn_blocking(move || {
+        service::stop_service(&rt, &workspace_owned, &session_owned, &name)
+    })
+    .await;
+    match join {
+        Err(_) => tool_error("internal error stopping service".into()),
+        Ok(Err(e)) => tool_error(format!("Failed to stop service: {e}")),
+        Ok(Ok(stopped)) => json!({
+            "content": [{ "type": "text", "text": format!("stopped: {stopped}") }],
+            "isError": false,
+            "structuredContent": { "stopped": stopped },
+        }),
+    }
+}
+
+async fn handle_list_services(
+    state: &AppState,
+    workspace: &std::path::Path,
+    session_id: &str,
+) -> Value {
+    let rt = state.runtime.clone();
+    let workspace_owned = workspace.to_path_buf();
+    let session_owned = session_id.to_string();
+    let join = tokio::task::spawn_blocking(move || {
+        service::list_services(&rt, &workspace_owned, &session_owned)
+    })
+    .await;
+    match join {
+        Err(_) => tool_error("internal error listing services".into()),
+        Ok(Err(e)) => tool_error(format!("Failed to list services: {e}")),
+        Ok(Ok(list)) => json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::to_string_pretty(&list).unwrap_or_default()
+            }],
+            "isError": false,
+            "structuredContent": { "services": list },
+        }),
+    }
+}
+
+async fn handle_service_logs(
+    state: &AppState,
+    workspace: &std::path::Path,
+    session_id: &str,
+    args: &Value,
+) -> Value {
+    let name = match args.get("name").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return tool_error("Missing `name`".into()),
+    };
+    if let Err(e) = validate_service_name(&name) {
+        return tool_error(e);
+    }
+    let lines = args
+        .get("lines")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(50);
+    let rt = state.runtime.clone();
+    let workspace_owned = workspace.to_path_buf();
+    let session_owned = session_id.to_string();
+    let join = tokio::task::spawn_blocking(move || {
+        service::service_logs(&rt, &workspace_owned, &session_owned, &name, lines)
+    })
+    .await;
+    match join {
+        Err(_) => tool_error("internal error reading service logs".into()),
+        Ok(Err(e)) => tool_error(format!("Failed to read service logs: {e}")),
+        Ok(Ok(text)) => tool_text(text),
+    }
+}
+
 async fn resolve_project_id(state: &AppState, api_key: &str) -> Option<String> {
     let map = state.projects.lock().await;
     for (pid, info) in map.iter() {
@@ -252,6 +489,42 @@ mod tests {
         assert!(
             desc.contains("Read tool"),
             "description should tell the agent to use its Read tool, got: {desc}"
+        );
+    }
+
+    #[test]
+    fn tools_definition_includes_service_tools() {
+        let v = tools_definition(&test_runtime(RuntimeKind::Podman));
+        let names: Vec<&str> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"start_service"));
+        assert!(names.contains(&"stop_service"));
+        assert!(names.contains(&"list_services"));
+        assert!(names.contains(&"service_logs"));
+    }
+
+    #[test]
+    fn start_service_description_mentions_lifetime_and_reachability() {
+        let v = tools_definition(&test_runtime(RuntimeKind::Podman));
+        let desc = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "start_service")
+            .unwrap()["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            desc.contains("session"),
+            "start_service description should mention per-session lifetime, got: {desc}"
+        );
+        assert!(
+            desc.contains("postgres:5432") || desc.to_lowercase().contains("standard port"),
+            "start_service description should explain DNS-name reachability, got: {desc}"
         );
     }
 
@@ -395,6 +668,10 @@ async fn handle_tool_call(
                 "structuredContent": { "commands": cmds },
             })
         }
+        "start_service" => handle_start_service(state, workspace, session_id, &args).await,
+        "stop_service" => handle_stop_service(state, workspace, session_id, &args).await,
+        "list_services" => handle_list_services(state, workspace, session_id).await,
+        "service_logs" => handle_service_logs(state, workspace, session_id, &args).await,
         other => tool_error(format!("Unknown tool: {other}")),
     }
 }
