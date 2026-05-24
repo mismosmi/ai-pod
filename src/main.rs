@@ -1,6 +1,6 @@
 use ai_pod::{
     cli, commands_cli, config, container, credentials, env_files_cli, image, mount_cli, runtime,
-    server, update, workspace,
+    server, services_cli, update, workspace,
 };
 
 use anyhow::{Context, Result};
@@ -8,7 +8,7 @@ use clap::Parser;
 use colored::Colorize;
 use std::path::Path;
 
-use cli::{AllowedAction, Cli, Command, CommandsAction, EnvFilesAction, MountAction};
+use cli::{AllowedAction, Cli, Command, CommandsAction, EnvFilesAction, MountAction, ServicesAction};
 use config::AppConfig;
 use runtime::ContainerRuntime;
 
@@ -547,6 +547,19 @@ async fn main() -> Result<()> {
                 Some(CommandsAction::Logs { command_id, session }) => {
                     commands_cli::run_logs(&config, &workspace, session.as_deref(), command_id)
                         .await?;
+                }
+            }
+        }
+        Some(Command::Services { action }) => {
+            let workspace = resolve_workspace(&cli.workdir)?;
+            match action {
+                None => services_cli::run_tui(&rt, &workspace)?,
+                Some(ServicesAction::List) => services_cli::run_list(&rt, &workspace)?,
+                Some(ServicesAction::Logs { name, session, lines }) => {
+                    services_cli::run_logs(&rt, &workspace, name, session.as_deref(), *lines)?;
+                }
+                Some(ServicesAction::Stop { name, session }) => {
+                    services_cli::run_stop(&rt, &workspace, name, session.as_deref())?;
                 }
             }
         }

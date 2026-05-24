@@ -693,6 +693,14 @@ pub fn launch_container(
     let global = GlobalConfig::load(config);
     let user_mount_args = build_mount_args(&config.home_dir, &global.mounts)?;
 
+    // Create the per-workspace service network up front and attach the main
+    // container to it at launch. Lazy attach via `podman network connect` after
+    // the fact does not work for rootless podman (slirp4netns containers cannot
+    // be added to additional networks), so any later `start_service` call would
+    // fail. Doing it here makes service-container requests work on every
+    // runtime without restarting the session.
+    let service_net = crate::service::ensure_service_network(rt, workspace)?;
+
     let mut run_cmd = rt.command();
     run_cmd.args(["run", "--rm", "-it"]);
     run_cmd.args([
@@ -700,6 +708,8 @@ pub fn launch_container(
         &container_name,
         "--label",
         "managed-by=ai-pod",
+        "--network",
+        &service_net,
         "-v",
         &format!("{}:{}:z", volume_name, CONTAINER_HOME),
         "-v",
@@ -727,12 +737,18 @@ pub fn launch_container(
         &opencode_config_env,
     ]);
     run_cmd.arg(image);
-    run_cmd
+    let run_status = run_cmd
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
         .context("Failed to run container")?;
+
+    // Main container has exited (cleanly or otherwise); tear down anything the
+    // agent started for this session. Best-effort: this is also covered by the
+    // server's periodic orphan sweep if the CLI was killed.
+    crate::service::cleanup_services_for_session(rt, &session_id);
+    let _ = run_status;
 
     Ok(())
 }
@@ -788,6 +804,11 @@ pub fn run_in_container(
     let global = GlobalConfig::load(config);
     let user_mount_args = build_mount_args(&config.home_dir, &global.mounts)?;
 
+    // See the matching comment in launch_container — main goes on the
+    // per-workspace service network at launch so service containers can be
+    // attached later on rootless podman.
+    let service_net = crate::service::ensure_service_network(rt, workspace)?;
+
     let mut run_args: Vec<String> = vec![
         "run".into(),
         "--rm".into(),
@@ -796,6 +817,8 @@ pub fn run_in_container(
     run_args.extend_from_slice(&[
         "--label".into(),
         "managed-by=ai-pod".into(),
+        "--network".into(),
+        service_net,
         "-v".into(),
         format!("{}:{}:z", volume_name, CONTAINER_HOME),
         "-v".into(),
@@ -834,6 +857,8 @@ pub fn run_in_container(
         .stderr(Stdio::inherit())
         .status()
         .context("Failed to run command in container")?;
+
+    crate::service::cleanup_services_for_session(rt, &session_id);
 
     if !status.success() {
         anyhow::bail!("Command exited with non-zero status");
@@ -966,6 +991,9 @@ pub fn clean_container(
     for dir in &state.masked_directories {
         let _ = remove_mask_volume(rt, workspace, dir);
     }
+
+    // Remove the per-workspace service-container network if it exists.
+    crate::service::remove_service_network(rt, workspace);
 
     Ok(())
 }

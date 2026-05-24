@@ -8,5 +8,7 @@ pub mod image;
 pub mod mount_cli;
 pub mod runtime;
 pub mod server;
+pub mod service;
+pub mod services_cli;
 pub mod update;
 pub mod workspace;

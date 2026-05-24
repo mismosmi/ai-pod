@@ -88,6 +88,7 @@ ai-pod --workdir /path/to/project
 | `clean [--workdir PATH]` | Stop and remove the container for a workspace |
 | `run <command> [args...]` | Run a command in the container instead of the default |
 | `commands [list\|run\|kill\|logs]` | View/manage host commands (interactive TUI if no subcommand) |
+| `services [list\|logs\|stop]` | View/manage service containers started by agents (interactive TUI if no subcommand) |
 | `allowed [list\|add\|remove]` | Manage the always-allowed command whitelist (interactive TUI if no subcommand) |
 | `mask <dir> [--workdir PATH]` | Shadow-mount `/app/<dir>` with an isolated per-workspace volume |
 | `unmask <dir> [--workdir PATH]` | Stop masking `<dir>` and delete its shadow volume |
@@ -158,6 +159,44 @@ The in-container agent talks to the host through an **MCP server** running on th
 | `list_commands` | List commands for this session (or workspace-wide with `scope=workspace`). |
 | `notify_user` | Send a desktop notification to the host user. |
 | `list_allowed_commands` | List host commands previously approved by the user for this workspace. |
+| `start_service` | Start an auxiliary service container (e.g. `postgres:16`) reachable from inside the agent container. |
+| `stop_service` | Stop and remove a service container started by this session. |
+| `list_services` | List service containers started by this session. |
+| `service_logs` | Read the tail of a service container's logs. |
+
+### Service containers
+
+The agent can spin up auxiliary containers (postgres, redis, …) it needs
+for the task at hand by calling the `start_service` MCP tool. Each
+request specifies an image, a short `name`, optional env vars, and
+optional command override. The host user approves the image plus the
+**sorted list of env-var KEY names** (values stay private and never
+enter the on-disk allowlist); re-requesting the same image with the
+same set of keys is auto-approved.
+
+Service containers live on a per-workspace bridge network
+(`ai-pod-<workspace-hash>-net`). The agent reaches a service by the
+`name` it requested, on the service's standard port — e.g. asking for
+`name=postgres image=postgres:16` makes it reachable from the agent
+container as `postgres:5432`. No host port mapping is created.
+
+Services are **ephemeral**. A fresh anonymous volume is allocated each
+session and discarded when the session ends; the service container
+itself is removed as soon as the main ai-pod container exits (or, as a
+backstop, by a periodic sweep in the shared server). `ai-pod clean`
+also removes the per-workspace network.
+
+#### Inspecting services from the host
+
+```sh
+ai-pod services                          # interactive TUI
+ai-pod services list                     # plain list across all sessions
+ai-pod services logs <name> [--lines N]  # tail logs of a service
+ai-pod services stop <name>              # stop a running service
+```
+
+The `--session <id>` flag disambiguates when the same name is in use
+across concurrent sessions on the same workspace.
 
 ### Command output files
 
