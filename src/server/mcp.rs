@@ -297,7 +297,7 @@ async fn handle_start_service(
     };
 
     match commands::run_service_request(state, &image, &env_keys, workspace).await {
-        commands::ApprovalOutcome::Denied => return tool_error("Service start denied by user".into()),
+        commands::ApprovalOutcome::Denied(reason) => return tool_error(reason.message().into()),
         commands::ApprovalOutcome::Timeout => {
             return tool_error("Permission request timed out after 60 seconds.".into());
         }
@@ -569,7 +569,7 @@ async fn handle_tool_call(
                 commands::ApprovalOutcome::Rejected => tool_error(format!(
                     "Command rejected — matches forbidden pattern. Do not use `cd /` or `| head`/`| tail` on the host."
                 )),
-                commands::ApprovalOutcome::Denied => tool_error("Command denied by user".into()),
+                commands::ApprovalOutcome::Denied(reason) => tool_error(reason.message().into()),
                 commands::ApprovalOutcome::Timeout => {
                     tool_error("Permission request timed out after 60 seconds.".into())
                 }

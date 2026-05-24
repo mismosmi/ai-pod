@@ -136,12 +136,12 @@ pub async fn run_command_handler(
             });
             return (StatusCode::BAD_REQUEST, body.to_string()).into_response();
         }
-        commands::ApprovalOutcome::Denied => {
-            return (
-                StatusCode::BAD_REQUEST,
-                r#"{"error":"Command denied by user"}"#,
-            )
-                .into_response();
+        commands::ApprovalOutcome::Denied(reason) => {
+            let body = serde_json::json!({
+                "error": reason.message(),
+                "reason": reason.slug(),
+            });
+            return (StatusCode::BAD_REQUEST, body.to_string()).into_response();
         }
         commands::ApprovalOutcome::Timeout => {
             return (
