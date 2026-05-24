@@ -1,10 +1,107 @@
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub struct AppConfig {
     pub config_dir: PathBuf,
     pub runtime_settings: PathBuf,
     pub home_dir: PathBuf,
+}
+
+/// A user-configured host-to-container bind mount applied to every ai-pod
+/// container launch. Stored as part of [`GlobalConfig`] in
+/// `~/.ai-pod/config.json`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MountSpec {
+    /// Tilde-expanded absolute host path, as the user supplied it. Symlinks
+    /// are intentionally NOT resolved so users can mount things like a
+    /// `~/.claude/skills` directory that is itself a symlink.
+    pub host: String,
+    /// Explicit container target path, or `None` to mirror under
+    /// `/home/ai-pod`. When `None`, the host path must be under the user's
+    /// `$HOME` directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    /// Read-only by default. Set true via `--writable` on `mount add`.
+    #[serde(default)]
+    pub writable: bool,
+}
+
+/// Global ai-pod configuration shared across all workspaces. Persists to
+/// `~/.ai-pod/config.json` with 0o600 permissions.
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+pub struct GlobalConfig {
+    #[serde(default)]
+    pub mounts: Vec<MountSpec>,
+}
+
+impl GlobalConfig {
+    pub fn path(config: &AppConfig) -> PathBuf {
+        config.config_dir.join("config.json")
+    }
+
+    /// Load `~/.ai-pod/config.json`. Returns default if missing or malformed
+    /// (with a stderr warning in the malformed case) so a corrupt file never
+    /// blocks a launch.
+    pub fn load(config: &AppConfig) -> Self {
+        let path = Self::path(config);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => return Self::default(),
+        };
+        match serde_json::from_str(&raw) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "warning: ignoring malformed {}: {}",
+                    path.display(),
+                    e
+                );
+                Self::default()
+            }
+        }
+    }
+
+    pub fn save(&self, config: &AppConfig) -> Result<()> {
+        let path = Self::path(config);
+        let json = serde_json::to_string_pretty(self)?;
+        let tmp = path.with_extension("tmp");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .context("Failed to write global config")?;
+        file.write_all(json.as_bytes())
+            .context("Failed to write global config contents")?;
+        std::fs::rename(&tmp, &path).context("Failed to rename global config")?;
+        // `.mode(0o600)` only takes effect on O_CREAT; a stale tmp from a
+        // crashed earlier run keeps its old mode through truncate. Re-apply
+        // explicitly so the rename target is always 0o600.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .context("Failed to set permissions on global config")?;
+        Ok(())
+    }
+
+    /// Returns false if a mount with the same host path already exists.
+    pub fn add(&mut self, spec: MountSpec) -> bool {
+        if self.mounts.iter().any(|m| m.host == spec.host) {
+            return false;
+        }
+        self.mounts.push(spec);
+        true
+    }
+
+    /// Returns true if a matching mount was removed.
+    pub fn remove(&mut self, host: &str) -> bool {
+        let before = self.mounts.len();
+        self.mounts.retain(|m| m.host != host);
+        before != self.mounts.len()
+    }
 }
 
 impl AppConfig {
@@ -138,5 +235,114 @@ mod tests {
         assert!(!config.config_dir.exists());
         config.init().unwrap();
         assert!(config.config_dir.exists());
+    }
+
+    #[test]
+    fn global_config_load_missing_returns_default() {
+        let dir = TempDir::new().unwrap();
+        let config = temp_config(&dir);
+        let loaded = GlobalConfig::load(&config);
+        assert!(loaded.mounts.is_empty());
+    }
+
+    #[test]
+    fn global_config_round_trips() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let config = temp_config(&dir);
+        config.init().unwrap();
+
+        let mut gc = GlobalConfig::default();
+        assert!(gc.add(MountSpec {
+            host: "/home/user/.claude/skills".into(),
+            container: None,
+            writable: false,
+        }));
+        assert!(gc.add(MountSpec {
+            host: "/etc/secret.pem".into(),
+            container: Some("/run/secrets/secret.pem".into()),
+            writable: true,
+        }));
+        gc.save(&config).unwrap();
+
+        let path = GlobalConfig::path(&config);
+        let perms = std::fs::metadata(&path).unwrap().permissions();
+        assert_eq!(
+            perms.mode() & 0o777,
+            0o600,
+            "config.json must be 0o600 — may contain references to secret paths"
+        );
+
+        let loaded = GlobalConfig::load(&config);
+        assert_eq!(loaded.mounts.len(), 2);
+        assert_eq!(loaded.mounts[0].host, "/home/user/.claude/skills");
+        assert_eq!(loaded.mounts[0].container, None);
+        assert!(!loaded.mounts[0].writable);
+        assert_eq!(loaded.mounts[1].host, "/etc/secret.pem");
+        assert_eq!(
+            loaded.mounts[1].container.as_deref(),
+            Some("/run/secrets/secret.pem")
+        );
+        assert!(loaded.mounts[1].writable);
+    }
+
+    #[test]
+    fn global_config_add_rejects_duplicate_host() {
+        let mut gc = GlobalConfig::default();
+        let spec = MountSpec {
+            host: "/foo".into(),
+            container: None,
+            writable: false,
+        };
+        assert!(gc.add(spec.clone()));
+        assert!(!gc.add(spec));
+        assert_eq!(gc.mounts.len(), 1);
+    }
+
+    #[test]
+    fn global_config_remove_reports_match() {
+        let mut gc = GlobalConfig::default();
+        gc.add(MountSpec {
+            host: "/foo".into(),
+            container: None,
+            writable: false,
+        });
+        assert!(gc.remove("/foo"));
+        assert!(!gc.remove("/foo"));
+        assert!(gc.mounts.is_empty());
+    }
+
+    #[test]
+    fn global_config_load_malformed_returns_default() {
+        let dir = TempDir::new().unwrap();
+        let config = temp_config(&dir);
+        config.init().unwrap();
+        std::fs::write(GlobalConfig::path(&config), "{not valid json").unwrap();
+        let loaded = GlobalConfig::load(&config);
+        assert!(loaded.mounts.is_empty());
+    }
+
+    #[test]
+    fn global_config_save_overwrites_stale_tmp_with_0o600() {
+        // Simulate a stale tmp file from a crashed earlier save with
+        // permissive bits. The `.mode(0o600)` on OpenOptions only takes
+        // effect on O_CREAT, so without the explicit set_permissions after
+        // rename the final file would inherit the looser mode.
+        let dir = TempDir::new().unwrap();
+        let config = temp_config(&dir);
+        config.init().unwrap();
+        let tmp = GlobalConfig::path(&config).with_extension("tmp");
+        std::fs::write(&tmp, "stale").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let gc = GlobalConfig::default();
+        gc.save(&config).unwrap();
+
+        let mode = std::fs::metadata(GlobalConfig::path(&config))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "save must enforce 0o600 even over a stale tmp");
     }
 }

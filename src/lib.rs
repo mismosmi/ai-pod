@@ -5,6 +5,7 @@ pub mod container;
 pub mod credentials;
 pub mod env_files_cli;
 pub mod image;
+pub mod mount_cli;
 pub mod runtime;
 pub mod server;
 pub mod service;

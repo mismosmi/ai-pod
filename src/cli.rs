@@ -141,6 +141,12 @@ pub enum Command {
         workdir: Option<PathBuf>,
     },
 
+    /// Manage host-path bind mounts applied to every ai-pod container.
+    Mount {
+        #[command(subcommand)]
+        action: MountAction,
+    },
+
     /// Update ai-pod to the latest release
     Update,
 }
@@ -219,6 +225,31 @@ pub enum EnvFilesAction {
     Unignore {
         /// Path relative to the workspace
         path: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum MountAction {
+    /// List configured global mounts
+    List,
+    /// Add a host path to the global mount list.
+    /// Spec is `host[:container]`; if container is omitted, the host
+    /// path must be under $HOME and is mirrored under /home/ai-pod.
+    Add {
+        /// `host[:container]` — e.g. `~/.claude/skills` or `/etc/foo:/run/foo`
+        spec: String,
+        /// Mount as read-write (default: read-only)
+        #[arg(long)]
+        writable: bool,
+        /// Skip the interactive confirmation when the path matches a built-in
+        /// warn-list (credentials, system paths, ai-pod's own state, etc.).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Remove a mount by host path (use the exact host path from `mount list`).
+    Remove {
+        /// Host path of the mount to remove
+        host: String,
     },
 }
 
