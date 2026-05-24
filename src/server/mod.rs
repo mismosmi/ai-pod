@@ -195,7 +195,9 @@ async fn reload_handler(State(state): State<AppState>) -> &'static str {
                 Some(s) => s.to_string(),
                 None => continue,
             };
-            if stem == "server" {
+            // "server" = the shared server state, "config" = the global
+            // GlobalConfig (mounts). Neither is a per-project state file.
+            if stem == "server" || stem == "config" {
                 continue;
             }
             let ps = ProjectState::load(&path);
@@ -226,7 +228,9 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
                 Some(s) => s.to_string(),
                 None => continue,
             };
-            if stem == "server" {
+            // "server" = the shared server state, "config" = the global
+            // GlobalConfig (mounts). Neither is a per-project state file.
+            if stem == "server" || stem == "config" {
                 continue;
             }
             let state = ProjectState::load(&path);
