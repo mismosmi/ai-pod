@@ -892,8 +892,6 @@ pub fn clean_container(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workspace::{container_prefix, new_container_name, volume_name};
-    use std::path::Path;
     use tempfile::TempDir;
 
     fn make_test_config(dir: &TempDir) -> AppConfig {
@@ -905,51 +903,6 @@ mod tests {
             config_dir,
             home_dir: home,
         }
-    }
-
-    #[test]
-    fn container_prefix_is_deterministic() {
-        let path = Path::new("/home/user/myproject");
-        assert_eq!(container_prefix(path), container_prefix(path));
-    }
-
-    #[test]
-    fn container_prefix_starts_with_ai_pod() {
-        let name = container_prefix(Path::new("/home/user/myproject"));
-        assert!(name.starts_with("ai-pod-"));
-    }
-
-    #[test]
-    fn new_container_name_starts_with_prefix() {
-        let path = Path::new("/home/user/myproject");
-        assert!(new_container_name(path).starts_with(&container_prefix(path)));
-    }
-
-    #[test]
-    fn new_container_name_is_unique() {
-        let path = Path::new("/home/user/myproject");
-        assert_ne!(new_container_name(path), new_container_name(path));
-    }
-
-    #[test]
-    fn container_prefix_differs_for_different_paths() {
-        let a = container_prefix(Path::new("/home/user/project-a"));
-        let b = container_prefix(Path::new("/home/user/project-b"));
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn volume_name_matches_container_prefix() {
-        let path = Path::new("/home/user/myproject");
-        let vname = volume_name(path);
-        assert_eq!(vname, format!("{}-home", container_prefix(path)));
-    }
-
-    #[test]
-    fn volume_name_differs_for_different_paths() {
-        let a = volume_name(Path::new("/home/user/project-a"));
-        let b = volume_name(Path::new("/home/user/project-b"));
-        assert_ne!(a, b);
     }
 
     #[test]
