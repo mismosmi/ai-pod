@@ -95,11 +95,30 @@ pub enum Command {
         action: Option<CommandsAction>,
     },
 
+    /// View and manage service containers (postgres, redis, etc.) started by
+    /// agents in the current workspace. Run with no subcommand for a TUI.
+    Services {
+        #[command(subcommand)]
+        action: Option<ServicesAction>,
+    },
+
     /// Manage the whitelist of always-allowed commands for a workspace.
     /// Run with no subcommand to open an interactive TUI.
     Allowed {
         #[command(subcommand)]
         action: Option<AllowedAction>,
+    },
+
+    /// Manage sensitive files in the workspace — hide them from the AI,
+    /// expose them, or silence startup warnings.
+    /// Run with no subcommand to open an interactive TUI.
+    EnvFiles {
+        #[command(subcommand)]
+        action: Option<EnvFilesAction>,
+
+        /// Workspace path (default: cwd)
+        #[arg(long)]
+        workdir: Option<PathBuf>,
     },
 
     /// Shadow-mount a top-level workspace directory with an isolated per-workspace volume.
@@ -151,6 +170,55 @@ pub enum CommandsAction {
         command_id: String,
         #[arg(long)]
         session: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ServicesAction {
+    /// Plain list (one row per service)
+    List,
+    /// Print recent log output for a service
+    Logs {
+        name: String,
+        /// Session id (optional; resolved from the workspace if exactly one session owns the name)
+        #[arg(long)]
+        session: Option<String>,
+        /// Number of trailing log lines to print
+        #[arg(long, default_value_t = 50)]
+        lines: usize,
+    },
+    /// Stop and remove a service container
+    Stop {
+        name: String,
+        /// Session id (optional; resolved from the workspace if exactly one session owns the name)
+        #[arg(long)]
+        session: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum EnvFilesAction {
+    /// Print a list of all detected sensitive files with their status
+    List,
+    /// Move a workspace file into ~/.env-files/<slug>/ and replace with a symlink
+    Hide {
+        /// Path relative to the workspace
+        path: String,
+    },
+    /// Restore a hidden file back into the workspace
+    Unhide {
+        /// Path relative to the workspace
+        path: String,
+    },
+    /// Suppress future startup warnings for a workspace file (keeps it readable by the AI)
+    Ignore {
+        /// Path relative to the workspace
+        path: String,
+    },
+    /// Re-enable startup warnings for a previously ignored file
+    Unignore {
+        /// Path relative to the workspace
+        path: String,
     },
 }
 

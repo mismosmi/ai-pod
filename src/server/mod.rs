@@ -59,6 +59,58 @@ async fn version_handler() -> Json<serde_json::Value> {
 const INSTALL_CLAUDE_SH: &str = include_str!("../../templates/install-claude.sh");
 const INSTALL_OPENCODE_SH: &str = include_str!("../../templates/install-opencode.sh");
 
+/// Stub returned when an outdated `ai-pod.Dockerfile` still tries to fetch
+/// `/host-tools`. The bundled `host-tools` binary was removed in 0.11.0 in
+/// favour of inline install scripts. Old Dockerfiles will write this script
+/// to /usr/local/bin/host-tools and then invoke `host-tools install <agent>`,
+/// which will print the upgrade instructions below and fail the build.
+const HOST_TOOLS_DEPRECATED_STUB: &str = r#"#!/bin/sh
+cat >&2 <<'EOF'
+
+================================================================================
+  ai-pod: your ai-pod.Dockerfile is out of date
+================================================================================
+
+  The `host-tools` helper binary was removed in ai-pod 0.11.0. The server no
+  longer ships it, so your Dockerfile cannot build.
+
+  To upgrade, replace your project's ai-pod.Dockerfile with the current
+  template. For a default claude pod it looks like this:
+
+    FROM rust:latest
+
+    ARG HOST_GATEWAY
+    RUN curl -fsSL "http://${HOST_GATEWAY}:7822/install/claude.sh" | bash
+
+    WORKDIR /app
+    RUN useradd -ms /bin/bash ai-pod
+    RUN chown -R ai-pod /app
+
+    RUN git config --system user.email "ai-pod@ai-pod" && \
+        git config --system user.name "ai-pod"
+
+    USER ai-pod
+    ENV PATH="/home/ai-pod/.local/bin:${PATH}"
+
+    CMD ["claude"]
+
+  Swap `claude` for `opencode` if that is the agent you use. See the project
+  README for the full template.
+
+================================================================================
+EOF
+exit 1
+"#;
+
+async fn host_tools_deprecated_handler() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
+        HOST_TOOLS_DEPRECATED_STUB,
+    )
+        .into_response()
+}
+
 async fn install_script_handler(AxumPath(name): AxumPath<String>) -> Response {
     let body = match name.as_str() {
         "claude.sh" => INSTALL_CLAUDE_SH,
@@ -126,8 +178,90 @@ pub fn build_app(state: AppState) -> Router {
     // Unthrottled: install scripts (fetched at image build time, idempotent)
     Router::new()
         .route("/install/{name}", get(install_script_handler))
+        .route("/host-tools", get(host_tools_deprecated_handler))
         .merge(rate_limited)
         .with_state(state)
+}
+
+/// Find live `ai-pod-parent={session_id}` labels whose corresponding main
+/// container is no longer running and remove the service containers tied to
+/// them.
+///
+/// Label format note: `ps --format "{{.Labels}}"` emits `k=v,k=v` (equals
+/// inside, commas between entries). This is distinct from `inspect --format
+/// "{{.Config.Labels}}"`, which uses Go's `map[k:v]` rendering with colons —
+/// don't reuse this parser for inspect output.
+async fn sweep_orphan_services(rt: &ContainerRuntime) {
+    // Set of session ids currently backed by a live main container.
+    let main_output = rt
+        .async_command()
+        .args([
+            "ps",
+            "--filter",
+            "label=managed-by=ai-pod",
+            "--format",
+            "{{.Names}}\t{{.Labels}}",
+        ])
+        .output()
+        .await;
+    let mut live_sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Ok(o) = main_output {
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            let mut parts = line.splitn(2, '\t');
+            let name = parts.next().unwrap_or("");
+            let labels = parts.next().unwrap_or("");
+            // Skip containers that are themselves services — their parent label
+            // makes them ineligible to be a "main" container.
+            if labels.contains("ai-pod-service=true") {
+                continue;
+            }
+            if let Some(sid) = crate::workspace::session_id_from_container_name(name) {
+                live_sessions.insert(sid);
+            }
+        }
+    }
+
+    // List services and reap any whose parent session isn't live.
+    let services = rt
+        .async_command()
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            "label=ai-pod-service=true",
+            "--format",
+            "{{.Names}}\t{{.Labels}}",
+        ])
+        .output()
+        .await;
+    let services = match services {
+        Ok(o) => o.stdout,
+        Err(_) => return,
+    };
+    for line in String::from_utf8_lossy(&services).lines() {
+        let mut parts = line.splitn(2, '\t');
+        let name = parts.next().unwrap_or("");
+        let labels = parts.next().unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        // Labels come back comma-separated as `k=v,k=v`. Find ai-pod-parent.
+        let parent = labels
+            .split(',')
+            .find_map(|kv| kv.trim().strip_prefix("ai-pod-parent="))
+            .map(|s| s.to_string());
+        let Some(parent) = parent else { continue };
+        if live_sessions.contains(&parent) {
+            continue;
+        }
+        let _ = rt
+            .async_command()
+            .args(["rm", "--force", name])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+    }
 }
 
 async fn reload_handler(State(state): State<AppState>) -> &'static str {
@@ -205,6 +339,13 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
             interval.tick().await;
+
+            // Sweep services whose parent session is no longer running. This
+            // is the backstop for the CLI's in-line cleanup: if `ai-pod` was
+            // SIGKILL'd before reaching that branch, the orphaned service
+            // containers would otherwise linger until `ai-pod clean`.
+            sweep_orphan_services(&shutdown_rt).await;
+
             if Instant::now() < *shutdown_keep_alive.lock().await {
                 continue;
             }

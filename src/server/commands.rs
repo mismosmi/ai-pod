@@ -122,17 +122,42 @@ pub async fn request_approval(
     command: &str,
     project_name: &str,
 ) -> ApprovalDecision {
+    request_approval_with_body(
+        state,
+        format!("Run command:\n{}", command),
+        // macOS dialog needs the literal command string as a script arg.
+        command,
+        project_name,
+    )
+    .await
+}
+
+/// Show the approval dialog for an arbitrary action.
+///
+/// `body` is the multi-line message shown to the user on Linux. `subject` is
+/// the raw item being approved (used as the AppleScript argument on macOS so
+/// the script can render whatever wording it wants). `project_name` titles the
+/// dialog. All three are passed through the existing `approval_lock` so two
+/// approval prompts can't appear at once.
+async fn request_approval_with_body(
+    state: &AppState,
+    body: String,
+    subject: &str,
+    project_name: &str,
+) -> ApprovalDecision {
     let _guard = state.approval_lock.lock().await;
-    let command = command.to_string();
+    let body = body;
+    let subject = subject.to_string();
     let project_name = project_name.to_string();
 
     tokio::task::spawn_blocking(move || {
         #[cfg(target_os = "linux")]
         {
+            let _ = &subject; // unused on linux; macOS branch consumes it
             let mut decision = ApprovalDecision::PermissionTimeout;
             let result = notify_rust::Notification::new()
                 .summary(&format!("ai-pod: {}", project_name))
-                .body(&format!("Run command:\n{}", command))
+                .body(&body)
                 .action("allow_once", "Allow Once")
                 .action("always_allow", "Always Allow")
                 .action("deny", "Deny")
@@ -155,9 +180,10 @@ pub async fn request_approval(
         }
         #[cfg(target_os = "macos")]
         {
+            let _ = &body; // body is rendered by the AppleScript itself
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
-                let output = build_approval_command(&command, &project_name).output();
+                let output = build_approval_command(&subject, &project_name).output();
                 let _ = tx.send(output);
             });
             match rx.recv_timeout(std::time::Duration::from_secs(60)) {
@@ -171,6 +197,7 @@ pub async fn request_approval(
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
+            let _ = (&body, &subject);
             ApprovalDecision::Deny(DenialReason::NoReason)
         }
     })
@@ -263,6 +290,55 @@ pub fn get_allowed_commands(state: &AppState, workspace: &Path) -> Vec<String> {
     let state_file = state.config_dir.join(format!("{}.json", hash));
     let project_state = ProjectState::load(&state_file);
     project_state.allowed_commands
+}
+
+/// Canonical string that identifies a `start_service` request for approval
+/// purposes. Only the env-var KEY names are included (sorted), so secret
+/// values never enter the on-disk allowlist.
+pub fn service_approval_key(image: &str, env_keys: &[String]) -> String {
+    if env_keys.is_empty() {
+        return image.to_string();
+    }
+    let mut keys = env_keys.to_vec();
+    keys.sort();
+    keys.dedup();
+    format!("{} with env [{}]", image, keys.join(", "))
+}
+
+/// Approve (or pre-approve) a service-container start request. Mirrors
+/// `run_host_command` but consults `allowed_services` instead of
+/// `allowed_commands` and prompts with a service-flavoured message.
+pub async fn run_service_request(
+    state: &AppState,
+    image: &str,
+    env_keys: &[String],
+    workspace: &Path,
+) -> ApprovalOutcome {
+    let key = service_approval_key(image, env_keys);
+    let hash = workspace_hash(workspace);
+    let state_file = state.config_dir.join(format!("{}.json", hash));
+    let ps = ProjectState::load(&state_file);
+    if ps.is_service_allowed(&key) {
+        return ApprovalOutcome::Approved;
+    }
+
+    let project_name = workspace
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let body = format!("Start service container:\n{}", key);
+    match request_approval_with_body(state, body, &key, &project_name).await {
+        ApprovalDecision::AllowOnce => ApprovalOutcome::Approved,
+        ApprovalDecision::AlwaysAllow => {
+            let mut ps = ProjectState::load(&state_file);
+            ps.add_allowed_service(&key);
+            let _ = ps.save(&state_file);
+            ApprovalOutcome::AlwaysAllow
+        }
+        ApprovalDecision::Deny(reason) => ApprovalOutcome::Denied(reason),
+        ApprovalDecision::PermissionTimeout => ApprovalOutcome::Timeout,
+    }
 }
 
 #[cfg(test)]
@@ -471,5 +547,40 @@ mod tests {
         assert!(!check_command_rejected("ls | headroom"));
         assert!(!check_command_rejected("ls | tailored"));
         assert!(!check_command_rejected("ls | heading"));
+    }
+
+    #[test]
+    fn service_approval_key_drops_env_when_empty() {
+        assert_eq!(service_approval_key("postgres:16", &[]), "postgres:16");
+    }
+
+    #[test]
+    fn service_approval_key_sorts_env_keys() {
+        let unsorted = vec!["POSTGRES_USER".to_string(), "POSTGRES_DB".to_string()];
+        let sorted = vec!["POSTGRES_DB".to_string(), "POSTGRES_USER".to_string()];
+        assert_eq!(
+            service_approval_key("postgres:16", &unsorted),
+            service_approval_key("postgres:16", &sorted),
+        );
+        assert_eq!(
+            service_approval_key("postgres:16", &sorted),
+            "postgres:16 with env [POSTGRES_DB, POSTGRES_USER]",
+        );
+    }
+
+    #[test]
+    fn service_approval_key_dedupes_env_keys() {
+        let dupes = vec!["A".to_string(), "A".to_string(), "B".to_string()];
+        assert_eq!(
+            service_approval_key("img", &dupes),
+            "img with env [A, B]",
+        );
+    }
+
+    #[test]
+    fn service_approval_key_differs_when_keys_differ() {
+        let a = service_approval_key("postgres:16", &["A".to_string()]);
+        let b = service_approval_key("postgres:16", &["B".to_string()]);
+        assert_ne!(a, b);
     }
 }

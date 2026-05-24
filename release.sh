@@ -33,11 +33,11 @@ if [ "$LOCAL" != "$REMOTE" ]; then
     exit 1
 fi
 
-# Update version in Cargo.toml
-sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml && rm Cargo.toml.bak
-
 # Run tests
 cargo test
+
+# Update version in Cargo.toml
+sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml && rm Cargo.toml.bak
 
 # Commit version bump
 git add Cargo.toml Cargo.lock

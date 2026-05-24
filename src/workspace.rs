@@ -47,6 +47,60 @@ pub fn mask_volume_name(workspace: &Path, dir: &str) -> String {
     format!("ai-pod-{}-mask-{}", workspace_hash(workspace), dir)
 }
 
+/// Per-workspace bridge network used to wire service containers to the
+/// running main container so the agent can reach them by name.
+pub fn service_network_name(workspace: &Path) -> String {
+    format!("ai-pod-{}-net", workspace_hash(workspace))
+}
+
+/// Container name for a service requested by the given main-container session.
+/// Embedding the session id keeps two concurrent ai-pod sessions on the same
+/// workspace from colliding on the same service name.
+pub fn service_container_name(workspace: &Path, session_id: &str, name: &str) -> String {
+    format!(
+        "ai-pod-{}-{}-svc-{}",
+        workspace_hash(workspace),
+        session_id,
+        name
+    )
+}
+
+/// Validate a user-supplied service name. Returns the trimmed name on success.
+///
+/// Rules: 1..=30 ASCII chars, lowercase alphanumeric or `-`, must start with an
+/// alphanumeric. Doubles as DNS alias on the workspace network, so we keep it
+/// to a strict subset of RFC 1123 hostname rules. The 30-char cap keeps the
+/// derived container name under podman/docker's 63-char limit.
+pub fn validate_service_name(name: &str) -> Result<&str, String> {
+    if name.is_empty() {
+        return Err("service name must not be empty".into());
+    }
+    if name.len() > 30 {
+        return Err(format!(
+            "service name '{}' too long ({} chars, max 30)",
+            name,
+            name.len()
+        ));
+    }
+    let first = name.chars().next().unwrap();
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return Err(format!(
+            "service name '{}' must start with a lowercase letter or digit",
+            name
+        ));
+    }
+    for c in name.chars() {
+        let ok = c.is_ascii_digit() || (c.is_ascii_alphabetic() && c.is_ascii_lowercase()) || c == '-';
+        if !ok {
+            return Err(format!(
+                "service name '{}' contains invalid character '{}' (only [a-z0-9-] allowed)",
+                name, c
+            ));
+        }
+    }
+    Ok(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +166,78 @@ mod tests {
         let a = container_prefix(Path::new("/home/user/project-a"));
         let b = container_prefix(Path::new("/home/user/project-b"));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn service_network_name_is_per_workspace() {
+        let p = Path::new("/home/user/myproject");
+        assert_eq!(
+            service_network_name(p),
+            format!("ai-pod-{}-net", workspace_hash(p))
+        );
+        let other = Path::new("/home/user/other");
+        assert_ne!(service_network_name(p), service_network_name(other));
+    }
+
+    #[test]
+    fn service_container_name_embeds_workspace_and_session() {
+        let p = Path::new("/home/user/myproject");
+        assert_eq!(
+            service_container_name(p, "abcd1234", "postgres"),
+            format!("ai-pod-{}-abcd1234-svc-postgres", workspace_hash(p))
+        );
+    }
+
+    #[test]
+    fn service_container_name_differs_between_sessions() {
+        let p = Path::new("/home/user/myproject");
+        assert_ne!(
+            service_container_name(p, "aaaa1111", "postgres"),
+            service_container_name(p, "bbbb2222", "postgres"),
+        );
+    }
+
+    #[test]
+    fn service_container_name_stays_under_docker_limit() {
+        let p = Path::new("/home/user/myproject");
+        let name = service_container_name(p, "abcd1234", &"x".repeat(30));
+        assert!(name.len() <= 63, "got {} chars: {}", name.len(), name);
+    }
+
+    #[test]
+    fn validate_service_name_accepts_typical_names() {
+        assert!(validate_service_name("postgres").is_ok());
+        assert!(validate_service_name("redis").is_ok());
+        assert!(validate_service_name("redis-7").is_ok());
+        assert!(validate_service_name("db1").is_ok());
+        assert!(validate_service_name("a").is_ok());
+    }
+
+    #[test]
+    fn validate_service_name_rejects_uppercase_and_punctuation() {
+        assert!(validate_service_name("Postgres").is_err());
+        assert!(validate_service_name("pg/x").is_err());
+        assert!(validate_service_name("pg_x").is_err());
+        assert!(validate_service_name("pg.x").is_err());
+    }
+
+    #[test]
+    fn validate_service_name_uppercase_first_char_message_blames_first_char() {
+        let err = validate_service_name("Postgres").unwrap_err();
+        assert!(
+            err.contains("must start with a lowercase letter or digit"),
+            "expected first-char error for uppercase first letter, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_service_name_rejects_empty_and_too_long() {
+        assert!(validate_service_name("").is_err());
+        assert!(validate_service_name(&"a".repeat(31)).is_err());
+    }
+
+    #[test]
+    fn validate_service_name_rejects_leading_dash() {
+        assert!(validate_service_name("-postgres").is_err());
     }
 }
