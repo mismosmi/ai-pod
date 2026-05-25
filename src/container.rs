@@ -284,7 +284,12 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
 
     let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
     let hooks_obj = hooks.as_object_mut().context("hooks is not an object")?;
-    hooks_obj.insert("Stop".to_string(), stop_hook);
+    hooks_obj.insert("Stop".to_string(), stop_hook.clone());
+    // SubagentStop fires when a subagent finishes — including when the
+    // user interrupts a subagent's turn. Treat it the same as Stop so
+    // rows recover from "Working..." after cancellations that don't
+    // bubble up as a top-level Stop.
+    hooks_obj.insert("SubagentStop".to_string(), stop_hook);
     hooks_obj.insert("Notification".to_string(), notification_hook);
     hooks_obj.insert("UserPromptSubmit".to_string(), prompt_submit_hook);
 

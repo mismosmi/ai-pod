@@ -115,6 +115,12 @@ impl AttachedTerm {
         self.alive.load(Ordering::Acquire)
     }
 
+    /// Forward a wheel scroll to the agent's pty. Stubbed for now —
+    /// emitting a proper SGR mouse sequence requires us to know which
+    /// mouse protocol mode the agent has enabled, and most TUIs we care
+    /// about (claude, opencode) don't use the wheel anyway.
+    pub fn send_scroll(&mut self, _up: bool, _col: u16, _row: u16) {}
+
     /// Adjust pty + parser to the given pane size (subtracting borders).
     pub fn resize(&mut self, rows: u16, cols: u16) {
         if rows == self.rows && cols == self.cols {

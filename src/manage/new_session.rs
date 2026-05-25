@@ -446,6 +446,7 @@ fn start_launch(state: &mut NewSessionState, rt: ContainerRuntime, workspace: Pa
                     &image_l,
                     &project_id_l,
                     &api_key_l,
+                    None,
                 )?;
                 // Immediately attach to the new container's pty so the main
                 // loop can take ownership without an extra round-trip
