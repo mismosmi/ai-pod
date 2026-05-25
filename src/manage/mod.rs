@@ -295,8 +295,8 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, state: &mut State) ->
 
         // ---- footer ----
         let hint = match state.focus {
-            Focus::List => " ↑/↓ select · Enter focus terminal · n new session · q quit ",
-            Focus::Term => " F1 back to list  (keys forward to agent) ",
+            Focus::List => " ↑/↓ select · Enter focus terminal · n new session · q/F10 quit ",
+            Focus::Term => " F1 back to list · F10 quit  (other keys → agent) ",
         };
         let footer_p = Paragraph::new(hint).style(Style::default().fg(Color::DarkGray));
         f.render_widget(footer_p, footer);
@@ -315,6 +315,11 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, state: &mut State) ->
 
 /// Returns true if the loop should exit.
 fn handle_key(state: &mut State, key: &KeyEvent) -> bool {
+    // Global quit — works from any focus so the user is never stuck inside
+    // the terminal pane with keystrokes being forwarded to the agent.
+    if key.code == KeyCode::F(10) {
+        return true;
+    }
     match state.focus {
         Focus::List => match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return true,
