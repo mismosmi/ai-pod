@@ -3,8 +3,6 @@
 //! agent container that the TUI then attaches to.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -13,10 +11,24 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::cli::{Agent, BaseImage};
 use crate::config::AppConfig;
 use crate::runtime::ContainerRuntime;
+
+use super::terminal::AttachedTerm;
+
+/// Events streamed from the background launch task into the modal. Once
+/// `Done` or `Error` arrives the task exits and the channel sender is
+/// dropped; no polling needed beyond draining whatever is queued each frame.
+pub enum LaunchEvent {
+    Log(String),
+    /// `podman run -d -it` succeeded and we already attached a pty to it.
+    /// The main loop inserts the term directly into `state.attached`.
+    Done(AttachedTerm),
+    Error(String),
+}
 
 /// What the new-session modal is currently showing.
 pub enum Stage {
@@ -40,9 +52,12 @@ pub enum Stage {
     },
     Launching {
         workspace: PathBuf,
-        log: Arc<Mutex<Vec<String>>>,
-        done: Arc<AtomicBool>,
-        error: Arc<Mutex<Option<String>>>,
+        log: Vec<String>,
+        rx: UnboundedReceiver<LaunchEvent>,
+        /// `None` while the task is still running; `Some(Ok())` on success
+        /// (the AttachedTerm has already been handed to the main loop), or
+        /// `Some(Err(msg))` if the task failed.
+        result: Option<std::result::Result<(), String>>,
     },
 }
 
@@ -80,7 +95,7 @@ pub fn handle_key(
     // Esc always closes (except while a launch is in progress; let the user
     // close once it's done).
     if key.code == KeyCode::Esc {
-        if matches!(&state.stage, Stage::Launching { done, .. } if !done.load(Ordering::Acquire)) {
+        if matches!(&state.stage, Stage::Launching { result, .. } if result.is_none()) {
             return Ok(false);
         }
         return Ok(true);
@@ -204,11 +219,10 @@ pub fn handle_key(
             }
             _ => {}
         },
-        Stage::Launching { done, .. } => {
-            // Enter/space closes once we're done.
-            if matches!(key.code, KeyCode::Enter | KeyCode::Char(' '))
-                && done.load(Ordering::Acquire)
-            {
+        Stage::Launching { result, .. } => {
+            // Enter/space closes once we're done. On success the main loop
+            // already auto-closed; this is the manual fallback (errors).
+            if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) && result.is_some() {
                 return Ok(true);
             }
         }
@@ -380,33 +394,23 @@ fn advance_after_pick(state: &mut NewSessionState, path: PathBuf) -> Result<()> 
 /// mode and pipes progress into `log`. The TUI watches `done` / `error` to
 /// know when to allow closing the modal.
 fn start_launch(state: &mut NewSessionState, rt: ContainerRuntime, workspace: PathBuf) {
-    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let done = Arc::new(AtomicBool::new(false));
-    let error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-
-    let log_t = log.clone();
-    let done_t = done.clone();
-    let error_t = error.clone();
+    let (tx, rx) = unbounded_channel::<LaunchEvent>();
     let workspace_t = workspace.clone();
 
     tokio::spawn(async move {
-        let push = |msg: &str| {
-            if let Ok(mut g) = log_t.lock() {
-                g.push(msg.to_string());
-            }
+        let log = |tx: &UnboundedSender<LaunchEvent>, msg: &str| {
+            let _ = tx.send(LaunchEvent::Log(msg.to_string()));
         };
-        let result: Result<()> = (async {
+        let result: Result<AttachedTerm> = (async {
             let config = AppConfig::new()?;
             config.init()?;
 
-            push("Ensuring shared server is running...");
+            log(&tx, "Ensuring shared server is running...");
             crate::server::lifecycle::ensure_shared_server(&config).await?;
 
-            push("Building image (this can take a few minutes)...");
+            log(&tx, "Building image (this can take a few minutes)...");
             let image_name = crate::image::image_name(&workspace_t);
             let dockerfile = workspace_t.join(crate::image::DOCKERFILE_NAME);
-            // Run the synchronous build off the async runtime so we don't
-            // starve other tasks (the UI keeps drawing in the meantime).
             let rt_b = rt.clone();
             let dockerfile_b = dockerfile.clone();
             let image_b = image_name.clone();
@@ -419,57 +423,95 @@ fn start_launch(state: &mut NewSessionState, rt: ContainerRuntime, workspace: Pa
             crate::server::lifecycle::bump_keep_alive().await;
             crate::server::lifecycle::check_server_version().await?;
 
-            push("Preparing project state...");
+            log(&tx, "Preparing project state...");
             let project_id = crate::workspace::workspace_hash(&workspace_t);
-            let state =
+            let proj_state =
                 crate::server::lifecycle::get_or_create_project_state(&config, &workspace_t)?;
             crate::server::lifecycle::reload_config().await?;
 
-            push("Starting detached container...");
+            log(&tx, "Starting detached container...");
+            // Run the synchronous container start + pty attach off the async
+            // runtime, then ship the live AttachedTerm back to the main loop.
             let rt_l = rt.clone();
             let workspace_l = workspace_t.clone();
             let config_l = AppConfig::new()?;
             let image_l = image_name.clone();
-            let api_key_l = state.api_key.clone();
+            let api_key_l = proj_state.api_key.clone();
             let project_id_l = project_id.clone();
-            let name = tokio::task::spawn_blocking(move || {
-                crate::container::start_container_detached(
+            let term = tokio::task::spawn_blocking(move || -> Result<AttachedTerm> {
+                let name = crate::container::start_container_detached(
                     &rt_l,
                     &config_l,
                     &workspace_l,
                     &image_l,
                     &project_id_l,
                     &api_key_l,
-                )
+                )?;
+                // Immediately attach to the new container's pty so the main
+                // loop can take ownership without an extra round-trip
+                // through refresh_agents().
+                let term = AttachedTerm::attach(&rt_l, &name)?;
+                Ok(term)
             })
             .await
             .map_err(|e| anyhow::anyhow!("launch task join: {e}"))??;
 
-            push(&format!("Container started: {name}"));
-            Ok(())
+            Ok(term)
         })
         .await;
 
         match result {
-            Ok(()) => {
-                push("Done. Press Enter to close.");
+            Ok(term) => {
+                let _ = tx.send(LaunchEvent::Done(term));
             }
             Err(e) => {
-                push(&format!("ERROR: {e}"));
-                if let Ok(mut g) = error_t.lock() {
-                    *g = Some(e.to_string());
-                }
+                let msg = e.to_string();
+                let _ = tx.send(LaunchEvent::Error(msg));
             }
         }
-        done_t.store(true, Ordering::Release);
+        // tx drops here → main loop sees the channel close after draining.
     });
 
     state.stage = Stage::Launching {
         workspace,
-        log,
-        done,
-        error,
+        log: Vec::new(),
+        rx,
+        result: None,
     };
+}
+
+/// Drain whatever events the launch task has sent so far into the modal
+/// state. Returns the AttachedTerm when the task finished successfully so
+/// the caller can plug it into `state.attached` and auto-close the modal.
+pub fn drain_launch_events(state: &mut NewSessionState) -> Option<AttachedTerm> {
+    let Stage::Launching {
+        log, rx, result, ..
+    } = &mut state.stage
+    else {
+        return None;
+    };
+    if result.is_some() {
+        return None;
+    }
+    let mut term_out: Option<AttachedTerm> = None;
+    loop {
+        match rx.try_recv() {
+            Ok(LaunchEvent::Log(msg)) => log.push(msg),
+            Ok(LaunchEvent::Done(term)) => {
+                log.push(format!("Container started: {}", term.container_name));
+                *result = Some(Ok(()));
+                term_out = Some(term);
+                break;
+            }
+            Ok(LaunchEvent::Error(msg)) => {
+                log.push(format!("ERROR: {msg}"));
+                *result = Some(Err(msg));
+                break;
+            }
+            Err(_) => break, // empty or closed
+        }
+    }
+    term_out
 }
 
 /// Render the modal centred over `area`. Caller draws the main view first;
@@ -505,9 +547,9 @@ pub fn render(state: &NewSessionState, frame: &mut Frame<'_>, area: Rect) {
         Stage::Launching {
             workspace,
             log,
-            done,
-            error,
-        } => render_launching(frame, inner, workspace, log, done, error),
+            result,
+            ..
+        } => render_launching(frame, inner, workspace, log, result),
     }
 }
 
@@ -651,51 +693,72 @@ fn render_launching(
     frame: &mut Frame<'_>,
     inner: Rect,
     workspace: &Path,
-    log: &Arc<Mutex<Vec<String>>>,
-    done: &Arc<AtomicBool>,
-    error: &Arc<Mutex<Option<String>>>,
+    log: &[String],
+    result: &Option<std::result::Result<(), String>>,
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(3), Constraint::Length(1)])
         .split(inner);
 
-    let header = Paragraph::new(format!("Launching agent for {}", workspace.display()))
+    let workspace_str = workspace.display().to_string();
+    // Inner area of the header block is chunks[0].width - 2 (left + right borders).
+    let header_text = truncate_to(
+        &format!("Launching agent for {workspace_str}"),
+        chunks[0].width.saturating_sub(2) as usize,
+    );
+    let header = Paragraph::new(header_text)
         .block(Block::default().borders(Borders::ALL).title(" launch "));
     frame.render_widget(header, chunks[0]);
 
+    // Log body. Long lines are truncated with an ellipsis so they can never
+    // spill past the modal — image builds in particular like to emit very
+    // long lines (full layer ids, urls, etc.).
+    let inner_w = chunks[1].width.saturating_sub(2) as usize;
+    let inner_h = chunks[1].height.saturating_sub(2) as usize;
     let lines: Vec<Line> = log
-        .lock()
-        .map(|g| {
-            g.iter()
-                .rev()
-                .take(chunks[1].height.saturating_sub(2) as usize)
-                .rev()
-                .map(|s| {
-                    if s.starts_with("ERROR") {
-                        Line::from(Span::styled(s.clone(), Style::default().fg(Color::Red)))
-                    } else {
-                        Line::from(s.clone())
-                    }
-                })
-                .collect()
+        .iter()
+        .rev()
+        .take(inner_h)
+        .rev()
+        .map(|s| {
+            let trimmed = truncate_to(s, inner_w);
+            if s.starts_with("ERROR") {
+                Line::from(Span::styled(trimmed, Style::default().fg(Color::Red)))
+            } else {
+                Line::from(trimmed)
+            }
         })
-        .unwrap_or_default();
+        .collect();
     let body = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(" log "));
     frame.render_widget(body, chunks[1]);
 
-    let is_done = done.load(Ordering::Acquire);
-    let has_err = error.lock().map(|g| g.is_some()).unwrap_or(false);
-    let hint = if !is_done {
-        " building..."
-    } else if has_err {
-        " failed · Esc/Enter to close "
-    } else {
-        " done · Enter to close "
+    let hint = match result {
+        None => " building...",
+        Some(Ok(())) => " done · Enter to close ",
+        Some(Err(_)) => " failed · Esc/Enter to close ",
     };
     let p = Paragraph::new(hint).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(p, chunks[2]);
+}
+
+/// Truncate a string to a max display width, appending `…` if shortened. We
+/// count chars rather than bytes because non-ASCII chars commonly appear in
+/// log output (the ellipsis itself, status icons, etc.); `width` is close
+/// enough to terminal columns for typical content.
+fn truncate_to(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
+    }
+    let take = max.saturating_sub(1);
+    let mut out: String = s.chars().take(take).collect();
+    out.push('…');
+    out
 }
 
 fn centred(area: Rect, max_w: u16, max_h: u16) -> Rect {

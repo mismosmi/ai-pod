@@ -48,6 +48,11 @@ impl AttachedTerm {
         // Pick a detach sequence the user is extremely unlikely to type.
         // The default ctrl-p,ctrl-q would silently detach the agent's input.
         cmd.arg("--detach-keys=ctrl-^,ctrl-^");
+        // Do NOT forward signals from our attach pty to the container — when
+        // the TUI exits and the pty closes, the resulting SIGHUP would
+        // otherwise propagate into the container and kill the agent. We want
+        // exit to behave like a detach, so the container keeps running.
+        cmd.arg("--sig-proxy=false");
         cmd.arg(container_name);
         // Inherit no env from the parent — `podman` reads its own config.
         cmd.env("TERM", "xterm-256color");
@@ -152,7 +157,16 @@ impl AttachedTerm {
                     buf.extend_from_slice(c.to_string().as_bytes());
                 }
             }
-            KeyCode::Enter => buf.push(b'\r'),
+            // Shift+Enter → Alt+CR (`\x1b\r`). Claude Code (and most modern
+            // terminal chat UIs) treat this as "insert newline" rather than
+            // "submit". Plain Enter stays `\r`.
+            KeyCode::Enter => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    buf.extend_from_slice(b"\x1b\r");
+                } else {
+                    buf.push(b'\r');
+                }
+            }
             KeyCode::Tab => buf.push(b'\t'),
             KeyCode::BackTab => buf.extend_from_slice(b"\x1b[Z"),
             KeyCode::Backspace => buf.push(0x7f),

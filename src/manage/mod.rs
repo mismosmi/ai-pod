@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    MouseButton, MouseEvent, MouseEventKind,
+    KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -66,12 +67,27 @@ pub async fn run_manage(rt: ContainerRuntime) -> Result<()> {
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture).context("enter alt screen")?;
+    // Best-effort: ask the terminal to report modifier-disambiguated key
+    // events (kitty keyboard protocol). Without this, Shift+Enter arrives
+    // as plain Enter on most terminals. Silently ignored if the host
+    // terminal doesn't support it.
+    let kbd_enhanced = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        )
+    )
+    .is_ok();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("create terminal")?;
 
     let result = run_loop(&mut terminal, rt, agents_dir).await;
 
     disable_raw_mode().ok();
+    if kbd_enhanced {
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    }
     execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen).ok();
     terminal.show_cursor().ok();
 
@@ -99,6 +115,32 @@ async fn run_loop(
         if state.last_refresh.elapsed() > Duration::from_millis(500) {
             refresh_agents(&mut state);
             state.last_refresh = Instant::now();
+        }
+
+        // While the new-session modal is open, drain any launch events the
+        // background task has produced. On success the task hands us a
+        // ready-to-go AttachedTerm — we plug it straight into state.attached,
+        // close the modal, and jump to the terminal pane. This means we only
+        // touch the channel when the modal is actually open, instead of
+        // polling for an outcome every frame.
+        let mut handed_term: Option<AttachedTerm> = None;
+        if let Screen::NewSession(ref mut s) = state.screen {
+            handed_term = new_session::drain_launch_events(s);
+        }
+        if let Some(term) = handed_term {
+            let name = term.container_name.clone();
+            state.attached.insert(name.clone(), term);
+            state.screen = Screen::Main;
+            refresh_agents(&mut state);
+            state.last_refresh = Instant::now();
+            if let Some(idx) = state
+                .agents
+                .iter()
+                .position(|a| a.container_name == name)
+            {
+                state.list_state.select(Some(idx));
+                state.focus = Focus::Term;
+            }
         }
 
         draw(terminal, &mut state)?;
@@ -268,13 +310,23 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, state: &mut State) ->
         f.render_stateful_widget(list, list_area, &mut state.list_state);
 
         // ---- terminal pane ----
+        // When the new-session modal is open we skip rendering the agent's
+        // vt100 grid entirely: the modal only Clears its own rect, so any
+        // cells the pane writes outside the modal's bounds would "leak"
+        // around the popover.
+        let modal_open = matches!(state.screen, Screen::NewSession(_));
         let selected_name = state
             .list_state
             .selected()
             .and_then(|i| state.agents.get(i))
             .map(|a| a.container_name.clone());
         let mut cursor_pos: Option<(u16, u16)> = None;
-        if let Some(name) = selected_name.as_deref() {
+        if modal_open {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray));
+            f.render_widget(block, term_area);
+        } else if let Some(name) = selected_name.as_deref() {
             if let Some(term) = state.attached.get_mut(name) {
                 let title = format!(" {} ", name);
                 cursor_pos = term.render(f, term_area, state.focus == Focus::Term, &title);
@@ -301,8 +353,10 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, state: &mut State) ->
         let footer_p = Paragraph::new(hint).style(Style::default().fg(Color::DarkGray));
         f.render_widget(footer_p, footer);
 
-        if let Some((cx, cy)) = cursor_pos {
-            f.set_cursor_position((cx, cy));
+        if !modal_open {
+            if let Some((cx, cy)) = cursor_pos {
+                f.set_cursor_position((cx, cy));
+            }
         }
 
         if let Screen::NewSession(ref s) = state.screen {

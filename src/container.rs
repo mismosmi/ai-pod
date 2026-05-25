@@ -239,14 +239,14 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
 
     // Mirror notify_user to the new /agent_status endpoint so the manage TUI
     // sees the same transitions (Idle on Stop, AwaitingInput on Notification).
-    // The Notification hook receives JSON on stdin; pull `.message` out with
-    // jq if present, falling back to a hard-coded label so the hook still
-    // works in containers without jq installed.
-    let agent_status_curl = |status: &str, fallback_line: &str| {
+    // Uses the same single-quote-concat style as notify_curl — no jq, no
+    // printf — so it parses on /bin/sh inside minimal containers and doesn't
+    // contend with notify_curl for stdin.
+    let agent_status_curl = |status: &str, line: &str| {
         format!(
-            "MSG=$(jq -r .message 2>/dev/null || true); MSG=${{MSG:-{fallback}}}; curl -fsS -X POST -H \"X-Api-Key: $AI_POD_API_KEY\" -H 'Content-Type: application/json' -d \"$(printf '{{\"project_id\":\"%s\",\"session_id\":\"%s\",\"status\":\"%s\",\"status_line\":\"%s\"}}' \"$AI_POD_PROJECT_ID\" \"$AI_POD_SESSION_ID\" \"{status}\" \"$MSG\")\" \"$AI_POD_SERVER_URL/agent_status\" >/dev/null || true",
+            "curl -fsS -X POST -H \"X-Api-Key: $AI_POD_API_KEY\" -H 'Content-Type: application/json' -d '{{\"project_id\":\"'\"$AI_POD_PROJECT_ID\"'\",\"session_id\":\"'\"$AI_POD_SESSION_ID\"'\",\"status\":\"{status}\",\"status_line\":\"{line}\"}}' \"$AI_POD_SERVER_URL/agent_status\" >/dev/null || true",
             status = status,
-            fallback = fallback_line,
+            line = line,
         )
     };
 
@@ -258,7 +258,9 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
         ]
     }]);
 
-    let permission_hook = serde_json::json!([{
+    // Claude Code fires `Notification` (not `PermissionRequest`) when it
+    // needs the user — permission prompts, idle timeouts, etc.
+    let notification_hook = serde_json::json!([{
         "matcher": "*",
         "hooks": [
             { "type": "command", "command": notify_curl("Claude needs your approval") },
@@ -273,7 +275,7 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
     let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
     let hooks_obj = hooks.as_object_mut().context("hooks is not an object")?;
     hooks_obj.insert("Stop".to_string(), stop_hook);
-    hooks_obj.insert("PermissionRequest".to_string(), permission_hook);
+    hooks_obj.insert("Notification".to_string(), notification_hook);
 
     // Set default permission mode — no per-tool prompts in TUI
     let permissions = obj
