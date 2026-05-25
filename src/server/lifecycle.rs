@@ -252,7 +252,7 @@ pub async fn ensure_shared_server(config: &AppConfig) -> Result<()> {
     // Wait briefly for server to start
     std::thread::sleep(std::time::Duration::from_millis(500));
 
-    println!(
+    eprintln!(
         "{} (PID {}, port {})",
         "Shared server started.".green(),
         pid,
@@ -329,7 +329,7 @@ pub async fn check_server_version() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Missing version field in server response"))?;
 
     if is_newer_version(server_version, CLI_VERSION) {
-        println!(
+        eprintln!(
             "{} Server is v{}, CLI is v{}. Finish active ai-pod sessions so a new server can start.",
             "Version mismatch:".yellow().bold(),
             server_version,

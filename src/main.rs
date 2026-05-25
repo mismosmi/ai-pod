@@ -229,7 +229,7 @@ async fn launch_flow(cli: &Cli, rt: &ContainerRuntime) -> Result<()> {
 
     // 1. Resolve workspace
     let workspace = resolve_workspace(&cli.workdir)?;
-    println!("{} {}", "Workspace:".blue(), workspace.display());
+    eprintln!("{} {}", "Workspace:".blue(), workspace.display());
 
     // 2. Locate Dockerfile
     let dockerfile = workspace.join(image::DOCKERFILE_NAME);
@@ -244,7 +244,7 @@ async fn launch_flow(cli: &Cli, rt: &ContainerRuntime) -> Result<()> {
     // 3. Credential scan
     if !cli.no_credential_check {
         if !credentials::check_credentials(&workspace, &config)? {
-            println!("{}", "Aborted.".red());
+            eprintln!("{}", "Aborted.".red());
             return Ok(());
         }
     }
@@ -293,8 +293,12 @@ async fn launch_flow(cli: &Cli, rt: &ContainerRuntime) -> Result<()> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Skip update check for internal/daemon commands
-    if !matches!(&cli.command, Some(Command::Serve) | Some(Command::Update)) {
+    // Skip update check for internal/daemon commands and when stdin isn't a
+    // tty — the latter means we're being driven by another program (e.g. an
+    // IDE speaking ACP), and the 3s blocking lookup just delays agent startup.
+    if !matches!(&cli.command, Some(Command::Serve) | Some(Command::Update))
+        && ai_pod::is_stdin_tty()
+    {
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(3),
             update::check_for_update(),
@@ -499,9 +503,25 @@ async fn main() -> Result<()> {
                     workspace.display()
                 );
             }
+            let interactive = ai_pod::is_stdin_tty();
             if !cli.no_credential_check {
-                if !credentials::check_credentials(&workspace, &config)? {
-                    println!("{}", "Aborted.".red());
+                // Without a tty we cannot run the dialoguer-based triage. Run
+                // the silent scan instead: succeed if nothing is pending, else
+                // emit a clear error pointing the user at the interactive flow.
+                if !interactive {
+                    let hash = workspace::workspace_hash(&workspace);
+                    let state = server::lifecycle::ProjectState::load(
+                        &config.project_state_file(&hash),
+                    );
+                    let pending = credentials::pending_credentials(&workspace, &state);
+                    if !pending.is_empty() {
+                        anyhow::bail!(
+                            "Workspace has {} un-triaged sensitive file(s). Run `ai-pod` interactively to review them, or pass `--no-credential-check`.",
+                            pending.len()
+                        );
+                    }
+                } else if !credentials::check_credentials(&workspace, &config)? {
+                    eprintln!("{}", "Aborted.".red());
                     return Ok(());
                 }
             }
@@ -523,6 +543,7 @@ async fn main() -> Result<()> {
                 &state.api_key,
                 command,
                 args,
+                interactive,
             )?;
         }
         Some(Command::Commands { action }) => {
