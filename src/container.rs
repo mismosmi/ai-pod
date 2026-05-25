@@ -268,6 +268,16 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
         ]
     }]);
 
+    // User just submitted a prompt → the agent is working. Without this
+    // hook the row stays stuck on the previous turn's "Task completed"
+    // until the next Stop fires.
+    let prompt_submit_hook = serde_json::json!([{
+        "matcher": "*",
+        "hooks": [
+            { "type": "command", "command": agent_status_curl("Running", "Working...") },
+        ]
+    }]);
+
     let obj = settings
         .as_object_mut()
         .context("settings.json is not an object")?;
@@ -276,6 +286,7 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
     let hooks_obj = hooks.as_object_mut().context("hooks is not an object")?;
     hooks_obj.insert("Stop".to_string(), stop_hook);
     hooks_obj.insert("Notification".to_string(), notification_hook);
+    hooks_obj.insert("UserPromptSubmit".to_string(), prompt_submit_hook);
 
     // Set default permission mode — no per-tool prompts in TUI
     let permissions = obj
@@ -764,6 +775,9 @@ pub fn launch_container(
 /// Used by the `ai-pod manage` TUI so the new session does not take over the
 /// caller's tty; the TUI attaches to it through `podman attach` like any
 /// pre-existing session.
+// `cmd_override`: optional override for the container's CMD. `None` uses
+// the Dockerfile's default (`claude` / `opencode`). When `Some`, the first
+// element is set as `--entrypoint`, the rest are passed as trailing args.
 pub fn start_container_detached(
     rt: &ContainerRuntime,
     config: &AppConfig,
@@ -771,6 +785,7 @@ pub fn start_container_detached(
     image: &str,
     project_id: &str,
     api_key: &str,
+    cmd_override: Option<&[String]>,
 ) -> Result<String> {
     let prefix = container_prefix(workspace);
     let volume_name = gen_volume_name(workspace);
@@ -854,7 +869,18 @@ pub fn start_container_detached(
         "-e",
         &opencode_config_env,
     ]);
-    run_cmd.arg(image);
+
+    // Build the rest of the run command, splicing in --entrypoint/args
+    // around `image` when the caller supplied an override.
+    if let Some(parts) = cmd_override.filter(|p| !p.is_empty()) {
+        run_cmd.args(["--entrypoint", &parts[0]]);
+        run_cmd.arg(image);
+        for arg in &parts[1..] {
+            run_cmd.arg(arg);
+        }
+    } else {
+        run_cmd.arg(image);
+    }
 
     let output = run_cmd
         .stdout(Stdio::null())

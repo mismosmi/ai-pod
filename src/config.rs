@@ -21,6 +21,19 @@ impl AppConfig {
 
     pub fn init(&self) -> Result<()> {
         std::fs::create_dir_all(&self.config_dir).context("Failed to create ~/.ai-pod/")?;
+        // Always (re)write the bundled OpenCode plugin so updates to the
+        // template propagate without the user having to delete the old
+        // file by hand. This is the host-side copy; the per-volume copy
+        // is refreshed during seed_home_volume on container init/rebuild.
+        let plugin_path = self.config_dir.join("opencode-plugin.js");
+        let bundled = include_str!("../templates/opencode-plugin.js");
+        if std::fs::read_to_string(&plugin_path)
+            .map(|s| s != bundled)
+            .unwrap_or(true)
+        {
+            std::fs::write(&plugin_path, bundled)
+                .context("Failed to write opencode-plugin.js")?;
+        }
         Ok(())
     }
 
