@@ -166,6 +166,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/keep-alive", post(keep_alive_handler))
         .route("/reload", post(reload_handler))
         .route("/notify_user", post(rest::notify_user_handler))
+        .route("/agent_status", post(rest::agent_status_handler))
         .route("/list_allowed_commands", post(rest::list_allowed_commands_handler))
         .route("/commands/run", post(rest::run_command_handler))
         .route("/commands/stop", post(rest::stop_command_handler))

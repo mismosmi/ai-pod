@@ -29,6 +29,16 @@ impl AppConfig {
         self.config_dir.join(format!("{}.json", hash))
     }
 
+    /// Directory that stores per-session agent status files written by Claude
+    /// Stop/Notification hooks (and the OpenCode plugin). Each session id maps
+    /// to a single JSON file `{session_id}.json` inside this directory.
+    pub fn agents_dir(&self) -> PathBuf {
+        let base = dirs::data_local_dir()
+            .or_else(dirs::data_dir)
+            .unwrap_or_else(|| self.home_dir.join(".local").join("share"));
+        base.join("ai-pod").join("agents")
+    }
+
     /// Returns path to the shared server state file: ~/.ai-pod/server.json
     pub fn server_state_file(&self) -> PathBuf {
         self.config_dir.join("server.json")

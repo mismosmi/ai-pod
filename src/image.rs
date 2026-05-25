@@ -7,6 +7,79 @@ use crate::runtime::ContainerRuntime;
 
 pub const DOCKERFILE_NAME: &str = "ai-pod.Dockerfile";
 
+struct BaseImageConfig {
+    from: &'static str,
+    install_packages: &'static str,
+    create_user: &'static str,
+}
+
+fn base_image_config(image: &crate::cli::BaseImage) -> BaseImageConfig {
+    use crate::cli::BaseImage;
+    match image {
+        BaseImage::Alpine => BaseImageConfig {
+            from: "alpine:latest",
+            install_packages: "RUN apk add --no-cache curl git vim bash",
+            create_user: "RUN adduser -D -h /home/ai-pod ai-pod && chown -R ai-pod /app",
+        },
+        BaseImage::Ubuntu => BaseImageConfig {
+            from: "ubuntu:latest",
+            install_packages: "RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git vim && rm -rf /var/lib/apt/lists/*",
+            create_user: "RUN useradd -ms /bin/bash ai-pod && chown -R ai-pod /app",
+        },
+        BaseImage::Node => BaseImageConfig {
+            from: "node:lts",
+            install_packages: "RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git vim && rm -rf /var/lib/apt/lists/*",
+            create_user: "RUN useradd -ms /bin/bash ai-pod && chown -R ai-pod /app",
+        },
+        BaseImage::Rust => BaseImageConfig {
+            from: "rust:latest",
+            install_packages: "RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git vim && rm -rf /var/lib/apt/lists/*",
+            create_user: "RUN useradd -ms /bin/bash ai-pod && chown -R ai-pod /app",
+        },
+        BaseImage::Python => BaseImageConfig {
+            from: "python:latest",
+            install_packages: "RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git vim && rm -rf /var/lib/apt/lists/*",
+            create_user: "RUN useradd -ms /bin/bash ai-pod && chown -R ai-pod /app",
+        },
+    }
+}
+
+/// Render the bundled Dockerfile template for the given agent + base image.
+pub fn render_dockerfile(agent: &crate::cli::Agent, image: &crate::cli::BaseImage) -> String {
+    let cfg = base_image_config(image);
+    let agent_str = match agent {
+        crate::cli::Agent::Claude => "claude",
+        crate::cli::Agent::Opencode => "opencode",
+    };
+    let extra = if matches!(agent, crate::cli::Agent::Opencode) {
+        "ENV OPENCODE_YOLO=1"
+    } else {
+        ""
+    };
+    include_str!("../templates/Dockerfile")
+        .replace("{{BASE_IMAGE}}", cfg.from)
+        .replace("{{INSTALL_PACKAGES}}", cfg.install_packages)
+        .replace("{{EXTRA_COMMANDS}}", extra)
+        .replace("{{CREATE_USER}}", cfg.create_user)
+        .replace("{{AGENT}}", agent_str)
+}
+
+/// Write `ai-pod.Dockerfile` into `workspace` (no-op if it already exists,
+/// returning `false` in that case; `true` if a new file was written).
+pub fn write_dockerfile(
+    workspace: &Path,
+    agent: &crate::cli::Agent,
+    image: &crate::cli::BaseImage,
+) -> Result<bool> {
+    let path = workspace.join(DOCKERFILE_NAME);
+    if path.exists() {
+        return Ok(false);
+    }
+    let content = render_dockerfile(agent, image);
+    std::fs::write(&path, content).context("Failed to write ai-pod.Dockerfile")?;
+    Ok(true)
+}
+
 /// Derives a stable, human-readable image name from the workspace path.
 /// Format: `{dirname}-{6-char hash}`, e.g. `myproject-12aef3`.
 pub fn image_name(workspace: &Path) -> String {

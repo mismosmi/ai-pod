@@ -143,6 +143,9 @@ pub enum Command {
 
     /// Update ai-pod to the latest release
     Update,
+
+    /// Open a TUI to manage all running ai-pod agents on this host.
+    Manage,
 }
 
 #[derive(Subcommand)]

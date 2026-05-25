@@ -17,6 +17,70 @@ use crate::workspace::{
 /// runtime does not need to probe the image.
 const CONTAINER_HOME: &str = "/home/ai-pod";
 
+/// One row from `podman ps -a --filter label=managed-by=ai-pod` enriched
+/// with the labels we set on launch. `workspace_path` and `session_id` are
+/// `None` for legacy containers launched before those labels were added.
+#[derive(Debug, Clone)]
+pub struct ManagedContainer {
+    pub name: String,
+    pub status: String,
+    pub state: String,
+    pub created_at: String,
+    pub workspace_path: Option<String>,
+    pub session_id: Option<String>,
+}
+
+/// List every container labelled `managed-by=ai-pod` on the host, including
+/// stopped ones. Returns structured rows so callers can pick out the workspace
+/// path or session id without re-shelling out.
+pub fn list_managed_containers(rt: &ContainerRuntime) -> Result<Vec<ManagedContainer>> {
+    let format = "{{.Names}}\t{{.Status}}\t{{.State}}\t{{.CreatedAt}}\t{{.Label \"workspace-path\"}}\t{{.Label \"ai-pod-session\"}}";
+    let output = rt
+        .command()
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            "label=managed-by=ai-pod",
+            "--format",
+            format,
+        ])
+        .output()
+        .context("Failed to list ai-pod containers")?;
+    let mut rows = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        let name = parts.first().copied().unwrap_or("").to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let status = parts.get(1).copied().unwrap_or("").to_string();
+        let state = parts.get(2).copied().unwrap_or("").to_string();
+        let created_at = parts.get(3).copied().unwrap_or("").to_string();
+        let workspace_path = parts
+            .get(4)
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty() && s != "<no value>");
+        let session_id = parts
+            .get(5)
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty() && s != "<no value>")
+            .or_else(|| crate::workspace::session_id_from_container_name(&name));
+        rows.push(ManagedContainer {
+            name,
+            status,
+            state,
+            created_at,
+            workspace_path,
+            session_id,
+        });
+    }
+    Ok(rows)
+}
+
 pub fn containers_for_prefix(
     rt: &ContainerRuntime,
     prefix: &str,
@@ -173,20 +237,33 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
         )
     };
 
+    // Mirror notify_user to the new /agent_status endpoint so the manage TUI
+    // sees the same transitions (Idle on Stop, AwaitingInput on Notification).
+    // The Notification hook receives JSON on stdin; pull `.message` out with
+    // jq if present, falling back to a hard-coded label so the hook still
+    // works in containers without jq installed.
+    let agent_status_curl = |status: &str, fallback_line: &str| {
+        format!(
+            "MSG=$(jq -r .message 2>/dev/null || true); MSG=${{MSG:-{fallback}}}; curl -fsS -X POST -H \"X-Api-Key: $AI_POD_API_KEY\" -H 'Content-Type: application/json' -d \"$(printf '{{\"project_id\":\"%s\",\"session_id\":\"%s\",\"status\":\"%s\",\"status_line\":\"%s\"}}' \"$AI_POD_PROJECT_ID\" \"$AI_POD_SESSION_ID\" \"{status}\" \"$MSG\")\" \"$AI_POD_SERVER_URL/agent_status\" >/dev/null || true",
+            status = status,
+            fallback = fallback_line,
+        )
+    };
+
     let stop_hook = serde_json::json!([{
         "matcher": "*",
-        "hooks": [{
-            "type": "command",
-            "command": notify_curl("Task completed"),
-        }]
+        "hooks": [
+            { "type": "command", "command": notify_curl("Task completed") },
+            { "type": "command", "command": agent_status_curl("Idle", "Task completed") },
+        ]
     }]);
 
     let permission_hook = serde_json::json!([{
         "matcher": "*",
-        "hooks": [{
-            "type": "command",
-            "command": notify_curl("Claude needs your approval"),
-        }]
+        "hooks": [
+            { "type": "command", "command": notify_curl("Claude needs your approval") },
+            { "type": "command", "command": agent_status_curl("AwaitingInput", "Claude needs your approval") },
+        ]
     }]);
 
     let obj = settings
@@ -628,11 +705,17 @@ pub fn launch_container(
 
     let mut run_cmd = rt.command();
     run_cmd.args(["run", "--rm", "-it"]);
+    let workspace_label = format!("workspace-path={}", workspace_str);
+    let session_label = format!("ai-pod-session={}", session_id);
     run_cmd.args([
         "--name",
         &container_name,
         "--label",
         "managed-by=ai-pod",
+        "--label",
+        &workspace_label,
+        "--label",
+        &session_label,
         "--network",
         &service_net,
         "-v",
@@ -673,6 +756,115 @@ pub fn launch_container(
     let _ = run_status;
 
     Ok(())
+}
+
+/// Start a new ai-pod session in detached mode and return its container name.
+/// Used by the `ai-pod manage` TUI so the new session does not take over the
+/// caller's tty; the TUI attaches to it through `podman attach` like any
+/// pre-existing session.
+pub fn start_container_detached(
+    rt: &ContainerRuntime,
+    config: &AppConfig,
+    workspace: &Path,
+    image: &str,
+    project_id: &str,
+    api_key: &str,
+) -> Result<String> {
+    let prefix = container_prefix(workspace);
+    let volume_name = gen_volume_name(workspace);
+    let workspace_str = workspace.to_string_lossy();
+
+    if !volume_exists(rt, &volume_name)? {
+        init_home_volume(
+            rt,
+            config,
+            &volume_name,
+            &prefix,
+            image,
+            project_id,
+            api_key,
+        )?;
+    }
+
+    let session_id = new_session_id();
+    let container_name = container_name_for(workspace, &session_id);
+
+    refresh_claude_mcp_in_volume(
+        rt,
+        config,
+        &volume_name,
+        &prefix,
+        image,
+        &rt.server_url(),
+        api_key,
+        &session_id,
+    )?;
+
+    let add_host = rt.add_host_arg();
+    let host_gw_env = format!("HOST_GATEWAY={}", rt.host_gateway());
+    let server_url_env = format!("AI_POD_SERVER_URL={}", rt.server_url());
+    let opencode_config_env = format!(
+        "OPENCODE_CONFIG_CONTENT={}",
+        opencode_config_content(&rt.server_url(), api_key, &session_id)
+    );
+
+    let project_state = load_project_state(config, workspace);
+    let mask_args = mask_mount_args(rt, workspace, image, &project_state.masked_directories)?;
+    let service_net = crate::service::ensure_service_network(rt, workspace)?;
+
+    let workspace_label = format!("workspace-path={}", workspace_str);
+    let session_label = format!("ai-pod-session={}", session_id);
+    let mut run_cmd = rt.command();
+    // -d for detached + -it to allocate a tty + keep stdin open so `podman
+    // attach` can drive the interactive agent later.
+    run_cmd.args(["run", "--rm", "-d", "-it"]);
+    run_cmd.args([
+        "--name",
+        &container_name,
+        "--label",
+        "managed-by=ai-pod",
+        "--label",
+        &workspace_label,
+        "--label",
+        &session_label,
+        "--network",
+        &service_net,
+        "-v",
+        &format!("{}:{}:z", volume_name, CONTAINER_HOME),
+        "-v",
+        &format!("{}:/app:Z", workspace_str),
+    ]);
+    for arg in &mask_args {
+        run_cmd.arg(arg);
+    }
+    run_cmd.args([
+        &add_host,
+        "-e",
+        &host_gw_env,
+        "-e",
+        &format!("AI_POD_PROJECT_ID={}", project_id),
+        "-e",
+        &format!("AI_POD_API_KEY={}", api_key),
+        "-e",
+        &format!("AI_POD_SESSION_ID={}", session_id),
+        "-e",
+        &server_url_env,
+        "-e",
+        &opencode_config_env,
+    ]);
+    run_cmd.arg(image);
+
+    let output = run_cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .context("Failed to start container")?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("{} run failed: {}", rt.cmd(), err.trim());
+    }
+
+    Ok(container_name)
 }
 
 pub fn run_in_container(
@@ -737,6 +929,10 @@ pub fn run_in_container(
     run_args.extend_from_slice(&[
         "--label".into(),
         "managed-by=ai-pod".into(),
+        "--label".into(),
+        format!("workspace-path={}", workspace_str),
+        "--label".into(),
+        format!("ai-pod-session={}", session_id),
         "--network".into(),
         service_net,
         "-v".into(),

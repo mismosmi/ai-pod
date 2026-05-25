@@ -1,6 +1,6 @@
 use ai_pod::{
-    cli, commands_cli, config, container, credentials, env_files_cli, image, runtime, server,
-    services_cli, update, workspace,
+    cli, commands_cli, config, container, credentials, env_files_cli, image, manage, runtime,
+    server, services_cli, update, workspace,
 };
 
 use anyhow::{Context, Result};
@@ -99,42 +99,6 @@ fn resolve_base_image(agent: &cli::Agent, image: Option<cli::BaseImage>) -> Resu
     Ok(variants[sel].clone())
 }
 
-struct BaseImageConfig {
-    from: &'static str,
-    install_packages: &'static str,
-    create_user: &'static str,
-}
-
-fn base_image_config(image: &cli::BaseImage) -> BaseImageConfig {
-    match image {
-        cli::BaseImage::Alpine => BaseImageConfig {
-            from: "alpine:latest",
-            install_packages: "RUN apk add --no-cache curl git vim bash",
-            create_user: "RUN adduser -D -h /home/ai-pod ai-pod && chown -R ai-pod /app",
-        },
-        cli::BaseImage::Ubuntu => BaseImageConfig {
-            from: "ubuntu:latest",
-            install_packages: "RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git vim && rm -rf /var/lib/apt/lists/*",
-            create_user: "RUN useradd -ms /bin/bash ai-pod && chown -R ai-pod /app",
-        },
-        cli::BaseImage::Node => BaseImageConfig {
-            from: "node:lts",
-            install_packages: "RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git vim && rm -rf /var/lib/apt/lists/*",
-            create_user: "RUN useradd -ms /bin/bash ai-pod && chown -R ai-pod /app",
-        },
-        cli::BaseImage::Rust => BaseImageConfig {
-            from: "rust:latest",
-            install_packages: "RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git vim && rm -rf /var/lib/apt/lists/*",
-            create_user: "RUN useradd -ms /bin/bash ai-pod && chown -R ai-pod /app",
-        },
-        cli::BaseImage::Python => BaseImageConfig {
-            from: "python:latest",
-            install_packages: "RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git vim && rm -rf /var/lib/apt/lists/*",
-            create_user: "RUN useradd -ms /bin/bash ai-pod && chown -R ai-pod /app",
-        },
-    }
-}
-
 fn init_project(
     workspace: &Path,
     agent: Option<cli::Agent>,
@@ -152,23 +116,9 @@ fn init_project(
     }
 
     let agent = resolve_agent(agent)?;
-    let image = resolve_base_image(&agent, image)?;
+    let base_image = resolve_base_image(&agent, image)?;
 
-    let agent_str = match agent {
-        cli::Agent::Claude => "claude",
-        cli::Agent::Opencode => "opencode",
-    };
-
-    let cfg = base_image_config(&image);
-    let extra_commands = if agent == cli::Agent::Opencode { "ENV OPENCODE_YOLO=1" } else { "" };
-    let content = include_str!("../templates/Dockerfile")
-        .replace("{{BASE_IMAGE}}", cfg.from)
-        .replace("{{INSTALL_PACKAGES}}", cfg.install_packages)
-        .replace("{{EXTRA_COMMANDS}}", extra_commands)
-        .replace("{{CREATE_USER}}", cfg.create_user)
-        .replace("{{AGENT}}", agent_str);
-
-    std::fs::write(&dockerfile, content).context("Failed to write ai-pod.Dockerfile")?;
+    image::write_dockerfile(workspace, &agent, &base_image)?;
 
     println!("{} {}", "Created:".green().bold(), dockerfile.display());
     println!("Edit this file to customise your container, then run `ai-pod` to launch.");
@@ -537,6 +487,10 @@ async fn main() -> Result<()> {
                         .await?;
                 }
             }
+        }
+        Some(Command::Manage) => {
+            manage::run_manage(rt.clone()).await?;
+            return Ok(());
         }
         Some(Command::Services { action }) => {
             let workspace = resolve_workspace(&cli.workdir)?;

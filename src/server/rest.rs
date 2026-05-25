@@ -78,6 +78,20 @@ pub struct ListAllowedCommandsResponse {
     pub commands: Vec<String>,
 }
 
+#[derive(Deserialize)]
+pub struct AgentStatusRequest {
+    pub project_id: String,
+    pub session_id: String,
+    pub status: String,
+    #[serde(default)]
+    pub status_line: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct AgentStatusResponse {
+    pub ok: bool,
+}
+
 fn extract_api_key(headers: &HeaderMap) -> &str {
     headers
         .get("x-api-key")
@@ -226,6 +240,83 @@ pub async fn notify_user_handler(
     notify::send_notification(&format!("ai-pod {}", project_name), &req.message);
 
     Json(NotifyUserResponse { ok: true }).into_response()
+}
+
+pub async fn agent_status_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<AgentStatusRequest>,
+) -> impl IntoResponse {
+    let provided_key = extract_api_key(&headers).to_string();
+    if let Err((status, msg)) = authenticate(&state, &req.project_id, &provided_key).await {
+        return (status, msg.to_string()).into_response();
+    }
+
+    // Whitelist the allowed status values.
+    let normalised = match req.status.as_str() {
+        "Running" | "Idle" | "AwaitingInput" | "Finished" => req.status.as_str(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "status must be one of Running, Idle, AwaitingInput, Finished",
+            )
+                .into_response();
+        }
+    };
+
+    // Reject session ids that aren't 8 hex chars to keep the filename safe.
+    if req.session_id.len() != 8 || !req.session_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return (StatusCode::BAD_REQUEST, "Invalid session_id").into_response();
+    }
+
+    let agents_dir = {
+        let home = match dirs::data_local_dir().or_else(dirs::data_dir) {
+            Some(p) => p,
+            None => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "no data dir").into_response();
+            }
+        };
+        home.join("ai-pod").join("agents")
+    };
+    if let Err(e) = std::fs::create_dir_all(&agents_dir) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("create agents_dir: {e}"),
+        )
+            .into_response();
+    }
+
+    let updated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let payload = serde_json::json!({
+        "session_id": req.session_id,
+        "project_id": req.project_id,
+        "status": normalised,
+        "status_line": req.status_line.clone().unwrap_or_default(),
+        "updated_at": updated_at,
+    });
+
+    let final_path = agents_dir.join(format!("{}.json", req.session_id));
+    let tmp_path = agents_dir.join(format!(".{}.json.tmp", req.session_id));
+    if let Err(e) = std::fs::write(&tmp_path, payload.to_string()) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write status: {e}"),
+        )
+            .into_response();
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("commit status: {e}"),
+        )
+            .into_response();
+    }
+
+    Json(AgentStatusResponse { ok: true }).into_response()
 }
 
 pub async fn list_allowed_commands_handler(
