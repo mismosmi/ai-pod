@@ -35,6 +35,7 @@ ratatui = "0.30"
 crossterm = "0.29"
 vt100 = "0.16"
 portable-pty = "0.9"
+unicode-width = "0.2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

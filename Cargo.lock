@@ -40,6 +40,7 @@ dependencies = [
  "tokio-stream",
  "tower",
  "tower_governor",
+ "unicode-width",
  "uuid",
  "vt100",
  "walkdir",

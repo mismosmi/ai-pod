@@ -131,6 +131,9 @@ async fn run_loop(
             let name = term.container_name.clone();
             state.attached.insert(name.clone(), term);
             state.screen = Screen::Main;
+            // Modal close → clear the host terminal so any residual cells
+            // from the dialog don't linger behind the new frame.
+            terminal.clear().ok();
             refresh_agents(&mut state);
             state.last_refresh = Instant::now();
             if let Some(idx) = state
@@ -160,6 +163,11 @@ async fn run_loop(
                                 Ok(true) => {
                                     state.screen = Screen::Main;
                                     state.last_refresh = Instant::now() - Duration::from_secs(60);
+                                    // Clean slate after the modal — any
+                                    // cells the dialog touched get fully
+                                    // repainted from the main view next
+                                    // tick.
+                                    terminal.clear().ok();
                                 }
                                 Ok(false) => {}
                                 Err(_) => { /* surfaced via the log */ }

@@ -743,21 +743,41 @@ fn render_launching(
     frame.render_widget(p, chunks[2]);
 }
 
-/// Truncate a string to a max display width, appending `…` if shortened. We
-/// count chars rather than bytes because non-ASCII chars commonly appear in
-/// log output (the ellipsis itself, status icons, etc.); `width` is close
-/// enough to terminal columns for typical content.
+/// Truncate a string to a max display-column width, appending `…` if
+/// shortened. Strips control characters (including embedded \n, \r, and
+/// ANSI escapes) and uses Unicode display width so wide glyphs (emoji,
+/// CJK) are counted as the 2 columns they actually occupy on screen.
+/// Without this, build-output lines with control codes or wide chars
+/// would render past the modal border.
 fn truncate_to(s: &str, max: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
     if max == 0 {
         return String::new();
     }
-    let count = s.chars().count();
-    if count <= max {
-        return s.to_string();
+    let limit = max.saturating_sub(1); // reserve one cell for the ellipsis
+    let mut width = 0usize;
+    let mut out = String::new();
+    let mut truncated = false;
+    for c in s.chars() {
+        // Drop anything that could cause the terminal to do something other
+        // than print a glyph in its own cell.
+        if c.is_control() && c != ' ' {
+            continue;
+        }
+        let cw = c.width().unwrap_or(0);
+        if cw == 0 {
+            continue;
+        }
+        if width + cw > limit {
+            truncated = true;
+            break;
+        }
+        width += cw;
+        out.push(c);
     }
-    let take = max.saturating_sub(1);
-    let mut out: String = s.chars().take(take).collect();
-    out.push('…');
+    if truncated {
+        out.push('…');
+    }
     out
 }
 
