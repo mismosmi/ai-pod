@@ -294,21 +294,18 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, state: &mut State) ->
                         AgentStatus::Unknown => None,
                     }
                 };
-                let lines = match detail {
-                    Some(d) => {
-                        let d = if d.len() > 28 {
-                            format!("  {}…", &d[..27])
-                        } else {
-                            format!("  {}", d)
-                        };
-                        vec![
-                            line1,
-                            Line::from(Span::styled(d, Style::default().fg(Color::DarkGray))),
-                        ]
-                    }
-                    None => vec![line1],
+                // Always render two lines so rows have a consistent height
+                // — empty placeholder when we have no status yet.
+                let detail_text = match detail {
+                    Some(d) if d.len() > 28 => format!("  {}…", &d[..27]),
+                    Some(d) => format!("  {}", d),
+                    None => String::new(),
                 };
-                ListItem::new(lines)
+                let line2 = Line::from(Span::styled(
+                    detail_text,
+                    Style::default().fg(Color::DarkGray),
+                ));
+                ListItem::new(vec![line1, line2])
             })
             .collect();
 
