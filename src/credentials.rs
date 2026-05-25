@@ -172,27 +172,32 @@ pub fn scan_workspace(workspace: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-pub fn check_credentials(workspace: &Path, config: &AppConfig) -> Result<bool> {
-    // Canonicalize so WalkDir paths and strip_prefix share the same base.
+/// Scan the workspace for credential files and return those not already on
+/// the project's ignore list. The workspace is canonicalized so `strip_prefix`
+/// matches the paths returned by `WalkDir`.
+pub fn pending_credentials(workspace: &Path, state: &ProjectState) -> Vec<PathBuf> {
     let workspace_buf = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     let workspace = workspace_buf.as_path();
 
-    let found = scan_workspace(workspace);
-    if found.is_empty() {
-        return Ok(true);
-    }
-
-    let hash = workspace_hash(workspace);
-    let state_path = config.project_state_file(&hash);
-    let mut state = ProjectState::load(&state_path);
-
-    let pending: Vec<PathBuf> = found
+    scan_workspace(workspace)
         .into_iter()
         .filter(|path| {
             let rel = path.strip_prefix(workspace).unwrap_or(path);
             !state.is_credential_ignored(&rel.to_string_lossy())
         })
-        .collect();
+        .collect()
+}
+
+pub fn check_credentials(workspace: &Path, config: &AppConfig) -> Result<bool> {
+    // Canonicalize so WalkDir paths and strip_prefix share the same base.
+    let workspace_buf = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let workspace = workspace_buf.as_path();
+
+    let hash = workspace_hash(workspace);
+    let state_path = config.project_state_file(&hash);
+    let mut state = ProjectState::load(&state_path);
+
+    let pending = pending_credentials(workspace, &state);
 
     if pending.is_empty() {
         return Ok(true);
@@ -442,25 +447,10 @@ mod tests_ignore_list {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join(".env"), "SECRET=123").unwrap();
 
-        let found = scan_workspace(dir.path());
-        assert_eq!(found.len(), 1);
-
-        let rel = found[0]
-            .strip_prefix(dir.path())
-            .expect("strip_prefix should succeed")
-            .to_string_lossy()
-            .to_string();
         let mut state = ProjectState::default();
-        state.add_ignored_credential(&rel);
+        state.add_ignored_credential(".env");
 
-        let pending: Vec<PathBuf> = scan_workspace(dir.path())
-            .into_iter()
-            .filter(|path| {
-                let r = path.strip_prefix(dir.path()).unwrap_or(path);
-                !state.is_credential_ignored(&r.to_string_lossy())
-            })
-            .collect();
-
+        let pending = pending_credentials(dir.path(), &state);
         assert!(
             pending.is_empty(),
             "ignored file should be filtered out, got: {:?}",
@@ -478,18 +468,22 @@ mod tests_ignore_list {
         let mut state = ProjectState::default();
         state.add_ignored_credential(".env");
 
-        let pending: Vec<PathBuf> = scan_workspace(&canonical)
-            .into_iter()
-            .filter(|path| {
-                let r = path.strip_prefix(&canonical).unwrap_or(path);
-                !state.is_credential_ignored(&r.to_string_lossy())
-            })
-            .collect();
-
+        let pending = pending_credentials(&canonical, &state);
         assert!(
             pending.is_empty(),
             "ignored file should be filtered out after canonicalization"
         );
+    }
+
+    #[test]
+    fn unignored_credential_file_is_returned_as_pending() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".env"), "SECRET=123").unwrap();
+
+        let state = ProjectState::default();
+        let pending = pending_credentials(dir.path(), &state);
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].ends_with(".env"));
     }
 }
 
