@@ -35,7 +35,9 @@ impl Agent {
         } else if let Some(e) = entry {
             (e.status.clone(), e.status_line.clone())
         } else {
-            (AgentStatus::Running, String::new())
+            // Container is up but no hook has reported in yet — leave the
+            // row blank rather than claiming a state we can't verify.
+            (AgentStatus::Unknown, String::new())
         };
         Self {
             container_name: c.name,

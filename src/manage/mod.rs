@@ -270,6 +270,9 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, state: &mut State) ->
                     AgentStatus::Finished => ("✓ ", Style::default().fg(Color::Green)),
                     AgentStatus::Idle => ("· ", Style::default().fg(Color::DarkGray)),
                     AgentStatus::Running => ("▶ ", Style::default()),
+                    // No hook has reported in yet — render the row without a
+                    // status glyph or text rather than claiming a state.
+                    AgentStatus::Unknown => ("  ", Style::default()),
                 };
                 let project = if a.project_name.len() > 16 {
                     format!("{}…", &a.project_name[..15])
@@ -281,25 +284,31 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, state: &mut State) ->
                     Span::styled(project, style),
                 ]);
                 let detail = if !a.status_line.is_empty() {
-                    a.status_line.clone()
+                    Some(a.status_line.clone())
                 } else {
                     match a.status {
-                        AgentStatus::Running => "running".to_string(),
-                        AgentStatus::Idle => "idle".to_string(),
-                        AgentStatus::AwaitingInput => "needs input".to_string(),
-                        AgentStatus::Finished => "finished".to_string(),
+                        AgentStatus::Running => Some("running".to_string()),
+                        AgentStatus::Idle => Some("idle".to_string()),
+                        AgentStatus::AwaitingInput => Some("needs input".to_string()),
+                        AgentStatus::Finished => Some("finished".to_string()),
+                        AgentStatus::Unknown => None,
                     }
                 };
-                let detail = if detail.len() > 28 {
-                    format!("  {}…", &detail[..27])
-                } else {
-                    format!("  {}", detail)
+                let lines = match detail {
+                    Some(d) => {
+                        let d = if d.len() > 28 {
+                            format!("  {}…", &d[..27])
+                        } else {
+                            format!("  {}", d)
+                        };
+                        vec![
+                            line1,
+                            Line::from(Span::styled(d, Style::default().fg(Color::DarkGray))),
+                        ]
+                    }
+                    None => vec![line1],
                 };
-                let line2 = Line::from(Span::styled(
-                    detail,
-                    Style::default().fg(Color::DarkGray),
-                ));
-                ListItem::new(vec![line1, line2])
+                ListItem::new(lines)
             })
             .collect();
 
@@ -446,6 +455,22 @@ fn handle_mouse(state: &mut State, ev: &MouseEvent) {
         }
         MouseEventKind::ScrollDown if in_list => move_selection(state, 1),
         MouseEventKind::ScrollUp if in_list => move_selection(state, -1),
+        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if in_term => {
+            // Forward wheel events to the agent's pty. AttachedTerm checks
+            // whether the agent has actually enabled mouse mode; if it
+            // hasn't, the call is a no-op.
+            let up = matches!(ev.kind, MouseEventKind::ScrollUp);
+            let inner_x = term_area.x + 1;
+            let inner_y = term_area.y + 1;
+            let col = ev.column.saturating_sub(inner_x).saturating_add(1);
+            let row = ev.row.saturating_sub(inner_y).saturating_add(1);
+            let name = selected_agent(state).map(|a| a.container_name.clone());
+            if let Some(name) = name {
+                if let Some(term) = state.attached.get_mut(&name) {
+                    term.send_scroll(up, col, row);
+                }
+            }
+        }
         _ => {}
     }
 }

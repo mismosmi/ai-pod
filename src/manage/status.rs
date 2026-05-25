@@ -8,6 +8,9 @@ use std::path::PathBuf;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentStatus {
+    /// No hook event has been received for this session yet — we know the
+    /// container is up but have no signal from the agent itself.
+    Unknown,
     Running,
     Idle,
     AwaitingInput,
@@ -20,7 +23,8 @@ impl AgentStatus {
             "Idle" => Self::Idle,
             "AwaitingInput" => Self::AwaitingInput,
             "Finished" => Self::Finished,
-            _ => Self::Running,
+            "Running" => Self::Running,
+            _ => Self::Unknown,
         }
     }
 }
