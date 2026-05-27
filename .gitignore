@@ -2,3 +2,4 @@
 .ai-pod/commands
 
 .claude/*.lock
+.DS_Store
