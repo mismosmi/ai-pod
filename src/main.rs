@@ -293,13 +293,22 @@ async fn launch_flow(cli: &Cli, rt: &ContainerRuntime) -> Result<()> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Skip update check for internal/daemon commands
-    if !matches!(&cli.command, Some(Command::Serve) | Some(Command::Update)) {
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            update::check_for_update(),
-        )
-        .await;
+    // Internal background command: refresh the update cache and exit. Handled
+    // before anything else so it never triggers its own update check or touches
+    // the container runtime.
+    if matches!(&cli.command, Some(Command::FetchUpdateCache)) {
+        if let Ok(config) = AppConfig::new() {
+            update::fetch_and_cache(&config.config_dir).await;
+        }
+        return Ok(());
+    }
+
+    // Show the cached update notification and, if stale, spawn a detached
+    // background refresh — no network wait on the startup path.
+    if !matches!(&cli.command, Some(Command::Serve) | Some(Command::Update))
+        && let Ok(config) = AppConfig::new()
+    {
+        update::check_for_update(&config.config_dir);
     }
 
     // Commands that don't need a container runtime
