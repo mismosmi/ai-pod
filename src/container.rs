@@ -669,6 +669,10 @@ pub fn launch_container(
     let container_name = container_name_for(workspace, &session_id);
     println!("{} {}", "Starting container:".blue().bold(), container_name);
 
+    // Record the runtime for this session before the container starts, so the
+    // shared server runs service containers on the same runtime.
+    crate::config::SessionState { runtime: rt.kind }.save(config, &session_id)?;
+
     refresh_claude_mcp_in_volume(
         rt,
         config,
@@ -748,6 +752,7 @@ pub fn launch_container(
     // agent started for this session. Best-effort: this is also covered by the
     // server's periodic orphan sweep if the CLI was killed.
     crate::service::cleanup_services_for_session(rt, &session_id);
+    let _ = std::fs::remove_file(config.session_state_file(&session_id));
     let _ = run_status;
 
     Ok(())
@@ -767,6 +772,10 @@ pub fn run_in_container(
     let container_name = container_name_for(workspace, &session_id);
     let volume_name = gen_volume_name(workspace);
     let workspace_str = workspace.to_string_lossy();
+
+    // Record the runtime for this session before the container starts, so the
+    // shared server runs service containers on the same runtime.
+    crate::config::SessionState { runtime: rt.kind }.save(config, &session_id)?;
 
     // Init home volume if it doesn't exist
     if !volume_exists(rt, &volume_name)? {
@@ -859,6 +868,7 @@ pub fn run_in_container(
         .context("Failed to run command in container")?;
 
     crate::service::cleanup_services_for_session(rt, &session_id);
+    let _ = std::fs::remove_file(config.session_state_file(&session_id));
 
     if !status.success() {
         anyhow::bail!("Command exited with non-zero status");

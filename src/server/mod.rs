@@ -183,6 +183,26 @@ pub fn build_app(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Container runtimes whose binary is currently on PATH. Sessions may be
+/// launched with different runtimes (the choice is persisted per session), so
+/// the orphan sweep must cover every installed runtime rather than only the
+/// server's own boot-time one.
+fn available_runtimes(dry_run: bool) -> Vec<ContainerRuntime> {
+    use crate::runtime::RuntimeKind;
+    [RuntimeKind::Podman, RuntimeKind::Docker]
+        .into_iter()
+        .filter(|k| dry_run || k.is_available())
+        .map(|kind| ContainerRuntime { kind, dry_run })
+        .collect()
+}
+
+/// Sweep orphaned service containers across every installed runtime.
+async fn sweep_orphan_services(base: &ContainerRuntime) {
+    for rt in available_runtimes(base.dry_run) {
+        sweep_orphan_services_one(&rt).await;
+    }
+}
+
 /// Find live `ai-pod-parent={session_id}` labels whose corresponding main
 /// container is no longer running and remove the service containers tied to
 /// them.
@@ -191,7 +211,7 @@ pub fn build_app(state: AppState) -> Router {
 /// inside, commas between entries). This is distinct from `inspect --format
 /// "{{.Config.Labels}}"`, which uses Go's `map[k:v]` rendering with colons —
 /// don't reuse this parser for inspect output.
-async fn sweep_orphan_services(rt: &ContainerRuntime) {
+async fn sweep_orphan_services_one(rt: &ContainerRuntime) {
     // Set of session ids currently backed by a live main container.
     let main_output = rt
         .async_command()

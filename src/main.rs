@@ -393,8 +393,14 @@ async fn main() -> Result<()> {
         _ => {}
     }
 
-    // Detect container runtime (podman preferred, docker fallback)
-    let rt = ContainerRuntime::detect(cli.dry_run)?;
+    // Resolve the runtime preference: --runtime flag > AI_POD_RUNTIME env >
+    // autodetect (podman preferred, docker fallback).
+    let runtime_pref = cli.runtime.or_else(|| {
+        std::env::var("AI_POD_RUNTIME")
+            .ok()
+            .and_then(|v| crate::runtime::RuntimeKind::from_value(&v))
+    });
+    let rt = ContainerRuntime::detect(runtime_pref, cli.dry_run)?;
 
     match &cli.command {
         Some(Command::Build) => {

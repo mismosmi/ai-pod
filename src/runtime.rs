@@ -1,10 +1,51 @@
 use anyhow::Result;
+use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
 use std::process::Command;
+use std::str::FromStr;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum RuntimeKind {
     Podman,
     Docker,
+}
+
+impl RuntimeKind {
+    /// Stable string form. Matches the binary name and is the single source of
+    /// truth for the CLI flag, the `AI_POD_RUNTIME` env var, and persisted
+    /// session records.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuntimeKind::Podman => "podman",
+            RuntimeKind::Docker => "docker",
+        }
+    }
+
+    /// Parse from a user/config string. Case-insensitive, trims whitespace;
+    /// returns `None` for anything unrecognized.
+    pub fn from_value(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "podman" => Some(RuntimeKind::Podman),
+            "docker" => Some(RuntimeKind::Docker),
+            _ => None,
+        }
+    }
+
+    /// Whether this runtime's binary is present and runnable on PATH.
+    pub fn is_available(self) -> bool {
+        Command::new(self.as_str())
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+}
+
+impl FromStr for RuntimeKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_value(s).ok_or_else(|| format!("unknown runtime: {s}"))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -14,24 +55,29 @@ pub struct ContainerRuntime {
 }
 
 impl ContainerRuntime {
-    /// Detect which container runtime is available.
-    /// Prefers podman; falls back to docker.
-    pub fn detect(dry_run: bool) -> Result<Self> {
-        if Command::new("podman")
-            .arg("--version")
-            .output()
-            .is_ok_and(|o| o.status.success())
-        {
+    /// Select the container runtime. When `preferred` is set (resolved from the
+    /// `--runtime` flag or `AI_POD_RUNTIME` env), that runtime is used and must
+    /// be available. When `None`, autodetect: prefer podman, fall back to
+    /// docker. Under `dry_run` the availability check is skipped so commands can
+    /// be printed on a host without the chosen runtime installed.
+    pub fn detect(preferred: Option<RuntimeKind>, dry_run: bool) -> Result<Self> {
+        if let Some(kind) = preferred {
+            if dry_run || kind.is_available() {
+                return Ok(Self { kind, dry_run });
+            }
+            anyhow::bail!(
+                "Requested container runtime `{}` is not available on PATH. \
+                 Install it or choose the other runtime.",
+                kind.as_str()
+            );
+        }
+        if RuntimeKind::Podman.is_available() {
             return Ok(Self {
                 kind: RuntimeKind::Podman,
                 dry_run,
             });
         }
-        if Command::new("docker")
-            .arg("--version")
-            .output()
-            .is_ok_and(|o| o.status.success())
-        {
+        if RuntimeKind::Docker.is_available() {
             return Ok(Self {
                 kind: RuntimeKind::Docker,
                 dry_run,
@@ -44,10 +90,7 @@ impl ContainerRuntime {
 
     /// The binary name: "podman" or "docker"
     pub fn cmd(&self) -> &'static str {
-        match self.kind {
-            RuntimeKind::Podman => "podman",
-            RuntimeKind::Docker => "docker",
-        }
+        self.kind.as_str()
     }
 
     /// Returns a std::process::Command with the runtime binary.
@@ -169,5 +212,60 @@ mod tests {
         };
         let program = rt.command().get_program().to_string_lossy().into_owned();
         assert_eq!(program, "echo");
+    }
+
+    #[test]
+    fn from_value_parses_case_insensitively_and_trims() {
+        assert_eq!(RuntimeKind::from_value("podman"), Some(RuntimeKind::Podman));
+        assert_eq!(RuntimeKind::from_value("Docker"), Some(RuntimeKind::Docker));
+        assert_eq!(
+            RuntimeKind::from_value("  PODMAN \n"),
+            Some(RuntimeKind::Podman)
+        );
+        assert_eq!(RuntimeKind::from_value("containerd"), None);
+        assert_eq!(RuntimeKind::from_value(""), None);
+    }
+
+    #[test]
+    fn as_str_round_trips_through_from_value() {
+        for kind in [RuntimeKind::Podman, RuntimeKind::Docker] {
+            assert_eq!(RuntimeKind::from_value(kind.as_str()), Some(kind));
+        }
+    }
+
+    #[test]
+    fn serde_serializes_as_lowercase_binary_name() {
+        assert_eq!(
+            serde_json::to_string(&RuntimeKind::Podman).unwrap(),
+            "\"podman\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RuntimeKind::Docker).unwrap(),
+            "\"docker\""
+        );
+        let parsed: RuntimeKind = serde_json::from_str("\"docker\"").unwrap();
+        assert_eq!(parsed, RuntimeKind::Docker);
+    }
+
+    #[test]
+    fn clap_value_variants_match_string_form() {
+        // The flag value and the persisted/serde string must be identical so a
+        // `--runtime` choice and a stored session record agree.
+        for kind in [RuntimeKind::Podman, RuntimeKind::Docker] {
+            let pv = kind.to_possible_value().unwrap();
+            assert_eq!(pv.get_name(), kind.as_str());
+        }
+    }
+
+    #[test]
+    fn detect_honors_explicit_preference_in_dry_run() {
+        // dry_run skips the availability probe, so an explicit choice is
+        // returned verbatim regardless of what is installed on the host.
+        let rt = ContainerRuntime::detect(Some(RuntimeKind::Docker), true).unwrap();
+        assert_eq!(rt.kind, RuntimeKind::Docker);
+        assert!(rt.dry_run);
+
+        let rt = ContainerRuntime::detect(Some(RuntimeKind::Podman), true).unwrap();
+        assert_eq!(rt.kind, RuntimeKind::Podman);
     }
 }
