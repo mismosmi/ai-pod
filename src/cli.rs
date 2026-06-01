@@ -5,6 +5,7 @@ use std::path::PathBuf;
 pub enum Agent {
     Claude,
     Opencode,
+    Codex,
 }
 
 #[derive(ValueEnum, Clone, Debug, PartialEq)]
@@ -17,7 +18,7 @@ pub enum BaseImage {
 }
 
 #[derive(Parser)]
-#[command(name = "ai-pod", about = "Run Claude Code inside Podman containers", version)]
+#[command(name = "ai-pod", about = "Run AI coding agents inside Podman containers", version)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,

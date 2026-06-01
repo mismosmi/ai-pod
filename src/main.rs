@@ -50,7 +50,7 @@ fn resolve_agent(agent: Option<cli::Agent>) -> Result<cli::Agent> {
     match agent {
         Some(a) => Ok(a),
         None => {
-            let items = &["Claude", "OpenCode"];
+            let items = &["Claude", "OpenCode", "Codex"];
             let sel = dialoguer::Select::new()
                 .with_prompt("Select agent")
                 .items(items)
@@ -59,7 +59,8 @@ fn resolve_agent(agent: Option<cli::Agent>) -> Result<cli::Agent> {
                 .context("Selection cancelled")?;
             Ok(match sel {
                 0 => cli::Agent::Claude,
-                _ => cli::Agent::Opencode,
+                1 => cli::Agent::Opencode,
+                _ => cli::Agent::Codex,
             })
         }
     }
@@ -80,7 +81,7 @@ fn resolve_base_image(agent: &cli::Agent, image: Option<cli::BaseImage>) -> Resu
             cli::BaseImage::Rust,
             cli::BaseImage::Python,
         ]),
-        cli::Agent::Claude => (&["Alpine", "Ubuntu", "Node", "Rust", "Python"], &[
+        cli::Agent::Claude | cli::Agent::Codex => (&["Alpine", "Ubuntu", "Node", "Rust", "Python"], &[
             cli::BaseImage::Alpine,
             cli::BaseImage::Ubuntu,
             cli::BaseImage::Node,
@@ -157,6 +158,7 @@ fn init_project(
     let agent_str = match agent {
         cli::Agent::Claude => "claude",
         cli::Agent::Opencode => "opencode",
+        cli::Agent::Codex => "codex",
     };
 
     let cfg = base_image_config(&image);

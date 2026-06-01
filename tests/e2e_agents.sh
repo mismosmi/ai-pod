@@ -12,6 +12,7 @@ IMAGE="${2:?Usage: e2e_agents.sh <agent> <image>}"
 case "$AGENT" in
   claude)   VERIFY_ARGS="claude --version" ;;
   opencode) VERIFY_ARGS="opencode --version" ;;
+  codex)    VERIFY_ARGS="codex --version" ;;
   *)        echo "Unknown agent: $AGENT"; exit 1 ;;
 esac
 

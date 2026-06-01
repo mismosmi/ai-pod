@@ -198,6 +198,18 @@ impl AppConfig {
         self.home_dir.join(".claude").join("CLAUDE.md")
     }
 
+    pub fn codex_dir(&self) -> PathBuf {
+        self.home_dir.join(".codex")
+    }
+
+    pub fn codex_config_path(&self) -> PathBuf {
+        self.codex_dir().join("config.toml")
+    }
+
+    pub fn codex_auth_path(&self) -> PathBuf {
+        self.codex_dir().join("auth.json")
+    }
+
     /// Returns the directory for storing moved credential files for a given workspace.
     /// E.g., `/home/user/my-project` → `~/.env-files/home-user-my-project/`
     pub fn env_files_project_dir(&self, workspace: &Path) -> PathBuf {
@@ -326,6 +338,19 @@ mod tests {
         let p = config.claude_md_path();
         assert!(p.ends_with("CLAUDE.md"));
         assert!(p.to_string_lossy().contains(".claude"));
+    }
+
+    #[test]
+    fn codex_paths_point_under_codex_dir() {
+        let dir = TempDir::new().unwrap();
+        let config = temp_config(&dir);
+        assert!(config.codex_dir().ends_with(".codex"));
+        let cfg = config.codex_config_path();
+        assert!(cfg.starts_with(config.codex_dir()));
+        assert!(cfg.ends_with("config.toml"));
+        let auth = config.codex_auth_path();
+        assert!(auth.starts_with(config.codex_dir()));
+        assert!(auth.ends_with("auth.json"));
     }
 
     #[test]
