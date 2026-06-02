@@ -293,17 +293,15 @@ async fn launch_flow(cli: &Cli, rt: &ContainerRuntime) -> Result<()> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Skip update check for internal/daemon commands and when stdin isn't a
-    // tty — the latter means we're being driven by another program (e.g. an
-    // IDE speaking ACP), and the 3s blocking lookup just delays agent startup.
+    // Show the cached update notification — a pure local read, no network wait.
+    // The cache is refreshed in the background by the shared server. Skipped for
+    // internal/daemon commands and when stdin isn't a tty (we're being driven by
+    // another program, e.g. an IDE speaking ACP, where it would just be noise).
     if !matches!(&cli.command, Some(Command::Serve) | Some(Command::Update))
         && ai_pod::is_stdin_tty()
+        && let Ok(config) = AppConfig::new()
     {
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            update::check_for_update(),
-        )
-        .await;
+        update::check_for_update(&config.config_dir);
     }
 
     // Commands that don't need a container runtime

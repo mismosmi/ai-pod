@@ -356,6 +356,16 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
         keep_alive_until: Arc::new(Mutex::new(Instant::now() + Duration::from_secs(30))),
     };
 
+    // Refresh the update-check cache in the background. The server is long-lived
+    // and started on most launches, so this keeps the cache fresh without ever
+    // blocking a CLI invocation on the network.
+    {
+        let config_dir = config.config_dir.clone();
+        tokio::spawn(async move {
+            crate::update::refresh_cache_if_stale(&config_dir).await;
+        });
+    }
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let shutdown_rt = state.runtime.clone();
     let shutdown_keep_alive = state.keep_alive_until.clone();
