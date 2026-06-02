@@ -584,6 +584,7 @@
                 <li><a href="#get-started">Get started</a></li>
                 <li><a href="#how-it-works">How it works</a></li>
                 <li><a href="#usage">Usage</a></li>
+                <li><a href="#ide">IDE</a></li>
                 <li><a href="#security">Security</a></li>
                 <li><a href="#troubleshooting">Troubleshooting</a></li>
             </ul>
@@ -971,6 +972,64 @@ RUN npx playwright install --with-deps
 RUN npm install -g @my-org/mcp-server</pre>
                     </div>
                 </div>
+            </div>
+        </section>
+
+        <hr class="divider" />
+
+        <!-- IDE INTEGRATION -->
+        <section id="ide">
+            <div class="container">
+                <div class="section-label">IDE integration</div>
+                <h2>Plug the in-container agent into your editor</h2>
+                <p class="section-intro">
+                    Any agent inside the container that speaks the
+                    <a href="https://agentclientprotocol.com/">Agent Client Protocol</a>
+                    can drive your IDE through <code>ai-pod run</code>.
+                    Stdio is forwarded transparently; when ai-pod detects
+                    that stdin isn't a terminal it drops the
+                    pseudo-TTY allocation and keeps status output on
+                    stderr, so the JSON-RPC byte stream stays clean.
+                </p>
+
+                <div class="demo-grid">
+                    <div class="code-block">
+                        <div class="code-block-header">
+                            <span class="dot"></span>
+                            Zed — claude-code-acp
+                        </div>
+                        <pre><span class="comment">// ~/.config/zed/settings.json</span>
+{
+  <span class="string">"agent_servers"</span>: {
+    <span class="string">"ai-pod (claude)"</span>: {
+      <span class="string">"command"</span>: <span class="string">"ai-pod"</span>,
+      <span class="string">"args"</span>: [
+        <span class="string">"--no-credential-check"</span>,
+        <span class="string">"run"</span>, <span class="string">"claude-code-acp"</span>
+      ]
+    }
+  }
+}</pre>
+                    </div>
+
+                    <div class="code-block">
+                        <div class="code-block-header">
+                            <span class="dot"></span>
+                            ai-pod.Dockerfile — install ACP adapter
+                        </div>
+                        <pre><span class="comment"># Bake the ACP adapter into the image</span>
+RUN npm install -g @zed-industries/claude-code-acp</pre>
+                    </div>
+                </div>
+
+                <p class="section-intro" style="margin-top: 2rem;">
+                    Run <code>ai-pod</code> interactively once first so the
+                    credential triage and home volume are set up — the
+                    dialog can't run without a TTY. Pass
+                    <code>--no-credential-check</code> from the IDE
+                    afterwards (or keep the workspace clean of
+                    un-triaged sensitive files).
+                </p>
             </div>
         </section>
 

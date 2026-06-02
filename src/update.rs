@@ -51,7 +51,7 @@ pub async fn run_update() -> Result<()> {
 pub async fn check_for_update() {
     if let Ok(latest) = fetch_latest_version().await {
         if is_newer(&latest, CURRENT_VERSION) {
-            println!(
+            eprintln!(
                 "{} {} → {} — {}",
                 "Update available:".yellow().bold(),
                 CURRENT_VERSION.dimmed(),
