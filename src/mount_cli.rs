@@ -375,7 +375,40 @@ fn collect_host_warnings(host: &str, target: &str, home_dir: &Path) -> Vec<Strin
     out
 }
 
+/// Interactive confirmation for a risky mount. Returns `false` (treated as a
+/// decline) whenever stdin isn't a terminal, so non-interactive callers — CI,
+/// piped input, and the test harness — never block on a prompt that has no one
+/// to answer it. Only when attached to a real TTY do we render the prompt.
+fn prompt_risky_mount(spec: &MountSpec, target: &str) -> bool {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return false;
+    }
+    dialoguer::Confirm::new()
+        .with_prompt(format!(
+            "Proceed with mount {} → {} ({})?",
+            spec.host,
+            target,
+            if spec.writable { "rw" } else { "ro" }
+        ))
+        .default(false)
+        .interact()
+        .unwrap_or(false)
+}
+
 pub fn run_add(config: &AppConfig, spec_str: &str, writable: bool, assume_yes: bool) -> Result<()> {
+    run_add_with_confirm(config, spec_str, writable, assume_yes, prompt_risky_mount)
+}
+
+/// Core of [`run_add`], with the risky-mount confirmation injected so tests can
+/// drive the decision without touching `dialoguer` (which would block on a TTY).
+fn run_add_with_confirm(
+    config: &AppConfig,
+    spec_str: &str,
+    writable: bool,
+    assume_yes: bool,
+    confirm: impl FnOnce(&MountSpec, &str) -> bool,
+) -> Result<()> {
     let spec = parse_spec(spec_str, writable, &config.home_dir)?;
     let target = crate::container::resolve_container_target(&spec, &config.home_dir)?;
 
@@ -388,20 +421,8 @@ pub fn run_add(config: &AppConfig, spec_str: &str, writable: bool, assume_yes: b
         for w in &warnings {
             eprintln!("  • {}", w);
         }
-        if !assume_yes {
-            let confirm = dialoguer::Confirm::new()
-                .with_prompt(format!(
-                    "Proceed with mount {} → {} ({})?",
-                    spec.host,
-                    target,
-                    if spec.writable { "rw" } else { "ro" }
-                ))
-                .default(false)
-                .interact()
-                .unwrap_or(false);
-            if !confirm {
-                anyhow::bail!("Mount cancelled by user");
-            }
+        if !assume_yes && !confirm(&spec, &target) {
+            anyhow::bail!("Mount cancelled by user");
         }
     }
 
@@ -952,14 +973,19 @@ mod tests {
 
     #[test]
     fn run_add_aborts_risky_mount_without_yes() {
-        // Non-interactive: dialoguer::Confirm falls back to its default
-        // (false), so the add must bail rather than succeed silently.
+        // When the user declines the confirmation, the add must bail rather
+        // than store the risky mount. We inject the decision via
+        // `run_add_with_confirm` so the test never reaches the live
+        // `dialoguer` prompt — which would block forever on a TTY.
         let dir = TempDir::new().unwrap();
         let config = make_config(dir.path());
         let ssh = dir.path().join(".ssh");
         std::fs::create_dir_all(&ssh).unwrap();
 
-        let err = run_add(&config, &ssh.display().to_string(), false, false).unwrap_err();
+        let err = run_add_with_confirm(&config, &ssh.display().to_string(), false, false, |_, _| {
+            false
+        })
+        .unwrap_err();
         assert!(
             err.to_string().contains("cancelled"),
             "expected cancellation, got: {}",
@@ -967,6 +993,21 @@ mod tests {
         );
         let gc = GlobalConfig::load(&config);
         assert!(gc.mounts.is_empty(), "risky mount must not be stored");
+    }
+
+    #[test]
+    fn run_add_stores_risky_mount_when_confirmed() {
+        // The complement of the abort case: when the user confirms at the
+        // prompt, the risky mount is stored. Again injected to avoid the TTY.
+        let dir = TempDir::new().unwrap();
+        let config = make_config(dir.path());
+        let ssh = dir.path().join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+
+        run_add_with_confirm(&config, &ssh.display().to_string(), false, false, |_, _| true)
+            .unwrap();
+        let gc = GlobalConfig::load(&config);
+        assert_eq!(gc.mounts.len(), 1, "confirmed risky mount must be stored");
     }
 
     #[test]
