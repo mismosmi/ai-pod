@@ -6,6 +6,7 @@ ARG HOST_GATEWAY
 ARG AI_POD_VERSION
 RUN curl -fsSL "http://${HOST_GATEWAY}:7822/install/claude.sh" | bash
 RUN curl -fsSL "http://${HOST_GATEWAY}:7822/install/opencode.sh" | bash
+RUN curl -fsSL "http://${HOST_GATEWAY}:7822/install/codex.sh" | bash
 
 WORKDIR /app
 
@@ -19,5 +20,6 @@ USER ai-pod
 
 ENV PATH="/home/ai-pod/.local/bin:${PATH}"
 ENV EDITOR=vim
+ENV OPENCODE_YOLO=1
 
 CMD ["claude"]
