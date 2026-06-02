@@ -149,11 +149,6 @@ pub enum Command {
 
     /// Update ai-pod to the latest release
     Update,
-
-    /// [Internal] Fetch the latest release version into the update cache.
-    /// Spawned as a detached background process on startup; not for direct use.
-    #[command(hide = true)]
-    FetchUpdateCache,
 }
 
 #[derive(Subcommand)]

@@ -69,15 +69,14 @@ pub async fn run_update() -> Result<()> {
     Ok(())
 }
 
-/// Show an update notification from the local cache (no network wait) and, if
-/// the cache is missing or stale, spawn a detached background process to
-/// refresh it for the next launch. This is the startup entry point and never
-/// blocks on the network.
+/// Show an update notification from the local cache. Pure local read — never
+/// touches the network, so it adds no latency to startup. The cache itself is
+/// refreshed in the background by the shared server (see
+/// [`refresh_cache_if_stale`]).
 pub fn check_for_update(config_dir: &Path) {
-    let path = cache_path(config_dir);
-    let cache = read_cache(&path);
+    let cache = read_cache(&cache_path(config_dir));
 
-    if let Some(ref cache) = cache {
+    if let Some(cache) = cache {
         if is_newer(&cache.latest_version, CURRENT_VERSION) {
             eprintln!(
                 "{} {} → {} — {}",
@@ -88,26 +87,26 @@ pub fn check_for_update(config_dir: &Path) {
             );
         }
     }
-
-    let stale = cache
-        .as_ref()
-        .is_none_or(|c| now_secs().saturating_sub(c.checked_at) >= REFRESH_INTERVAL_SECS);
-    if stale {
-        spawn_background_refresh();
-    }
 }
 
-/// Fetch the latest release version and write it to the update cache. Invoked
-/// by the hidden `fetch-update-cache` subcommand in a detached background
-/// process. Failures are silent — a missed refresh just delays the
-/// notification to a later launch.
-pub async fn fetch_and_cache(config_dir: &Path) {
+/// Refresh the update cache if it's missing or older than
+/// [`REFRESH_INTERVAL_SECS`]. Run as a background task by the long-lived shared
+/// server on startup, so the GitHub lookup happens off the CLI's critical path
+/// and the result is ready for the next launch's [`check_for_update`].
+/// Failures are silent — a missed refresh just defers the notification.
+pub async fn refresh_cache_if_stale(config_dir: &Path) {
+    let path = cache_path(config_dir);
+    let stale = read_cache(&path)
+        .is_none_or(|c| now_secs().saturating_sub(c.checked_at) >= REFRESH_INTERVAL_SECS);
+    if !stale {
+        return;
+    }
     if let Ok(latest_version) = fetch_latest_version().await {
         let cache = UpdateCache {
             latest_version,
             checked_at: now_secs(),
         };
-        let _ = write_cache(&cache_path(config_dir), &cache);
+        let _ = write_cache(&path, &cache);
     }
 }
 
@@ -136,21 +135,6 @@ fn write_cache(path: &Path, cache: &UpdateCache) -> Result<()> {
     std::fs::write(&tmp, json.as_bytes()).context("Failed to write update cache")?;
     std::fs::rename(&tmp, path).context("Failed to rename update cache")?;
     Ok(())
-}
-
-/// Spawn `ai-pod fetch-update-cache` as a detached background process so the
-/// network lookup happens off the startup path. Best-effort: any failure to
-/// locate or spawn the executable is ignored.
-fn spawn_background_refresh() {
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-    let _ = Command::new(exe)
-        .arg("fetch-update-cache")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
 }
 
 async fn fetch_latest_version() -> anyhow::Result<String> {

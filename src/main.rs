@@ -293,21 +293,10 @@ async fn launch_flow(cli: &Cli, rt: &ContainerRuntime) -> Result<()> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Internal background command: refresh the update cache and exit. Handled
-    // before anything else so it never triggers its own update check or touches
-    // the container runtime.
-    if matches!(&cli.command, Some(Command::FetchUpdateCache)) {
-        if let Ok(config) = AppConfig::new() {
-            update::fetch_and_cache(&config.config_dir).await;
-        }
-        return Ok(());
-    }
-
-    // Show the cached update notification and, if stale, spawn a detached
-    // background refresh — no network wait on the startup path. Skipped for
-    // internal/daemon commands and when stdin isn't a tty (we're being driven
-    // by another program, e.g. an IDE speaking ACP, where the notification
-    // would just be noise).
+    // Show the cached update notification — a pure local read, no network wait.
+    // The cache is refreshed in the background by the shared server. Skipped for
+    // internal/daemon commands and when stdin isn't a tty (we're being driven by
+    // another program, e.g. an IDE speaking ACP, where it would just be noise).
     if !matches!(&cli.command, Some(Command::Serve) | Some(Command::Update))
         && ai_pod::is_stdin_tty()
         && let Ok(config) = AppConfig::new()
