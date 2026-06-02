@@ -4,7 +4,14 @@ FROM {{BASE_IMAGE}}
 {{EXTRA_COMMANDS}}
 ARG HOST_GATEWAY
 ARG AI_POD_VERSION
-RUN curl -fsSL "http://${HOST_GATEWAY}:7822/install/{{AGENT}}.sh" | bash
+# Fetch to a file first: `curl ... | bash` masks a failed download because the
+# pipeline's exit status is bash's, not curl's, so a 404 (e.g. an outdated
+# shared server that doesn't know this agent's install route) would silently
+# produce an image without the agent. Splitting the steps lets `curl -f` fail
+# the build loudly instead.
+RUN curl -fsSL "http://${HOST_GATEWAY}:7822/install/{{AGENT}}.sh" -o /tmp/ai-pod-install.sh \
+    && bash /tmp/ai-pod-install.sh \
+    && rm -f /tmp/ai-pod-install.sh
 
 WORKDIR /app
 

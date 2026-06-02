@@ -255,10 +255,17 @@ async fn launch_flow(cli: &Cli, rt: &ContainerRuntime) -> Result<()> {
     //    Dockerfile can fetch /install/{agent}.sh from http://{gateway}:7822)
     server::lifecycle::ensure_shared_server(&config).await?;
 
+    // 5. Check server version compatibility BEFORE building. A stale server
+    //    (e.g. one started by a prior CLI that predates a newly-added agent or
+    //    install route) would serve 404s during the build; bail here with a
+    //    clear "finish active sessions" message instead of producing a broken
+    //    image.
+    server::lifecycle::check_server_version().await?;
+
     // Prune .ai-pod/commands/ entries for sessions whose container is gone.
     clean_stale_sessions(rt, &workspace);
 
-    // 5. Build image if needed
+    // 6. Build image if needed
     let image = image::image_name(&workspace);
     image::ensure_image(rt, &dockerfile, &image, cli.rebuild, cli.no_cache)?;
 
@@ -266,9 +273,6 @@ async fn launch_flow(cli: &Cli, rt: &ContainerRuntime) -> Result<()> {
     // request: re-arm the inactivity timer so the server doesn't shut down
     // while we set up state and launch the container.
     server::lifecycle::bump_keep_alive().await;
-
-    // 6. Check server version compatibility
-    server::lifecycle::check_server_version().await?;
 
     // 7. Get or create project state (stable api_key)
     let project_id = workspace::workspace_hash(&workspace);
@@ -422,6 +426,8 @@ async fn main() -> Result<()> {
                 );
             }
             server::lifecycle::ensure_shared_server(&config).await?;
+            // Catch a stale server before building (see launch_flow for why).
+            server::lifecycle::check_server_version().await?;
             let image = image::image_name(&workspace);
             image::ensure_image(&rt, &dockerfile, &image, cli.rebuild, cli.no_cache)?;
         }
@@ -534,10 +540,11 @@ async fn main() -> Result<()> {
                 }
             }
             server::lifecycle::ensure_shared_server(&config).await?;
+            // Catch a stale server before building (see launch_flow for why).
+            server::lifecycle::check_server_version().await?;
             let image = image::image_name(&workspace);
             image::ensure_image(&rt, &dockerfile, &image, cli.rebuild, cli.no_cache)?;
             server::lifecycle::bump_keep_alive().await;
-            server::lifecycle::check_server_version().await?;
             let project_id = workspace::workspace_hash(&workspace);
             let state = server::lifecycle::get_or_create_project_state(&config, &workspace)?;
             server::lifecycle::reload_config().await?;
