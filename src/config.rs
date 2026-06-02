@@ -104,6 +104,55 @@ impl GlobalConfig {
     }
 }
 
+/// Path to a per-session record, relative to the config dir. Kept in a
+/// `sessions/` subdirectory so the server's project scanner (which treats every
+/// top-level `~/.ai-pod/*.json` stem as a project) never picks these up.
+pub fn session_state_path(config_dir: &Path, session_id: &str) -> PathBuf {
+    config_dir.join("sessions").join(format!("{session_id}.json"))
+}
+
+/// Per-session state persisted to `~/.ai-pod/sessions/{session_id}.json`. The
+/// host-side CLI writes this at container launch; the shared server reads it
+/// (keyed by the `X-Ai-Pod-Session-Id` header) to run service containers on the
+/// same runtime the session was launched with.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SessionState {
+    pub runtime: crate::runtime::RuntimeKind,
+}
+
+impl SessionState {
+    /// Load a session record straight from a config dir. Returns `None` when the
+    /// file is missing or malformed, so callers can fall back gracefully.
+    pub fn load_from_dir(config_dir: &Path, session_id: &str) -> Option<Self> {
+        let path = session_state_path(config_dir, session_id);
+        let raw = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    /// Persist this record to `~/.ai-pod/sessions/{session_id}.json` at 0o600,
+    /// creating the `sessions/` directory if needed. Atomic via temp + rename.
+    pub fn save(&self, config: &AppConfig, session_id: &str) -> Result<()> {
+        let dir = config.sessions_dir();
+        std::fs::create_dir_all(&dir).context("Failed to create ~/.ai-pod/sessions/")?;
+        let path = dir.join(format!("{session_id}.json"));
+        let json = serde_json::to_string_pretty(self)?;
+        let tmp = path.with_extension("tmp");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .context("Failed to write session state")?;
+        file.write_all(json.as_bytes())
+            .context("Failed to write session state contents")?;
+        std::fs::rename(&tmp, &path).context("Failed to rename session state")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .context("Failed to set permissions on session state")?;
+        Ok(())
+    }
+}
+
 impl AppConfig {
     pub fn new() -> Result<Self> {
         let home_dir = dirs::home_dir().context("Could not determine home directory")?;
@@ -129,6 +178,16 @@ impl AppConfig {
     /// Returns path to the shared server state file: ~/.ai-pod/server.json
     pub fn server_state_file(&self) -> PathBuf {
         self.config_dir.join("server.json")
+    }
+
+    /// Directory holding per-session records: ~/.ai-pod/sessions/
+    pub fn sessions_dir(&self) -> PathBuf {
+        self.config_dir.join("sessions")
+    }
+
+    /// Returns path to a per-session record: ~/.ai-pod/sessions/{session_id}.json
+    pub fn session_state_file(&self, session_id: &str) -> PathBuf {
+        session_state_path(&self.config_dir, session_id)
     }
 
     pub fn claude_settings_path(&self) -> PathBuf {
@@ -208,6 +267,47 @@ mod tests {
         let p = config.server_state_file();
         assert!(p.starts_with(&config.config_dir));
         assert!(p.to_string_lossy().ends_with("server.json"));
+    }
+
+    #[test]
+    fn session_state_file_is_under_sessions_subdir() {
+        let dir = TempDir::new().unwrap();
+        let config = temp_config(&dir);
+        let p = config.session_state_file("abc123");
+        assert!(p.starts_with(config.sessions_dir()));
+        assert!(p.to_string_lossy().ends_with("abc123.json"));
+        // Must NOT sit directly under config_dir, or the server's project
+        // scanner would mistake it for a project state file.
+        assert_ne!(p.parent(), Some(config.config_dir.as_path()));
+    }
+
+    #[test]
+    fn session_state_round_trips_at_0o600() {
+        use crate::runtime::RuntimeKind;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let config = temp_config(&dir);
+        config.init().unwrap();
+
+        SessionState {
+            runtime: RuntimeKind::Docker,
+        }
+        .save(&config, "sess0001")
+        .unwrap();
+
+        let path = config.session_state_file("sess0001");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let loaded = SessionState::load_from_dir(&config.config_dir, "sess0001").unwrap();
+        assert_eq!(loaded.runtime, RuntimeKind::Docker);
+    }
+
+    #[test]
+    fn session_state_load_missing_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let config = temp_config(&dir);
+        assert!(SessionState::load_from_dir(&config.config_dir, "nope").is_none());
     }
 
     #[test]

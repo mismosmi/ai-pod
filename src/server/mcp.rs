@@ -40,6 +40,21 @@ fn extract_session_id(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Resolve the container runtime for a session. The launching CLI records it in
+/// `~/.ai-pod/sessions/{session_id}.json`; we read it so service containers run
+/// on the same runtime the session was launched with. Falls back to the
+/// server's own runtime for sessions launched before this existed (or host-side
+/// callers with no session record).
+fn session_runtime(state: &AppState, session_id: &str) -> ContainerRuntime {
+    match crate::config::SessionState::load_from_dir(&state.config_dir, session_id) {
+        Some(s) => ContainerRuntime {
+            kind: s.runtime,
+            dry_run: state.runtime.dry_run,
+        },
+        None => state.runtime.clone(),
+    }
+}
+
 fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -224,8 +239,9 @@ pub async fn mcp_handler(
                 }
             };
             let session_id = extract_session_id(&headers).unwrap_or_else(|| "host".to_string());
+            let rt = session_runtime(&state, &session_id);
 
-            let result = handle_tool_call(&state, &workspace, &session_id, &params).await;
+            let result = handle_tool_call(&state, &rt, &workspace, &session_id, &params).await;
             Json(rpc_result(id, result)).into_response()
         }
         _ => {
@@ -240,6 +256,7 @@ pub async fn mcp_handler(
 
 async fn handle_start_service(
     state: &AppState,
+    rt: &ContainerRuntime,
     workspace: &std::path::Path,
     session_id: &str,
     args: &Value,
@@ -307,7 +324,7 @@ async fn handle_start_service(
         commands::ApprovalOutcome::Approved | commands::ApprovalOutcome::AlwaysAllow => {}
     }
 
-    let rt = state.runtime.clone();
+    let rt = rt.clone();
     let workspace_owned = workspace.to_path_buf();
     let session_owned = session_id.to_string();
     let join = tokio::task::spawn_blocking(move || {
@@ -337,7 +354,7 @@ async fn handle_start_service(
 }
 
 async fn handle_stop_service(
-    state: &AppState,
+    rt: &ContainerRuntime,
     workspace: &std::path::Path,
     session_id: &str,
     args: &Value,
@@ -349,7 +366,7 @@ async fn handle_stop_service(
     if let Err(e) = validate_service_name(&name) {
         return tool_error(e);
     }
-    let rt = state.runtime.clone();
+    let rt = rt.clone();
     let workspace_owned = workspace.to_path_buf();
     let session_owned = session_id.to_string();
     let join = tokio::task::spawn_blocking(move || {
@@ -368,11 +385,11 @@ async fn handle_stop_service(
 }
 
 async fn handle_list_services(
-    state: &AppState,
+    rt: &ContainerRuntime,
     workspace: &std::path::Path,
     session_id: &str,
 ) -> Value {
-    let rt = state.runtime.clone();
+    let rt = rt.clone();
     let workspace_owned = workspace.to_path_buf();
     let session_owned = session_id.to_string();
     let join = tokio::task::spawn_blocking(move || {
@@ -394,7 +411,7 @@ async fn handle_list_services(
 }
 
 async fn handle_service_logs(
-    state: &AppState,
+    rt: &ContainerRuntime,
     workspace: &std::path::Path,
     session_id: &str,
     args: &Value,
@@ -411,7 +428,7 @@ async fn handle_service_logs(
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
         .unwrap_or(50);
-    let rt = state.runtime.clone();
+    let rt = rt.clone();
     let workspace_owned = workspace.to_path_buf();
     let session_owned = session_id.to_string();
     let join = tokio::task::spawn_blocking(move || {
@@ -440,11 +457,57 @@ mod tests {
     use super::*;
     use crate::runtime::RuntimeKind;
 
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
     fn test_runtime(kind: RuntimeKind) -> ContainerRuntime {
         ContainerRuntime {
             kind,
             dry_run: false,
         }
+    }
+
+    fn test_state(config_dir: std::path::PathBuf, kind: RuntimeKind) -> AppState {
+        AppState {
+            projects: Arc::new(Mutex::new(HashMap::new())),
+            config_dir,
+            approval_lock: Arc::new(Mutex::new(())),
+            commands: Arc::new(Mutex::new(HashMap::new())),
+            runtime: test_runtime(kind),
+            keep_alive_until: Arc::new(Mutex::new(
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+            )),
+        }
+    }
+
+    #[test]
+    fn session_runtime_falls_back_to_server_runtime_when_no_record() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_state(dir.path().to_path_buf(), RuntimeKind::Podman);
+        // No session file written → falls back to the server's boot runtime.
+        assert_eq!(session_runtime(&state, "missing").kind, RuntimeKind::Podman);
+    }
+
+    #[test]
+    fn session_runtime_reads_persisted_kind_and_keeps_dry_run() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = crate::config::AppConfig {
+            config_dir: dir.path().to_path_buf(),
+            runtime_settings: dir.path().join("runtime-settings.json"),
+            home_dir: dir.path().to_path_buf(),
+        };
+        crate::config::SessionState {
+            runtime: RuntimeKind::Docker,
+        }
+        .save(&config, "sess42")
+        .unwrap();
+
+        // Server runtime is podman, but the session was launched with docker.
+        let state = test_state(dir.path().to_path_buf(), RuntimeKind::Podman);
+        let rt = session_runtime(&state, "sess42");
+        assert_eq!(rt.kind, RuntimeKind::Docker);
+        assert_eq!(rt.dry_run, state.runtime.dry_run);
     }
 
     #[test]
@@ -552,6 +615,7 @@ mod tests {
 
 async fn handle_tool_call(
     state: &AppState,
+    rt: &ContainerRuntime,
     workspace: &std::path::Path,
     session_id: &str,
     params: &Value,
@@ -668,10 +732,10 @@ async fn handle_tool_call(
                 "structuredContent": { "commands": cmds },
             })
         }
-        "start_service" => handle_start_service(state, workspace, session_id, &args).await,
-        "stop_service" => handle_stop_service(state, workspace, session_id, &args).await,
-        "list_services" => handle_list_services(state, workspace, session_id).await,
-        "service_logs" => handle_service_logs(state, workspace, session_id, &args).await,
+        "start_service" => handle_start_service(state, rt, workspace, session_id, &args).await,
+        "stop_service" => handle_stop_service(rt, workspace, session_id, &args).await,
+        "list_services" => handle_list_services(rt, workspace, session_id).await,
+        "service_logs" => handle_service_logs(rt, workspace, session_id, &args).await,
         other => tool_error(format!("Unknown tool: {other}")),
     }
 }

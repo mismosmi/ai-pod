@@ -41,6 +41,10 @@ pub struct Cli {
     /// Print podman/docker commands instead of executing them
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Container runtime to use (overrides AI_POD_RUNTIME and autodetect)
+    #[arg(long, value_enum)]
+    pub runtime: Option<crate::runtime::RuntimeKind>,
 }
 
 #[derive(Subcommand)]
