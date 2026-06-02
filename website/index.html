@@ -491,7 +491,12 @@
 
             /* ── ANNOUNCEMENT BANNER ── */
             .announce-banner {
-                background: linear-gradient(90deg, #1a1040 0%, #0d2a3a 50%, #1a1040 100%);
+                background: linear-gradient(
+                    90deg,
+                    #1a1040 0%,
+                    #0d2a3a 50%,
+                    #1a1040 100%
+                );
                 border-bottom: 1px solid var(--border);
                 padding: 0.55rem 2rem;
                 text-align: center;
@@ -513,15 +518,19 @@
                     90deg,
                     transparent,
                     rgba(124, 106, 247, 0.12),
-                    rgba(94, 234, 212, 0.10),
+                    rgba(94, 234, 212, 0.1),
                     transparent
                 );
                 animation: shimmer 3.5s ease-in-out infinite;
             }
 
             @keyframes shimmer {
-                0% { left: -100%; }
-                100% { left: 200%; }
+                0% {
+                    left: -100%;
+                }
+                100% {
+                    left: 200%;
+                }
             }
 
             .announce-inner {
@@ -544,7 +553,11 @@
 
             .announce-new {
                 display: inline-block;
-                background: linear-gradient(135deg, var(--accent), var(--accent2));
+                background: linear-gradient(
+                    135deg,
+                    var(--accent),
+                    var(--accent2)
+                );
                 color: #0d0f14;
                 font-size: 0.68rem;
                 font-weight: 800;
@@ -561,8 +574,13 @@
             }
 
             @keyframes bobFloat {
-                0%, 100% { transform: translateY(0); }
-                50% { transform: translateY(-3px); }
+                0%,
+                100% {
+                    transform: translateY(0);
+                }
+                50% {
+                    transform: translateY(-3px);
+                }
             }
         </style>
     </head>
@@ -602,9 +620,9 @@
                 >
             </h1>
             <p>
-                ai-pod runs Claude Code inside isolated containers (Podman
-                or Docker) so your AI has exactly the tools it needs —
-                and nothing it shouldn't touch.
+                ai-pod runs Claude Code inside isolated containers (Podman or
+                Docker) so your AI has exactly the tools it needs — and nothing
+                it shouldn't touch.
             </p>
             <div class="hero-actions">
                 <a href="#usage" class="btn-primary">Get started</a>
@@ -646,9 +664,9 @@
                         <div class="feature-icon">📦</div>
                         <h3>Per-workspace isolation</h3>
                         <p>
-                            Every directory gets a dedicated container
-                            (Podman or Docker), named by a hash of its path.
-                            Projects can't interfere with each other.
+                            Every directory gets a dedicated container (Podman
+                            or Docker), named by a hash of its path. Projects
+                            can't interfere with each other.
                         </p>
                     </div>
 
@@ -659,8 +677,8 @@
                             A named volume preserves
                             <code>~/.claude</code> and
                             <code>~/.config/opencode</code> across sessions —
-                            your login, memory, settings, and conversation history
-                            survive container restarts.
+                            your login, memory, settings, and conversation
+                            history survive container restarts.
                         </p>
                     </div>
 
@@ -687,24 +705,24 @@
 
                     <div class="feature-card">
                         <div class="feature-icon">⚙️</div>
-                        <h3>AI-driven skill file</h3>
+                        <h3>Built-in MCP host bridge</h3>
                         <p>
-                            Container environment context and
-                            <code>host-tools</code> usage are delivered via an
-                            auto-generated ai-pod skill loaded by Claude and
-                            OpenCode, so agents know how to interact with the
-                            host and the container.
+                            Host interaction is exposed as MCP tools served from
+                            the shared ai-pod server. Their descriptions teach
+                            Claude and OpenCode how to run host commands, send
+                            notifications, and start services — no extra config.
                         </p>
                     </div>
 
                     <div class="feature-card">
                         <div class="feature-icon">🖥️</div>
-                        <h3>Host command execution</h3>
+                        <h3>Host command execution via MCP</h3>
                         <p>
-                            The bundled <code>host-tools</code> binary lets
-                            Claude run commands on the host machine. Every
-                            command requires your explicit approval — with a
-                            persistent allowlist for trusted ones.
+                            Agents run commands on the host through ai-pod's
+                            built-in MCP server — no binary is shipped into the
+                            container. Every command requires your explicit
+                            approval, with a persistent allowlist for trusted
+                            ones.
                         </p>
                     </div>
 
@@ -742,12 +760,12 @@
 
                     <div class="feature-card">
                         <div class="feature-icon">⚡</div>
-                        <h3>Background daemon management</h3>
+                        <h3>On-demand service containers</h3>
                         <p>
-                            Claude can start long-running processes on the host
-                            — dev servers, file watchers, build pipelines — and
-                            track them by ID. Daemons are stopped automatically
-                            when the session ends.
+                            Agents can spin up auxiliary containers over MCP —
+                            Postgres, Redis, and the like — reachable by name on
+                            the workspace network. They're ephemeral and removed
+                            automatically when the session ends.
                         </p>
                     </div>
                 </div>
@@ -772,8 +790,7 @@
                         <p>
                             You'll need <a href="https://podman.io">Podman</a>
                             or Docker already installed. Then grab ai-pod with
-                            the one-line install script at the top of this
-                            page.
+                            the one-line install script at the top of this page.
                         </p>
                     </div>
                     <div class="step">
@@ -781,22 +798,21 @@
                         <p>
                             <code>cd</code> into your project and run
                             <code>ai-pod init</code>. This drops an
-                            <code>ai-pod.Dockerfile</code> in the workspace
-                            that you can edit — pick your base image, install
-                            the tools Claude should have, and add any MCP
-                            servers. See the
-                            <a href="#usage">example in Usage</a>.
+                            <code>ai-pod.Dockerfile</code> in the workspace that
+                            you can edit — pick your base image, install the
+                            tools Claude should have, and add any MCP servers.
+                            See the <a href="#usage">example in Usage</a>.
                         </p>
                     </div>
                     <div class="step">
                         <h3>Launch the container</h3>
                         <p>
-                            Run <code>ai-pod</code>. It scans the workspace
-                            for credentials, builds the image, starts the
-                            shared background server, and drops you into a
-                            Claude Code session inside the container. The
-                            first run takes a minute; later runs are instant
-                            unless the Dockerfile changed.
+                            Run <code>ai-pod</code>. It scans the workspace for
+                            credentials, builds the image, starts the shared
+                            background server, and drops you into a Claude Code
+                            session inside the container. The first run takes a
+                            minute; later runs are instant unless the Dockerfile
+                            changed.
                         </p>
                     </div>
                     <div class="step">
@@ -846,8 +862,8 @@
                         <h3>Start the shared server</h3>
                         <p>
                             A lightweight background server starts on the host,
-                            bridging host-interaction requests from all
-                            containers.
+                            exposing an MCP endpoint that bridges
+                            host-interaction requests from all containers.
                         </p>
                     </div>
                     <div class="step">
@@ -919,42 +935,34 @@
                     <div class="code-block">
                         <div class="code-block-header">
                             <span class="dot"></span>
-                            host-tools (inside container)
+                            Host commands &amp; allowlist
                         </div>
-                        <pre><span class="comment"># Run a command on the host</span>
-<span class="cmd">host-tools run-command</span> ls ~/Desktop
+                        <pre><span class="comment"># Inspect / kill running host commands (TUI)</span>
+<span class="cmd">ai-pod commands</span>
 
-<span class="comment"># Open a URL in the host browser</span>
-<span class="cmd">host-tools run-command</span> open https://example.com
+<span class="comment"># Run a host command (same approval flow)</span>
+<span class="cmd">ai-pod commands run</span> ls ~/Desktop
 
-<span class="comment"># List previously approved commands</span>
-<span class="cmd">host-tools run-command</span> <span class="flag">--list</span>
+<span class="comment"># Manage the always-allowed whitelist (TUI)</span>
+<span class="cmd">ai-pod allowed</span>
 
-<span class="comment"># Send a desktop notification</span>
-<span class="cmd">host-tools notify-user</span> <span class="string">"Build finished"</span></pre>
+<span class="comment"># List approved commands</span>
+<span class="cmd">ai-pod allowed list</span></pre>
                     </div>
 
                     <div class="code-block">
                         <div class="code-block-header">
                             <span class="dot"></span>
-                            Daemon management (inside container)
+                            Service containers
                         </div>
-                        <pre><span class="comment"># Start a background process, get its ID</span>
-<span class="cmd">host-tools daemon start</span> npm run dev
-<span class="comment">  → a3f91c820b4e</span>
+                        <pre><span class="comment"># List service containers agents started</span>
+<span class="cmd">ai-pod services list</span>
 
-<span class="comment"># Stream its output (follows until exit)</span>
-<span class="cmd">host-tools daemon output</span> a3f91c820b4e
+<span class="comment"># Tail a service's logs</span>
+<span class="cmd">ai-pod services logs</span> postgres
 
-<span class="comment"># Check status and exit code</span>
-<span class="cmd">host-tools daemon status</span> a3f91c820b4e
-
-<span class="comment"># List all daemons for this project</span>
-<span class="cmd">host-tools daemon list</span>
-
-<span class="comment"># Stop one or all daemons</span>
-<span class="cmd">host-tools daemon stop</span> a3f91c820b4e
-<span class="cmd">host-tools daemon stop-all</span></pre>
+<span class="comment"># Stop a running service</span>
+<span class="cmd">ai-pod services stop</span> postgres</pre>
                     </div>
 
                     <div class="code-block">
@@ -984,12 +992,14 @@ RUN npm install -g @my-org/mcp-server</pre>
                 <h2>Plug the in-container agent into your editor</h2>
                 <p class="section-intro">
                     Any agent inside the container that speaks the
-                    <a href="https://agentclientprotocol.com/">Agent Client Protocol</a>
-                    can drive your IDE through <code>ai-pod run</code>.
-                    Stdio is forwarded transparently; when ai-pod detects
-                    that stdin isn't a terminal it drops the
-                    pseudo-TTY allocation and keeps status output on
-                    stderr, so the JSON-RPC byte stream stays clean.
+                    <a href="https://agentclientprotocol.com/"
+                        >Agent Client Protocol</a
+                    >
+                    can drive your IDE through <code>ai-pod run</code>. Stdio is
+                    forwarded transparently; when ai-pod detects that stdin
+                    isn't a terminal it drops the pseudo-TTY allocation and
+                    keeps status output on stderr, so the JSON-RPC byte stream
+                    stays clean.
                 </p>
 
                 <div class="demo-grid">
@@ -1022,13 +1032,12 @@ RUN npm install -g @zed-industries/claude-code-acp</pre>
                     </div>
                 </div>
 
-                <p class="section-intro" style="margin-top: 2rem;">
+                <p class="section-intro" style="margin-top: 2rem">
                     Run <code>ai-pod</code> interactively once first so the
-                    credential triage and home volume are set up — the
-                    dialog can't run without a TTY. Pass
-                    <code>--no-credential-check</code> from the IDE
-                    afterwards (or keep the workspace clean of
-                    un-triaged sensitive files).
+                    credential triage and home volume are set up — the dialog
+                    can't run without a TTY. Pass
+                    <code>--no-credential-check</code> from the IDE afterwards
+                    (or keep the workspace clean of un-triaged sensitive files).
                 </p>
             </div>
         </section>
@@ -1103,9 +1112,9 @@ RUN npm install -g @zed-industries/claude-code-acp</pre>
                                 <strong>Rootless containers</strong>
                                 <span
                                     >Works with Podman's rootless mode out of
-                                    the box, and supports Docker too. Keeps
-                                    the blast radius small even if something
-                                    goes wrong.</span
+                                    the box, and supports Docker too. Keeps the
+                                    blast radius small even if something goes
+                                    wrong.</span
                                 >
                             </div>
                         </li>
@@ -1131,21 +1140,27 @@ RUN npm install -g @zed-industries/claude-code-acp</pre>
                         <div class="feature-icon">🔑</div>
                         <h3>Permission denied on workspace files</h3>
                         <p>
-                            Your workspace is bind-mounted into the container
-                            at <code>/app</code>. The <code>claude</code> user
+                            Your workspace is bind-mounted into the container at
+                            <code>/app</code>. The <code>claude</code> user
                             inside the container has its own uid, and if that
-                            uid doesn't line up with the host uid that owns
-                            the files, Claude can't write to
-                            <code>/app</code> — or new files end up with an
-                            owner you can't edit on the host.
+                            uid doesn't line up with the host uid that owns the
+                            files, Claude can't write to <code>/app</code> — or
+                            new files end up with an owner you can't edit on the
+                            host.
                         </p>
                         <p style="margin-top: 1rem">
                             There are three independent knobs for fixing this.
-                            Pick the one that matches where you want the fix
-                            to live: per-project, per-run, or globally.
+                            Pick the one that matches where you want the fix to
+                            live: per-project, per-run, or globally.
                         </p>
 
-                        <h4 style="margin-top: 1.5rem; font-size: 0.95rem; color: var(--text);">
+                        <h4
+                            style="
+                                margin-top: 1.5rem;
+                                font-size: 0.95rem;
+                                color: var(--text);
+                            "
+                        >
                             1. Pin the uid in your Dockerfile
                         </h4>
                         <p>
@@ -1153,8 +1168,8 @@ RUN npm install -g @zed-industries/claude-code-acp</pre>
                             <code>useradd</code> so the <code>claude</code>
                             user is built with a specific uid instead of the
                             distro default. Check your host uid first with
-                            <code>id -u</code>. Most surgical fix — stays
-                            inside the one project.
+                            <code>id -u</code>. Most surgical fix — stays inside
+                            the one project.
                         </p>
                         <div class="code-block" style="margin-top: 0.75rem">
                             <div class="code-block-header">
@@ -1165,16 +1180,22 @@ RUN npm install -g @zed-industries/claude-code-acp</pre>
     &amp;&amp; chown -R claude /app</pre>
                         </div>
 
-                        <h4 style="margin-top: 1.5rem; font-size: 0.95rem; color: var(--text);">
+                        <h4
+                            style="
+                                margin-top: 1.5rem;
+                                font-size: 0.95rem;
+                                color: var(--text);
+                            "
+                        >
                             2. Set <code>PODMAN_USERNS</code> globally
                         </h4>
                         <p>
                             <code>PODMAN_USERNS</code> is a standard Podman
                             environment variable. When set, it becomes the
                             <code>--userns</code> value for every
-                            <code>podman run</code> — including the ones
-                            ai-pod makes. Use this to configure user namespace
-                            mapping across every project.
+                            <code>podman run</code> — including the ones ai-pod
+                            makes. Use this to configure user namespace mapping
+                            across every project.
                         </p>
                         <div class="code-block" style="margin-top: 0.75rem">
                             <div class="code-block-header">
@@ -1184,7 +1205,13 @@ RUN npm install -g @zed-industries/claude-code-acp</pre>
                             <pre><span class="cmd">export</span> PODMAN_USERNS=keep-id:uid=1000,gid=1000</pre>
                         </div>
 
-                        <h4 style="margin-top: 1.5rem; font-size: 0.95rem; color: var(--text);">
+                        <h4
+                            style="
+                                margin-top: 1.5rem;
+                                font-size: 0.95rem;
+                                color: var(--text);
+                            "
+                        >
                             Debugging uid mismatches
                         </h4>
                         <p>
@@ -1206,10 +1233,10 @@ RUN npm install -g @zed-industries/claude-code-acp</pre>
 <span class="cmd">ls</span> <span class="flag">-ln</span> /app               <span class="comment"># what the container sees as owner</span></pre>
                         </div>
                         <p style="margin-top: 0.75rem">
-                            If the uid from <code>id</code> inside the
-                            container doesn't match the numeric owner of
-                            <code>/app</code>, that's the gap — apply one of
-                            the three fixes above.
+                            If the uid from <code>id</code> inside the container
+                            doesn't match the numeric owner of
+                            <code>/app</code>, that's the gap — apply one of the
+                            three fixes above.
                         </p>
                     </div>
                 </div>
