@@ -1,25 +1,23 @@
 FROM rust:latest
 
-ARG HOST_GATEWAY
-RUN curl -fsSL "http://${HOST_GATEWAY}:7822/host-tools" \
-      -o /usr/local/bin/host-tools && chmod +x /usr/local/bin/host-tools
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git vim && rm -rf /var/lib/apt/lists/*
 
-RUN host-tools install claude
-RUN host-tools install opencode
+ARG HOST_GATEWAY
+ARG AI_POD_VERSION
+RUN curl -fsSL "http://${HOST_GATEWAY}:7822/install/claude.sh" | bash
+RUN curl -fsSL "http://${HOST_GATEWAY}:7822/install/opencode.sh" | bash
 
 WORKDIR /app
 
-RUN useradd -ms /bin/bash ai-pod
-RUN chown -R ai-pod /app
+RUN useradd -ms /bin/bash ai-pod && chown -R ai-pod /app
 
-# System-level git identity
+# System-level git identity (fallback when no host identity is provided)
 RUN git config --system user.email "ai-pod@ai-pod" && \
     git config --system user.name "ai-pod"
 
 USER ai-pod
 
 ENV PATH="/home/ai-pod/.local/bin:${PATH}"
-ENV OPENCODE_YOLO=1
-
+ENV EDITOR=vim
 
 CMD ["claude"]

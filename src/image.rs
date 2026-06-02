@@ -54,7 +54,7 @@ pub fn needs_build(rt: &ContainerRuntime, image: &str, force: bool) -> Result<bo
 }
 
 pub fn build_image(rt: &ContainerRuntime, dockerfile: &Path, image: &str, no_cache: bool) -> Result<()> {
-    println!("{}", "Building container image...".blue().bold());
+    eprintln!("{}", "Building container image...".blue().bold());
 
     let version_arg = format!("AI_POD_VERSION={}", env!("CARGO_PKG_VERSION"));
     let gateway_arg = format!("HOST_GATEWAY={}", rt.host_gateway());
@@ -113,7 +113,7 @@ pub fn build_image(rt: &ContainerRuntime, dockerfile: &Path, image: &str, no_cac
         anyhow::bail!("{} build failed", rt.cmd());
     }
 
-    println!("{}", "Image built successfully.".green().bold());
+    eprintln!("{}", "Image built successfully.".green().bold());
     Ok(())
 }
 
@@ -121,7 +121,7 @@ pub fn ensure_image(rt: &ContainerRuntime, dockerfile: &Path, image: &str, force
     if needs_build(rt, image, force)? {
         build_image(rt, dockerfile, image, no_cache)?;
     } else {
-        println!("{}", "Container image is up to date.".green());
+        eprintln!("{}", "Container image is up to date.".green());
     }
     Ok(())
 }

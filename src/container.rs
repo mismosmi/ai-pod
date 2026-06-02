@@ -93,7 +93,7 @@ fn ensure_mask_volume(
 ) -> Result<String> {
     let vol = mask_volume_name(workspace, dir);
     if !volume_exists(rt, &vol)? {
-        println!("{} {}", "Creating mask volume:".blue().bold(), vol);
+        eprintln!("{} {}", "Creating mask volume:".blue().bold(), vol);
         let status = rt
             .command()
             .args(["volume", "create", &vol])
@@ -212,10 +212,10 @@ pub fn remove_mask_volume(rt: &ContainerRuntime, workspace: &Path, dir: &str) ->
         .output()
         .context("Failed to remove mask volume")?;
     if output.status.success() {
-        println!("{} {}", "Removed volume:".red().bold(), vol);
+        eprintln!("{} {}", "Removed volume:".red().bold(), vol);
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        println!(
+        eprintln!(
             "{} could not remove {} ({})",
             "Warning:".yellow().bold(),
             vol,
@@ -566,7 +566,7 @@ fn init_home_volume(
     project_id: &str,
     api_key: &str,
 ) -> Result<()> {
-    println!(
+    eprintln!(
         "{} {}",
         "Initialising home volume:".blue().bold(),
         volume_name
@@ -585,7 +585,7 @@ fn init_home_volume(
 
     let _ = (project_id, api_key); // used via env vars at runtime
 
-    println!("{}", "Home volume initialised.".green());
+    eprintln!("{}", "Home volume initialised.".green());
 
     Ok(())
 }
@@ -601,7 +601,7 @@ fn reseed_home_volume(
     project_id: &str,
     api_key: &str,
 ) -> Result<()> {
-    println!(
+    eprintln!(
         "{} {}",
         "Refreshing home volume config:".blue().bold(),
         volume_name
@@ -611,7 +611,7 @@ fn reseed_home_volume(
 
     let _ = (project_id, api_key); // used via env vars at runtime
 
-    println!("{}", "Home volume reseeded.".green());
+    eprintln!("{}", "Home volume reseeded.".green());
 
     Ok(())
 }
@@ -632,7 +632,7 @@ pub fn launch_container(
     // On rebuild: stop all existing containers for this workspace and reseed the volume
     if rebuild {
         for name in containers_for_prefix(rt, &prefix, false)? {
-            println!(
+            eprintln!(
                 "{} {}",
                 "Removing container for rebuild:".blue().bold(),
                 name
@@ -667,7 +667,7 @@ pub fn launch_container(
 
     let session_id = new_session_id();
     let container_name = container_name_for(workspace, &session_id);
-    println!("{} {}", "Starting container:".blue().bold(), container_name);
+    eprintln!("{} {}", "Starting container:".blue().bold(), container_name);
 
     refresh_claude_mcp_in_volume(
         rt,
@@ -762,6 +762,7 @@ pub fn run_in_container(
     api_key: &str,
     command: &str,
     args: &[String],
+    interactive: bool,
 ) -> Result<()> {
     let session_id = new_session_id();
     let container_name = container_name_for(workspace, &session_id);
@@ -792,7 +793,7 @@ pub fn run_in_container(
         &session_id,
     )?;
 
-    println!(
+    eprintln!(
         "{} {} {}",
         "Running in container:".blue().bold(),
         container_name,
@@ -809,10 +810,14 @@ pub fn run_in_container(
     // attached later on rootless podman.
     let service_net = crate::service::ensure_service_network(rt, workspace)?;
 
+    // Without a tty on stdin (e.g. an IDE driving ai-pod over stdio for
+    // ACP), `-t` would allocate a pseudo-TTY that mangles the JSON-RPC
+    // byte stream the agent emits. Keep `-i` so stdin stays attached.
+    let stdio_flag = if interactive { "-it" } else { "-i" };
     let mut run_args: Vec<String> = vec![
         "run".into(),
         "--rm".into(),
-        "-it".into(),
+        stdio_flag.into(),
     ];
     run_args.extend_from_slice(&[
         "--label".into(),

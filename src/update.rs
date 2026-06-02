@@ -79,7 +79,7 @@ pub fn check_for_update(config_dir: &Path) {
 
     if let Some(ref cache) = cache {
         if is_newer(&cache.latest_version, CURRENT_VERSION) {
-            println!(
+            eprintln!(
                 "{} {} → {} — {}",
                 "Update available:".yellow().bold(),
                 CURRENT_VERSION.dimmed(),

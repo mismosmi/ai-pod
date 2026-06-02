@@ -102,6 +102,34 @@ ai-pod run claude resume   # resume the last Claude session
 ai-pod run bash            # open a bash shell in the container
 ```
 
+### IDE integration via ACP
+
+`ai-pod run` forwards stdio transparently between the parent process and the in-container command. When stdin is not a terminal — i.e. an IDE is piping JSON-RPC over `ai-pod`'s stdio — ai-pod drops the pseudo-TTY allocation and keeps status output on stderr, so the byte stream coming out of the container is exactly what the IDE sees. That makes any agent that speaks the [Agent Client Protocol](https://agentclientprotocol.com/) usable from inside the container.
+
+Run your workspace through `ai-pod` once first, so the credential triage and home volume are set up. Then point your IDE at `ai-pod run …` with the in-container ACP binary as the command. For Claude Code:
+
+```jsonc
+// Zed: ~/.config/zed/settings.json
+{
+  "agent_servers": {
+    "ai-pod (claude)": {
+      "command": "ai-pod",
+      "args": [
+        "--no-credential-check",
+        "--workdir", "/absolute/path/to/workspace",
+        "run", "claude-code-acp"
+      ]
+    }
+  }
+}
+```
+
+For OpenCode, use whichever ACP entry point it exposes (e.g. `ai-pod run opencode acp`). Anything you install into your `ai-pod.Dockerfile` is on `$PATH` inside the container, so `npm i -g @zed-industries/claude-code-acp` in the Dockerfile is enough to make the example above work.
+
+Notes:
+- Pass `--no-credential-check` (or run `ai-pod` interactively first to triage the workspace) — the credential dialog can't run without a TTY, and ai-pod will refuse to start if anything is pending.
+- `--workdir` is required when the IDE launches `ai-pod` from a directory other than the workspace root.
+
 ### Masking host directories
 
 Some directories — `node_modules`, `target`, `.venv`, `dist` — contain
