@@ -50,7 +50,7 @@ fn resolve_agent(agent: Option<cli::Agent>) -> Result<cli::Agent> {
     match agent {
         Some(a) => Ok(a),
         None => {
-            let items = &["Claude", "OpenCode"];
+            let items = &["Claude", "OpenCode", "Codex"];
             let sel = dialoguer::Select::new()
                 .with_prompt("Select agent")
                 .items(items)
@@ -59,7 +59,8 @@ fn resolve_agent(agent: Option<cli::Agent>) -> Result<cli::Agent> {
                 .context("Selection cancelled")?;
             Ok(match sel {
                 0 => cli::Agent::Claude,
-                _ => cli::Agent::Opencode,
+                1 => cli::Agent::Opencode,
+                _ => cli::Agent::Codex,
             })
         }
     }
@@ -80,7 +81,7 @@ fn resolve_base_image(agent: &cli::Agent, image: Option<cli::BaseImage>) -> Resu
             cli::BaseImage::Rust,
             cli::BaseImage::Python,
         ]),
-        cli::Agent::Claude => (&["Alpine", "Ubuntu", "Node", "Rust", "Python"], &[
+        cli::Agent::Claude | cli::Agent::Codex => (&["Alpine", "Ubuntu", "Node", "Rust", "Python"], &[
             cli::BaseImage::Alpine,
             cli::BaseImage::Ubuntu,
             cli::BaseImage::Node,
@@ -157,6 +158,7 @@ fn init_project(
     let agent_str = match agent {
         cli::Agent::Claude => "claude",
         cli::Agent::Opencode => "opencode",
+        cli::Agent::Codex => "codex",
     };
 
     let cfg = base_image_config(&image);
@@ -253,10 +255,17 @@ async fn launch_flow(cli: &Cli, rt: &ContainerRuntime) -> Result<()> {
     //    Dockerfile can fetch /install/{agent}.sh from http://{gateway}:7822)
     server::lifecycle::ensure_shared_server(&config).await?;
 
+    // 5. Check server version compatibility BEFORE building. A stale server
+    //    (e.g. one started by a prior CLI that predates a newly-added agent or
+    //    install route) would serve 404s during the build; bail here with a
+    //    clear "finish active sessions" message instead of producing a broken
+    //    image.
+    server::lifecycle::check_server_version().await?;
+
     // Prune .ai-pod/commands/ entries for sessions whose container is gone.
     clean_stale_sessions(rt, &workspace);
 
-    // 5. Build image if needed
+    // 6. Build image if needed
     let image = image::image_name(&workspace);
     image::ensure_image(rt, &dockerfile, &image, cli.rebuild, cli.no_cache)?;
 
@@ -264,9 +273,6 @@ async fn launch_flow(cli: &Cli, rt: &ContainerRuntime) -> Result<()> {
     // request: re-arm the inactivity timer so the server doesn't shut down
     // while we set up state and launch the container.
     server::lifecycle::bump_keep_alive().await;
-
-    // 6. Check server version compatibility
-    server::lifecycle::check_server_version().await?;
 
     // 7. Get or create project state (stable api_key)
     let project_id = workspace::workspace_hash(&workspace);
@@ -418,6 +424,8 @@ async fn main() -> Result<()> {
                 );
             }
             server::lifecycle::ensure_shared_server(&config).await?;
+            // Catch a stale server before building (see launch_flow for why).
+            server::lifecycle::check_server_version().await?;
             let image = image::image_name(&workspace);
             image::ensure_image(&rt, &dockerfile, &image, cli.rebuild, cli.no_cache)?;
         }
@@ -530,10 +538,11 @@ async fn main() -> Result<()> {
                 }
             }
             server::lifecycle::ensure_shared_server(&config).await?;
+            // Catch a stale server before building (see launch_flow for why).
+            server::lifecycle::check_server_version().await?;
             let image = image::image_name(&workspace);
             image::ensure_image(&rt, &dockerfile, &image, cli.rebuild, cli.no_cache)?;
             server::lifecycle::bump_keep_alive().await;
-            server::lifecycle::check_server_version().await?;
             let project_id = workspace::workspace_hash(&workspace);
             let state = server::lifecycle::get_or_create_project_state(&config, &workspace)?;
             server::lifecycle::reload_config().await?;

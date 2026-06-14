@@ -325,6 +325,48 @@ fn opencode_config_content(server_url: &str, api_key: &str, session_id: &str) ->
     .expect("serialize opencode config content")
 }
 
+/// Merge ai-pod's keys into a Codex `config.toml`, preserving everything else.
+///
+/// Codex reads `~/.codex/config.toml` (TOML); login/auth lives separately in
+/// `~/.codex/auth.json` and is never touched here. We use `toml_edit` so a
+/// user's persisted, possibly hand-edited config (model, provider, comments,
+/// other `[mcp_servers.*]`) survives byte-for-byte — only the five keys we own
+/// are rewritten on every launch:
+///   - `experimental_use_rmcp_client` (enables native streamable-HTTP MCP)
+///   - `[mcp_servers.ai-pod]` (url + http_headers, with literal session creds)
+///   - `approval_policy = "never"` and `sandbox_mode = "danger-full-access"`
+///     (the container is the sandbox, matching Claude's `bypassPermissions`
+///     and OpenCode's YOLO mode; a user's stricter value is intentionally
+///     overridden each launch)
+///   - `notify` (points at the in-container notify helper)
+fn codex_config_merge(
+    existing: &str,
+    server_url: &str,
+    api_key: &str,
+    session_id: &str,
+) -> String {
+    // Missing OR unparsable config -> start from an empty document.
+    let mut doc = existing
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap_or_default();
+
+    doc["experimental_use_rmcp_client"] = toml_edit::value(true);
+    doc["approval_policy"] = toml_edit::value("never");
+    doc["sandbox_mode"] = toml_edit::value("danger-full-access");
+
+    let mut notify = toml_edit::Array::new();
+    notify.push("/usr/local/bin/ai-pod-codex-notify");
+    doc["notify"] = toml_edit::value(notify);
+
+    // Nested tables auto-vivify, so this works on an empty document too.
+    let server = &mut doc["mcp_servers"]["ai-pod"];
+    server["url"] = toml_edit::value(format!("{}/mcp", server_url));
+    server["http_headers"]["X-Api-Key"] = toml_edit::value(api_key);
+    server["http_headers"]["X-Ai-Pod-Session-Id"] = toml_edit::value(session_id);
+
+    doc.to_string()
+}
+
 fn read_git_global(key: &str) -> Option<String> {
     std::process::Command::new("git")
         .args(["config", "--global", key])
@@ -427,6 +469,7 @@ fn seed_home_volume(
             "mkdir",
             "-p",
             &format!("{}/.claude", CONTAINER_HOME),
+            &format!("{}/.codex", CONTAINER_HOME),
             &format!("{}/.config", CONTAINER_HOME),
             &format!("{}/.config/opencode/plugins", CONTAINER_HOME),
         ])
@@ -469,6 +512,25 @@ fn seed_home_volume(
                 ),
             ])
             .status();
+    }
+
+    // First-time init only: carry the host's Codex login + prefs into the
+    // volume so the user starts logged in. `refresh_codex_config_in_volume`
+    // later merges ai-pod's keys over the copied config.toml. Auth lives in
+    // auth.json and is preserved untouched across reseeds.
+    if copy_claude_json {
+        for host_path in [config.codex_auth_path(), config.codex_config_path()] {
+            if host_path.exists() {
+                let _ = rt
+                    .command()
+                    .args([
+                        "cp",
+                        &host_path.to_string_lossy(),
+                        &format!("{}:{}/.codex/", init_container, CONTAINER_HOME),
+                    ])
+                    .status();
+            }
+        }
     }
 
     write_gitconfig_to_volume(rt, config, &init_container)?;
@@ -547,6 +609,70 @@ fn refresh_claude_mcp_in_volume(
             "cp",
             tmp_out.to_str().unwrap(),
             &format!("{}:{}/.claude.json", init_container, CONTAINER_HOME),
+        ])
+        .status();
+
+    let _ = rt.command().args(["rm", &init_container]).status();
+    let _ = std::fs::remove_file(&tmp_in);
+    let _ = std::fs::remove_file(&tmp_out);
+    Ok(())
+}
+
+/// Update the `~/.codex/config.toml` in the volume with ai-pod's MCP entry and
+/// runtime settings (see [`codex_config_merge`]). Runs on every launch so the
+/// in-volume config matches the env the agent will see, mirroring
+/// [`refresh_claude_mcp_in_volume`].
+fn refresh_codex_config_in_volume(
+    rt: &ContainerRuntime,
+    config: &AppConfig,
+    volume_name: &str,
+    container_name: &str,
+    image: &str,
+    server_url: &str,
+    api_key: &str,
+    session_id: &str,
+) -> Result<()> {
+    let init_container = format!("{}-codex", container_name);
+    let status = rt
+        .command()
+        .args([
+            "create",
+            "--name",
+            &init_container,
+            "-v",
+            &format!("{}:{}", volume_name, CONTAINER_HOME),
+            image,
+            "true",
+        ])
+        .status()
+        .context("Failed to create codex-refresh container")?;
+    if !status.success() {
+        anyhow::bail!("Failed to create codex-refresh container");
+    }
+
+    // Pull the existing config.toml out of the volume (may not exist yet).
+    let tmp_in = config.config_dir.join("codex-config-in.toml");
+    let _ = std::fs::remove_file(&tmp_in);
+    let _ = rt
+        .command()
+        .args([
+            "cp",
+            &format!("{}:{}/.codex/config.toml", init_container, CONTAINER_HOME),
+            tmp_in.to_str().unwrap(),
+        ])
+        .status();
+
+    let existing = std::fs::read_to_string(&tmp_in).unwrap_or_default();
+    let merged = codex_config_merge(&existing, server_url, api_key, session_id);
+
+    let tmp_out = config.config_dir.join("codex-config-out.toml");
+    std::fs::write(&tmp_out, merged)?;
+    let _ = rt
+        .command()
+        .args([
+            "cp",
+            tmp_out.to_str().unwrap(),
+            &format!("{}:{}/.codex/config.toml", init_container, CONTAINER_HOME),
         ])
         .status();
 
@@ -684,6 +810,17 @@ pub fn launch_container(
         &session_id,
     )?;
 
+    refresh_codex_config_in_volume(
+        rt,
+        config,
+        &volume_name,
+        &prefix,
+        image,
+        &rt.server_url(),
+        api_key,
+        &session_id,
+    )?;
+
     let add_host = rt.add_host_arg();
     let host_gw_env = format!("HOST_GATEWAY={}", rt.host_gateway());
     let server_url_env = format!("AI_POD_SERVER_URL={}", rt.server_url());
@@ -792,6 +929,17 @@ pub fn run_in_container(
     }
 
     refresh_claude_mcp_in_volume(
+        rt,
+        config,
+        &volume_name,
+        &container_name,
+        image,
+        &rt.server_url(),
+        api_key,
+        &session_id,
+    )?;
+
+    refresh_codex_config_in_volume(
         rt,
         config,
         &volume_name,
@@ -1124,6 +1272,82 @@ mod tests {
         assert_eq!(v["mcp"]["ai-pod"]["enabled"], true);
         assert_eq!(v["mcp"]["ai-pod"]["headers"]["X-Api-Key"], "k1");
         assert_eq!(v["mcp"]["ai-pod"]["headers"]["X-Ai-Pod-Session-Id"], "s2");
+    }
+
+    #[test]
+    fn codex_config_merge_into_empty() {
+        let out = codex_config_merge(
+            "",
+            "http://host.containers.internal:7822",
+            "k1",
+            "s2",
+        );
+        let doc = out.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(doc["experimental_use_rmcp_client"].as_bool(), Some(true));
+        assert_eq!(doc["approval_policy"].as_str(), Some("never"));
+        assert_eq!(doc["sandbox_mode"].as_str(), Some("danger-full-access"));
+        assert_eq!(
+            doc["notify"].as_array().unwrap().get(0).unwrap().as_str(),
+            Some("/usr/local/bin/ai-pod-codex-notify")
+        );
+        let server = &doc["mcp_servers"]["ai-pod"];
+        assert_eq!(
+            server["url"].as_str(),
+            Some("http://host.containers.internal:7822/mcp")
+        );
+        assert_eq!(server["http_headers"]["X-Api-Key"].as_str(), Some("k1"));
+        assert_eq!(
+            server["http_headers"]["X-Ai-Pod-Session-Id"].as_str(),
+            Some("s2")
+        );
+    }
+
+    #[test]
+    fn codex_config_merge_preserves_existing_keys() {
+        let existing = "model = \"gpt-5\"\n# my comment\n";
+        let out = codex_config_merge(
+            existing,
+            "http://host.containers.internal:7822",
+            "k1",
+            "s2",
+        );
+        // The user's key and comment survive (toml_edit, not a typed rewrite).
+        assert!(out.contains("# my comment"), "comment should survive: {out}");
+        let doc = out.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(doc["model"].as_str(), Some("gpt-5"));
+        // ...and ai-pod's keys are still merged in.
+        assert_eq!(
+            doc["mcp_servers"]["ai-pod"]["http_headers"]["X-Api-Key"].as_str(),
+            Some("k1")
+        );
+    }
+
+    #[test]
+    fn codex_config_merge_url_uses_runtime_gateway() {
+        // On Docker the gateway is host.docker.internal — the url must reflect
+        // whatever server_url is passed, not a hardcoded host.
+        let out = codex_config_merge("", "http://host.docker.internal:7822", "k1", "s2");
+        let doc = out.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(
+            doc["mcp_servers"]["ai-pod"]["url"].as_str(),
+            Some("http://host.docker.internal:7822/mcp")
+        );
+    }
+
+    #[test]
+    fn codex_config_merge_overwrites_stale_session() {
+        let first = codex_config_merge("", "http://h:7822", "k1", "old-session");
+        let second = codex_config_merge(&first, "http://h:7822", "k2", "new-session");
+        let doc = second.parse::<toml_edit::DocumentMut>().unwrap();
+        let server = &doc["mcp_servers"]["ai-pod"];
+        assert_eq!(server["http_headers"]["X-Api-Key"].as_str(), Some("k2"));
+        assert_eq!(
+            server["http_headers"]["X-Ai-Pod-Session-Id"].as_str(),
+            Some("new-session")
+        );
+        // No stale session credential left behind.
+        assert!(second.contains("new-session"));
+        assert!(!second.contains("old-session"), "stale session must be gone: {second}");
     }
 
     #[test]

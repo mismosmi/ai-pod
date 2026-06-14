@@ -2,23 +2,23 @@
 
 [Read the docs](https://ai-pod.apps.farbenmeer.de)
 
-**Claude Code & OpenCode inside isolated containers — safe, persistent, and project-aware.**
+**Claude Code, OpenCode & Codex inside isolated containers — safe, persistent, and project-aware.**
 
-ai-pod manages per-workspace containers that run Claude Code or OpenCode. It works with **Podman** (preferred) or **Docker** — whichever is available on your system. Each workspace gets a dedicated container, a shared background server bridges host interaction via MCP, and your personal agent settings follow you everywhere.
+ai-pod manages per-workspace containers that run Claude Code, OpenCode, or OpenAI Codex. It works with **Podman** (preferred) or **Docker** — whichever is available on your system. Each workspace gets a dedicated container, a shared background server bridges host interaction via MCP, and your personal agent settings follow you everywhere.
 
 ---
 
 ## Features
 
 - **Workspace isolation** — each directory gets its own container, named by a hash of its path; projects can't interfere with each other
-- **Persistent agent state** — a named volume preserves `~/.claude` and `~/.config/opencode` (login, memory, settings) across container restarts
+- **Persistent agent state** — a named volume preserves `~/.claude`, `~/.config/opencode`, and `~/.codex` (login, memory, settings) across container restarts
 - **Credential scanning** — scans the workspace for secrets before mounting it; prompts you to review or abort
 - **Custom Dockerfiles per project** — drop an `ai-pod.Dockerfile` in any project to install extra runtimes, tools, or MCP servers
 - **AI-driven skill file** — container environment context and host-command usage are delivered via an auto-generated ai-pod skill loaded by Claude and OpenCode
 - **Host command execution via MCP** — the in-container agent talks to the shared host server over MCP (`http://host.containers.internal:7822/mcp`); every host command requires your explicit approval with a persistent allowlist
 - **File-based command output** — every command writes stdout/stderr/exit to `{workspace}/.ai-pod/commands/{session_id}/{command_id}/` so the agent reads long-running output directly
 - **Interactive TUIs** — `ai-pod commands` to inspect/kill running host commands, `ai-pod allowed` to manage the whitelist
-- **Desktop notifications** — Stop hooks notify you on Claude session end, and an OpenCode plugin sends notifications when `session.idle` fires
+- **Desktop notifications** — Stop hooks notify you on Claude session end, an OpenCode plugin sends notifications when `session.idle` fires, and Codex's `notify` program fires on turn completion
 - **Transparent host networking** — containers reach host services at `host.containers.internal` (Podman) or `host.docker.internal` (Docker); no manual port mapping needed
 - **Auto-update checks** — silently checks for new releases on startup and notifies you when one is available
 
@@ -153,7 +153,7 @@ launch; a warning is printed if a container is currently running.
 
 Your host `~/.claude/CLAUDE.md` and `~/.claude/settings.json` are merged with container defaults at launch time, and your `~/.claude.json` is copied in on first init, so your personal Claude preferences carry over automatically.
 
-The MCP server entry for ai-pod is written into `~/.claude.json` (`mcpServers.ai-pod`) and injected into OpenCode via the `OPENCODE_CONFIG_CONTENT` env var, both with the per-session credentials baked in literally — no env-var interpolation, so `claude doctor` stays clean.
+The MCP server entry for ai-pod is written into `~/.claude.json` (`mcpServers.ai-pod`), injected into OpenCode via the `OPENCODE_CONFIG_CONTENT` env var, and merged into Codex's `~/.codex/config.toml` (`[mcp_servers.ai-pod]`, a streamable-HTTP MCP server), all with the per-session credentials baked in literally — no env-var interpolation, so `claude doctor` stays clean. Your personal Codex login (`~/.codex/auth.json`) and other `config.toml` preferences (model, provider) carry over and are preserved; ai-pod only rewrites the keys it owns.
 
 ---
 
@@ -169,7 +169,7 @@ ai-pod init
 
 This writes an `ai-pod.Dockerfile` to the workspace root based on the default image. Edit it to add anything your project needs (e.g. Node, Python, Playwright, project-specific MCP servers). When `ai-pod` launches, it automatically uses `ai-pod.Dockerfile` if present, otherwise falls back to the global default.
 
-The default image is based on Ubuntu. The Dockerfile downloads the agent (Claude Code or OpenCode) via `curl http://${HOST_GATEWAY}:7822/install/{agent}.sh` — the shared host server vends per-agent install scripts. The generated Dockerfile includes commented-out examples for common additions like Playwright and MCP servers.
+The default image is based on Ubuntu. The Dockerfile downloads the agent (Claude Code, OpenCode, or Codex) via `curl http://${HOST_GATEWAY}:7822/install/{agent}.sh` — the shared host server vends per-agent install scripts. The generated Dockerfile includes commented-out examples for common additions like Playwright and MCP servers.
 
 ---
 

@@ -58,6 +58,7 @@ async fn version_handler() -> Json<serde_json::Value> {
 
 const INSTALL_CLAUDE_SH: &str = include_str!("../../templates/install-claude.sh");
 const INSTALL_OPENCODE_SH: &str = include_str!("../../templates/install-opencode.sh");
+const INSTALL_CODEX_SH: &str = include_str!("../../templates/install-codex.sh");
 
 /// Stub returned when an outdated `ai-pod.Dockerfile` still tries to fetch
 /// `/host-tools`. The bundled `host-tools` binary was removed in 0.11.0 in
@@ -115,6 +116,7 @@ async fn install_script_handler(AxumPath(name): AxumPath<String>) -> Response {
     let body = match name.as_str() {
         "claude.sh" => INSTALL_CLAUDE_SH,
         "opencode.sh" => INSTALL_OPENCODE_SH,
+        "codex.sh" => INSTALL_CODEX_SH,
         _ => {
             return (StatusCode::NOT_FOUND, "Unknown install script").into_response();
         }
