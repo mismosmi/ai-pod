@@ -48,6 +48,34 @@ impl FromStr for RuntimeKind {
     }
 }
 
+/// Path the forwarded host SSH agent socket is mounted to inside the container.
+/// `SSH_AUTH_SOCK` is set to this so git/ssh in the pod find the host agent.
+pub const SSH_AGENT_CONTAINER_PATH: &str = "/run/ssh-agent.sock";
+
+/// Docker Desktop on macOS bridges the host's SSH agent to this in-VM socket.
+/// Mounting the raw `$SSH_AUTH_SOCK` does not work there because the runtime
+/// lives in a VM that cannot see the host's socket directly.
+const DOCKER_DESKTOP_SSH_SOCK: &str = "/run/host-services/ssh-auth.sock";
+
+/// Resolve the host-side SSH agent socket to bind into the container. Pure so it
+/// can be unit-tested across platform/runtime combinations.
+fn resolve_ssh_agent_source(
+    kind: RuntimeKind,
+    is_macos: bool,
+    env_sock: Option<String>,
+) -> Result<String> {
+    if is_macos && kind == RuntimeKind::Docker {
+        return Ok(DOCKER_DESKTOP_SSH_SOCK.to_string());
+    }
+    match env_sock.filter(|s| !s.is_empty()) {
+        Some(sock) => Ok(sock),
+        None => anyhow::bail!(
+            "No SSH agent found: $SSH_AUTH_SOCK is not set. Start one with \
+             `eval \"$(ssh-agent)\"` and `ssh-add`, or drop the --ssh flag."
+        ),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ContainerRuntime {
     pub kind: RuntimeKind,
@@ -134,6 +162,41 @@ impl ContainerRuntime {
     /// The server URL using the correct gateway hostname.
     pub fn server_url(&self) -> String {
         format!("http://{}:7822", self.host_gateway())
+    }
+
+    /// Whether this runtime maps the host user into a separate user namespace
+    /// (rootless podman). In that mode an unprivileged in-container user cannot
+    /// read a bind-mounted host socket unless we run with `--userns=keep-id`.
+    /// Docker is treated as non-rootless. Under `dry_run` we assume rootless
+    /// podman so the previewed command reflects the keep-id path.
+    pub fn is_rootless(&self) -> bool {
+        if self.kind == RuntimeKind::Docker {
+            return false;
+        }
+        if self.dry_run {
+            return true;
+        }
+        Command::new(self.cmd())
+            .args(["info", "--format", "{{.Host.Security.Rootless}}"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
+            .unwrap_or(false)
+    }
+
+    /// Whether forwarding the host SSH agent needs `--userns=keep-id` (rootless
+    /// podman) so the in-container `ai-pod` user can read the agent socket.
+    pub fn ssh_needs_keep_id(&self) -> bool {
+        self.kind == RuntimeKind::Podman && self.is_rootless()
+    }
+
+    /// The host-side SSH agent socket to bind into the container.
+    pub fn ssh_agent_source(&self) -> Result<String> {
+        resolve_ssh_agent_source(
+            self.kind,
+            cfg!(target_os = "macos"),
+            std::env::var("SSH_AUTH_SOCK").ok(),
+        )
     }
 
     /// Display name for the runtime (e.g. in generated docs).
@@ -255,6 +318,60 @@ mod tests {
             let pv = kind.to_possible_value().unwrap();
             assert_eq!(pv.get_name(), kind.as_str());
         }
+    }
+
+    #[test]
+    fn ssh_source_uses_docker_desktop_socket_on_macos() {
+        let src =
+            resolve_ssh_agent_source(RuntimeKind::Docker, true, Some("/tmp/agent.sock".into()))
+                .unwrap();
+        assert_eq!(src, "/run/host-services/ssh-auth.sock");
+    }
+
+    #[test]
+    fn ssh_source_uses_env_sock_for_podman_on_macos() {
+        // podman-machine on macOS still relies on $SSH_AUTH_SOCK being reachable.
+        let src =
+            resolve_ssh_agent_source(RuntimeKind::Podman, true, Some("/tmp/agent.sock".into()))
+                .unwrap();
+        assert_eq!(src, "/tmp/agent.sock");
+    }
+
+    #[test]
+    fn ssh_source_uses_env_sock_on_linux() {
+        for kind in [RuntimeKind::Podman, RuntimeKind::Docker] {
+            let src =
+                resolve_ssh_agent_source(kind, false, Some("/run/user/1000/ssh".into())).unwrap();
+            assert_eq!(src, "/run/user/1000/ssh");
+        }
+    }
+
+    #[test]
+    fn ssh_source_errors_when_no_agent() {
+        let err = resolve_ssh_agent_source(RuntimeKind::Podman, false, None).unwrap_err();
+        assert!(err.to_string().contains("SSH_AUTH_SOCK"));
+        // Empty string is treated the same as unset.
+        assert!(resolve_ssh_agent_source(RuntimeKind::Docker, false, Some(String::new())).is_err());
+    }
+
+    #[test]
+    fn docker_is_never_rootless() {
+        let rt = ContainerRuntime {
+            kind: RuntimeKind::Docker,
+            dry_run: true,
+        };
+        assert!(!rt.is_rootless());
+        assert!(!rt.ssh_needs_keep_id());
+    }
+
+    #[test]
+    fn dry_run_podman_assumes_rootless_keep_id() {
+        let rt = ContainerRuntime {
+            kind: RuntimeKind::Podman,
+            dry_run: true,
+        };
+        assert!(rt.is_rootless());
+        assert!(rt.ssh_needs_keep_id());
     }
 
     #[test]
