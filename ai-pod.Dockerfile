@@ -12,8 +12,8 @@ WORKDIR /app
 RUN useradd -ms /bin/bash ai-pod && chown -R ai-pod /app
 
 # System-level git identity (fallback when no host identity is provided)
-RUN git config --system user.email "ai-pod@ai-pod" && \
-    git config --system user.name "ai-pod"
+RUN git config --system user.email "git@michelsmola.de" && \
+    git config --system user.name "Michel Smola"
 
 USER ai-pod
 
