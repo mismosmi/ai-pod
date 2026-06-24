@@ -17,6 +17,54 @@ use crate::workspace::{
 /// runtime does not need to probe the image.
 const CONTAINER_HOME: &str = "/home/ai-pod";
 
+/// `--userns=keep-id` args, used when rootless podman forwards the host SSH
+/// agent: the host UID is mapped 1:1 so the unprivileged in-container `ai-pod`
+/// user can read the bind-mounted agent socket and the home volume seeded under
+/// the same mapping. Empty otherwise.
+fn userns_args(keep_id: bool) -> &'static [&'static str] {
+    if keep_id {
+        &["--userns", "keep-id"]
+    } else {
+        &[]
+    }
+}
+
+/// Home volume name, suffixed with `-kid` when seeded under keep-id. A keep-id
+/// volume's on-disk ownership is interpreted through a different userns mapping
+/// than a default one, so the two must never share a name.
+fn home_volume_name(workspace: &Path, keep_id: bool) -> String {
+    let base = gen_volume_name(workspace);
+    if keep_id {
+        format!("{}-kid", base)
+    } else {
+        base
+    }
+}
+
+/// Mask volume name, suffixed the same way as the home volume under keep-id.
+fn mask_vol_name(workspace: &Path, dir: &str, keep_id: bool) -> String {
+    let base = mask_volume_name(workspace, dir);
+    if keep_id {
+        format!("{}-kid", base)
+    } else {
+        base
+    }
+}
+
+/// Bind-mount + env args that forward the host's SSH agent into the container,
+/// so `git push` and other SSH operations authenticate with the host's keys.
+/// Errors (before any container is started) if no agent is available.
+fn ssh_agent_run_args(rt: &ContainerRuntime) -> Result<Vec<String>> {
+    let src = rt.ssh_agent_source()?;
+    let dst = crate::runtime::SSH_AGENT_CONTAINER_PATH;
+    Ok(vec![
+        "-v".to_string(),
+        format!("{}:{}", src, dst),
+        "-e".to_string(),
+        format!("SSH_AUTH_SOCK={}", dst),
+    ])
+}
+
 pub fn containers_for_prefix(
     rt: &ContainerRuntime,
     prefix: &str,
@@ -58,25 +106,28 @@ pub fn volume_exists(rt: &ContainerRuntime, name: &str) -> Result<bool> {
 
 /// Create a fresh mask volume and chown its root to the container's `ai-pod` user
 /// so the unprivileged in-container user can write under /app/<dir>.
-fn seed_mask_volume(rt: &ContainerRuntime, image: &str, vol: &str, dir: &str) -> Result<()> {
+fn seed_mask_volume(
+    rt: &ContainerRuntime,
+    image: &str,
+    vol: &str,
+    dir: &str,
+    keep_id: bool,
+) -> Result<()> {
     let mount_path = format!("/app/{}", dir);
-    let status = rt
-        .command()
-        .args([
-            "run",
-            "--rm",
-            "--user",
-            "0",
-            "-v",
-            &format!("{}:{}:Z", vol, mount_path),
-            "--entrypoint",
-            "chown",
-            image,
-            "ai-pod:ai-pod",
-            &mount_path,
-        ])
-        .status()
-        .context("Failed to seed mask volume")?;
+    let mut cmd = rt.command();
+    cmd.arg("run").args(userns_args(keep_id)).args([
+        "--rm",
+        "--user",
+        "0",
+        "-v",
+        &format!("{}:{}:Z", vol, mount_path),
+        "--entrypoint",
+        "chown",
+        image,
+        "ai-pod:ai-pod",
+        &mount_path,
+    ]);
+    let status = cmd.status().context("Failed to seed mask volume")?;
     if !status.success() {
         anyhow::bail!("Failed to chown mask volume {}", vol);
     }
@@ -90,8 +141,9 @@ fn ensure_mask_volume(
     workspace: &Path,
     image: &str,
     dir: &str,
+    keep_id: bool,
 ) -> Result<String> {
-    let vol = mask_volume_name(workspace, dir);
+    let vol = mask_vol_name(workspace, dir, keep_id);
     if !volume_exists(rt, &vol)? {
         eprintln!("{} {}", "Creating mask volume:".blue().bold(), vol);
         let status = rt
@@ -102,7 +154,7 @@ fn ensure_mask_volume(
         if !status.success() {
             anyhow::bail!("Failed to create mask volume {}", vol);
         }
-        seed_mask_volume(rt, image, &vol, dir)?;
+        seed_mask_volume(rt, image, &vol, dir, keep_id)?;
     }
     Ok(vol)
 }
@@ -116,10 +168,11 @@ fn mask_mount_args(
     workspace: &Path,
     image: &str,
     masks: &[String],
+    keep_id: bool,
 ) -> Result<Vec<String>> {
     let mut out = Vec::with_capacity(masks.len() * 2);
     for dir in masks {
-        let vol = ensure_mask_volume(rt, workspace, image, dir)?;
+        let vol = ensure_mask_volume(rt, workspace, image, dir, keep_id)?;
         out.push("-v".to_string());
         out.push(format!("{}:/app/{}:Z", vol, dir));
     }
@@ -202,25 +255,31 @@ pub(crate) fn build_mount_args(home_dir: &Path, mounts: &[MountSpec]) -> Result<
 /// Best-effort removal of a single mask volume. Prints a message on success and
 /// a warning if the volume is in use (e.g. another container still mounts it).
 pub fn remove_mask_volume(rt: &ContainerRuntime, workspace: &Path, dir: &str) -> Result<()> {
-    let vol = mask_volume_name(workspace, dir);
-    if !volume_exists(rt, &vol)? {
-        return Ok(());
-    }
-    let output = rt
-        .command()
-        .args(["volume", "rm", &vol])
-        .output()
-        .context("Failed to remove mask volume")?;
-    if output.status.success() {
-        eprintln!("{} {}", "Removed volume:".red().bold(), vol);
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!(
-            "{} could not remove {} ({})",
-            "Warning:".yellow().bold(),
-            vol,
-            stderr.trim()
-        );
+    // Remove both the default-mapping volume and the keep-id (`--ssh` on rootless
+    // podman) variant, since either may have been created for this dir.
+    for vol in [
+        mask_vol_name(workspace, dir, false),
+        mask_vol_name(workspace, dir, true),
+    ] {
+        if !volume_exists(rt, &vol)? {
+            continue;
+        }
+        let output = rt
+            .command()
+            .args(["volume", "rm", &vol])
+            .output()
+            .context("Failed to remove mask volume")?;
+        if output.status.success() {
+            eprintln!("{} {}", "Removed volume:".red().bold(), vol);
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!(
+                "{} could not remove {} ({})",
+                "Warning:".yellow().bold(),
+                vol,
+                stderr.trim()
+            );
+        }
     }
     Ok(())
 }
@@ -383,19 +442,19 @@ fn seed_home_volume(
     container_name: &str,
     image: &str,
     copy_claude_json: bool,
+    keep_id: bool,
 ) -> Result<()> {
     let init_container = format!("{}-init", container_name);
-    let status = rt
-        .command()
-        .args([
-            "create",
-            "--name",
-            &init_container,
-            "-v",
-            &format!("{}:{}", volume_name, CONTAINER_HOME),
-            image,
-            "true",
-        ])
+    let mut create_cmd = rt.command();
+    create_cmd.arg("create").args(userns_args(keep_id)).args([
+        "--name",
+        &init_container,
+        "-v",
+        &format!("{}:{}", volume_name, CONTAINER_HOME),
+        image,
+        "true",
+    ]);
+    let status = create_cmd
         .status()
         .context("Failed to create init container")?;
     if !status.success() {
@@ -416,21 +475,19 @@ fn seed_home_volume(
         }
     }
 
-    let _ = rt
-        .command()
-        .args([
-            "run",
-            "--rm",
-            "-v",
-            &format!("{}:{}:z", volume_name, CONTAINER_HOME),
-            image,
-            "mkdir",
-            "-p",
-            &format!("{}/.claude", CONTAINER_HOME),
-            &format!("{}/.config", CONTAINER_HOME),
-            &format!("{}/.config/opencode/plugins", CONTAINER_HOME),
-        ])
-        .status();
+    let mut mkdir_cmd = rt.command();
+    mkdir_cmd.arg("run").args(userns_args(keep_id)).args([
+        "--rm",
+        "-v",
+        &format!("{}:{}:z", volume_name, CONTAINER_HOME),
+        image,
+        "mkdir",
+        "-p",
+        &format!("{}/.claude", CONTAINER_HOME),
+        &format!("{}/.config", CONTAINER_HOME),
+        &format!("{}/.config/opencode/plugins", CONTAINER_HOME),
+    ]);
+    let _ = mkdir_cmd.status();
 
     generate_runtime_settings(config)?;
 
@@ -439,7 +496,10 @@ fn seed_home_volume(
         .args([
             "cp",
             &config.runtime_settings.to_string_lossy(),
-            &format!("{}:{}/.claude/settings.json", init_container, CONTAINER_HOME),
+            &format!(
+                "{}:{}/.claude/settings.json",
+                init_container, CONTAINER_HOME
+            ),
         ])
         .status();
 
@@ -490,19 +550,19 @@ fn refresh_claude_mcp_in_volume(
     server_url: &str,
     api_key: &str,
     session_id: &str,
+    keep_id: bool,
 ) -> Result<()> {
     let init_container = format!("{}-mcp", container_name);
-    let status = rt
-        .command()
-        .args([
-            "create",
-            "--name",
-            &init_container,
-            "-v",
-            &format!("{}:{}", volume_name, CONTAINER_HOME),
-            image,
-            "true",
-        ])
+    let mut create_cmd = rt.command();
+    create_cmd.arg("create").args(userns_args(keep_id)).args([
+        "--name",
+        &init_container,
+        "-v",
+        &format!("{}:{}", volume_name, CONTAINER_HOME),
+        image,
+        "true",
+    ]);
+    let status = create_cmd
         .status()
         .context("Failed to create mcp-refresh container")?;
     if !status.success() {
@@ -565,6 +625,7 @@ fn init_home_volume(
     image: &str,
     project_id: &str,
     api_key: &str,
+    keep_id: bool,
 ) -> Result<()> {
     eprintln!(
         "{} {}",
@@ -581,7 +642,15 @@ fn init_home_volume(
         anyhow::bail!("Failed to create volume {}", volume_name);
     }
 
-    seed_home_volume(rt, config, volume_name, container_name, image, true)?;
+    seed_home_volume(
+        rt,
+        config,
+        volume_name,
+        container_name,
+        image,
+        true,
+        keep_id,
+    )?;
 
     let _ = (project_id, api_key); // used via env vars at runtime
 
@@ -600,6 +669,7 @@ fn reseed_home_volume(
     image: &str,
     project_id: &str,
     api_key: &str,
+    keep_id: bool,
 ) -> Result<()> {
     eprintln!(
         "{} {}",
@@ -607,7 +677,15 @@ fn reseed_home_volume(
         volume_name
     );
 
-    seed_home_volume(rt, config, volume_name, container_name, image, false)?;
+    seed_home_volume(
+        rt,
+        config,
+        volume_name,
+        container_name,
+        image,
+        false,
+        keep_id,
+    )?;
 
     let _ = (project_id, api_key); // used via env vars at runtime
 
@@ -624,9 +702,21 @@ pub fn launch_container(
     image: &str,
     project_id: &str,
     api_key: &str,
+    forward_ssh: bool,
 ) -> Result<()> {
+    // Rootless podman needs keep-id (and a dedicated home volume) so the
+    // in-container user can read the forwarded agent socket.
+    let keep_id = forward_ssh && rt.ssh_needs_keep_id();
+    // Resolve the agent socket up front so we fail before touching any volume
+    // or container if no agent is available.
+    let ssh_args = if forward_ssh {
+        ssh_agent_run_args(rt)?
+    } else {
+        Vec::new()
+    };
+
     let prefix = container_prefix(workspace);
-    let volume_name = gen_volume_name(workspace);
+    let volume_name = home_volume_name(workspace, keep_id);
     let workspace_str = workspace.to_string_lossy();
 
     // On rebuild: stop all existing containers for this workspace and reseed the volume
@@ -648,6 +738,7 @@ pub fn launch_container(
                 image,
                 project_id,
                 api_key,
+                keep_id,
             )?;
         }
     }
@@ -662,6 +753,7 @@ pub fn launch_container(
             image,
             project_id,
             api_key,
+            keep_id,
         )?;
     }
 
@@ -682,6 +774,7 @@ pub fn launch_container(
         &rt.server_url(),
         api_key,
         &session_id,
+        keep_id,
     )?;
 
     let add_host = rt.add_host_arg();
@@ -693,7 +786,13 @@ pub fn launch_container(
     );
 
     let project_state = load_project_state(config, workspace);
-    let mask_args = mask_mount_args(rt, workspace, image, &project_state.masked_directories)?;
+    let mask_args = mask_mount_args(
+        rt,
+        workspace,
+        image,
+        &project_state.masked_directories,
+        keep_id,
+    )?;
     let global = GlobalConfig::load(config);
     let user_mount_args = build_mount_args(&config.home_dir, &global.mounts)?;
 
@@ -707,6 +806,7 @@ pub fn launch_container(
 
     let mut run_cmd = rt.command();
     run_cmd.args(["run", "--rm", "-it"]);
+    run_cmd.args(userns_args(keep_id));
     run_cmd.args([
         "--name",
         &container_name,
@@ -723,6 +823,9 @@ pub fn launch_container(
         run_cmd.arg(arg);
     }
     for arg in &mask_args {
+        run_cmd.arg(arg);
+    }
+    for arg in &ssh_args {
         run_cmd.arg(arg);
     }
     run_cmd.args([
@@ -768,10 +871,19 @@ pub fn run_in_container(
     command: &str,
     args: &[String],
     interactive: bool,
+    forward_ssh: bool,
 ) -> Result<()> {
+    let keep_id = forward_ssh && rt.ssh_needs_keep_id();
+    // Resolve the agent socket up front so we fail before starting anything.
+    let ssh_args = if forward_ssh {
+        ssh_agent_run_args(rt)?
+    } else {
+        Vec::new()
+    };
+
     let session_id = new_session_id();
     let container_name = container_name_for(workspace, &session_id);
-    let volume_name = gen_volume_name(workspace);
+    let volume_name = home_volume_name(workspace, keep_id);
     let workspace_str = workspace.to_string_lossy();
 
     // Record the runtime for this session before the container starts, so the
@@ -788,6 +900,7 @@ pub fn run_in_container(
             image,
             project_id,
             api_key,
+            keep_id,
         )?;
     }
 
@@ -800,6 +913,7 @@ pub fn run_in_container(
         &rt.server_url(),
         api_key,
         &session_id,
+        keep_id,
     )?;
 
     eprintln!(
@@ -810,7 +924,13 @@ pub fn run_in_container(
     );
 
     let project_state = load_project_state(config, workspace);
-    let mask_args = mask_mount_args(rt, workspace, image, &project_state.masked_directories)?;
+    let mask_args = mask_mount_args(
+        rt,
+        workspace,
+        image,
+        &project_state.masked_directories,
+        keep_id,
+    )?;
     let global = GlobalConfig::load(config);
     let user_mount_args = build_mount_args(&config.home_dir, &global.mounts)?;
 
@@ -823,11 +943,8 @@ pub fn run_in_container(
     // ACP), `-t` would allocate a pseudo-TTY that mangles the JSON-RPC
     // byte stream the agent emits. Keep `-i` so stdin stays attached.
     let stdio_flag = if interactive { "-it" } else { "-i" };
-    let mut run_args: Vec<String> = vec![
-        "run".into(),
-        "--rm".into(),
-        stdio_flag.into(),
-    ];
+    let mut run_args: Vec<String> = vec!["run".into(), "--rm".into(), stdio_flag.into()];
+    run_args.extend(userns_args(keep_id).iter().map(|s| s.to_string()));
     run_args.extend_from_slice(&[
         "--label".into(),
         "managed-by=ai-pod".into(),
@@ -840,6 +957,7 @@ pub fn run_in_container(
     ]);
     run_args.extend(user_mount_args);
     run_args.extend(mask_args);
+    run_args.extend(ssh_args);
     run_args.extend_from_slice(&[
         rt.add_host_arg(),
         "-e".into(),
@@ -972,7 +1090,6 @@ pub fn clean_container(
     workspace: &Path,
 ) -> Result<()> {
     let prefix = container_prefix(workspace);
-    let volume_name = gen_volume_name(workspace);
 
     let containers = containers_for_prefix(rt, &prefix, false)?;
 
@@ -986,16 +1103,22 @@ pub fn clean_container(
         println!("{}", "Containers removed.".green());
     }
 
-    // Remove named home volume
-    if volume_exists(rt, &volume_name)? {
-        println!("{} {}", "Removing volume:".red().bold(), volume_name);
-        let status = rt
-            .command()
-            .args(["volume", "rm", &volume_name])
-            .status()
-            .context("Failed to remove volume")?;
-        if status.success() {
-            println!("{}", "Volume removed.".green());
+    // Remove named home volume(s): both the default-mapping volume and the
+    // keep-id (`--ssh` on rootless podman) variant, if present.
+    for volume_name in [
+        home_volume_name(workspace, false),
+        home_volume_name(workspace, true),
+    ] {
+        if volume_exists(rt, &volume_name)? {
+            println!("{} {}", "Removing volume:".red().bold(), volume_name);
+            let status = rt
+                .command()
+                .args(["volume", "rm", &volume_name])
+                .status()
+                .context("Failed to remove volume")?;
+            if status.success() {
+                println!("{}", "Volume removed.".green());
+            }
         }
     }
 

@@ -76,6 +76,32 @@ ai-pod --workdir /path/to/project
 | `--no-cache` | Build the image without the Docker/Podman layer cache |
 | `--no-credential-check` | Skip scanning the workspace for credential files |
 | `--dry-run` | Print podman/docker commands instead of executing them |
+| `--ssh` | Forward the host's SSH agent into the container (enables `git push` over SSH) |
+
+### Forwarding the SSH agent (`--ssh`)
+
+Pass `--ssh` to bridge your host's running SSH agent into the container so
+`git push`, `git clone`, and other SSH operations authenticate with your host
+keys — without exposing the private key files themselves (only the live agent
+socket is shared, so the credential hiding of `~/.ssh` is unaffected). Your host
+git identity is already seeded into the container, and `known_hosts` accumulates
+in the persistent home volume, so the first interactive push prompts to trust a
+host once and subsequent pushes are silent.
+
+Requirements and caveats:
+
+- A running agent with a loaded key on the host (`ssh-add -l` should list one).
+- **Docker Desktop on macOS** is bridged automatically via Docker's built-in
+  agent socket — no extra setup.
+- **Rootless podman** runs the container in a user namespace, so ai-pod adds
+  `--userns=keep-id` and uses a separate home volume (suffixed `-kid`) so the
+  in-container user can read the socket. The first `--ssh` launch re-seeds this
+  volume.
+- **Docker / rootful podman on Linux** assume your host user is UID 1000 (the
+  container's `ai-pod` user); a different UID may hit socket permission errors.
+- **podman-machine on macOS** is best-effort — it only works if `$SSH_AUTH_SOCK`
+  is reachable inside the podman VM.
+- On SELinux-enforcing hosts the socket mount may need additional configuration.
 
 ### Subcommands
 

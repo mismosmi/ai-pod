@@ -284,6 +284,7 @@ async fn launch_flow(cli: &Cli, rt: &ContainerRuntime) -> Result<()> {
         &image,
         &project_id,
         &state.api_key,
+        cli.ssh,
     )?;
 
     Ok(())
@@ -548,6 +549,7 @@ async fn main() -> Result<()> {
                 command,
                 args,
                 interactive,
+                cli.ssh,
             )?;
         }
         Some(Command::Commands { action }) => {

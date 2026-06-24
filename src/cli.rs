@@ -45,6 +45,12 @@ pub struct Cli {
     /// Container runtime to use (overrides AI_POD_RUNTIME and autodetect)
     #[arg(long, value_enum)]
     pub runtime: Option<crate::runtime::RuntimeKind>,
+
+    /// Forward the host's SSH agent into the container (enables `git push` over SSH).
+    /// Requires a running agent (`ssh-add -l`); on Docker Desktop for macOS the
+    /// host agent is bridged automatically.
+    #[arg(long)]
+    pub ssh: bool,
 }
 
 #[derive(Subcommand)]
