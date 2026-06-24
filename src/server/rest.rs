@@ -1,7 +1,7 @@
 use axum::{
     Json,
-    extract::State,
-    http::{HeaderMap, StatusCode},
+    extract::{Query, State},
+    http::{HeaderMap, StatusCode, header},
     response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
@@ -76,6 +76,11 @@ pub struct ListAllowedCommandsRequest {
 #[derive(Serialize)]
 pub struct ListAllowedCommandsResponse {
     pub commands: Vec<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ClipboardQuery {
+    pub project_id: String,
 }
 
 fn extract_api_key(headers: &HeaderMap) -> &str {
@@ -242,4 +247,29 @@ pub async fn list_allowed_commands_handler(
 
     let cmds = commands::get_allowed_commands(&state, &workspace);
     Json(ListAllowedCommandsResponse { commands: cmds }).into_response()
+}
+
+/// Read the host clipboard and return it as a PNG image. Backs the container's
+/// fake `xclip`/`wl-paste` shims so native Ctrl+V paste works inside a pod.
+///
+/// `200 image/png` when the clipboard holds an image, `204 No Content` when it
+/// is empty / non-image, `401`/`404` on auth failure. Returns image bytes only,
+/// never clipboard text.
+pub async fn clipboard_image_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ClipboardQuery>,
+) -> impl IntoResponse {
+    let provided_key = extract_api_key(&headers).to_string();
+    if let Err((status, msg)) = authenticate(&state, &q.project_id, &provided_key).await {
+        return (status, msg.to_string()).into_response();
+    }
+
+    match tokio::task::spawn_blocking(super::clipboard::read_clipboard_png).await {
+        Ok(Some(bytes)) => {
+            (StatusCode::OK, [(header::CONTENT_TYPE, "image/png")], bytes).into_response()
+        }
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }

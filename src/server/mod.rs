@@ -1,3 +1,4 @@
+pub mod clipboard;
 pub mod commands;
 pub mod lifecycle;
 pub mod mcp;
@@ -58,6 +59,7 @@ async fn version_handler() -> Json<serde_json::Value> {
 
 const INSTALL_CLAUDE_SH: &str = include_str!("../../templates/install-claude.sh");
 const INSTALL_OPENCODE_SH: &str = include_str!("../../templates/install-opencode.sh");
+const INSTALL_CLIPBOARD_SH: &str = include_str!("../../templates/install-clipboard.sh");
 
 /// Stub returned when an outdated `ai-pod.Dockerfile` still tries to fetch
 /// `/host-tools`. The bundled `host-tools` binary was removed in 0.11.0 in
@@ -115,6 +117,7 @@ async fn install_script_handler(AxumPath(name): AxumPath<String>) -> Response {
     let body = match name.as_str() {
         "claude.sh" => INSTALL_CLAUDE_SH,
         "opencode.sh" => INSTALL_OPENCODE_SH,
+        "clipboard.sh" => INSTALL_CLIPBOARD_SH,
         _ => {
             return (StatusCode::NOT_FOUND, "Unknown install script").into_response();
         }
@@ -171,6 +174,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/commands/stop", post(rest::stop_command_handler))
         .route("/commands/status", post(rest::command_status_handler))
         .route("/commands/list", post(rest::list_commands_handler))
+        .route("/clipboard/image", get(rest::clipboard_image_handler))
         .route("/mcp", post(mcp::mcp_handler))
         .layer(GovernorLayer::new(governor_conf))
         .layer(middleware::from_fn(add_retry_after_header));
