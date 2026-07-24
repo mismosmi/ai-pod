@@ -629,6 +629,8 @@ pub fn launch_container(
     let volume_name = gen_volume_name(workspace);
     let workspace_str = workspace.to_string_lossy();
 
+    rt.warn_if_rootless_userns_mismatch();
+
     // On rebuild: stop all existing containers for this workspace and reseed the volume
     if rebuild {
         for name in containers_for_prefix(rt, &prefix, false)? {
@@ -773,6 +775,8 @@ pub fn run_in_container(
     let container_name = container_name_for(workspace, &session_id);
     let volume_name = gen_volume_name(workspace);
     let workspace_str = workspace.to_string_lossy();
+
+    rt.warn_if_rootless_userns_mismatch();
 
     // Record the runtime for this session before the container starts, so the
     // shared server runs service containers on the same runtime.
