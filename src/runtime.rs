@@ -1,6 +1,8 @@
 use anyhow::Result;
 use clap::ValueEnum;
+use colored::Colorize;
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::process::Command;
 use std::str::FromStr;
 
@@ -143,6 +145,62 @@ impl ContainerRuntime {
             RuntimeKind::Docker => "Docker",
         }
     }
+
+    /// On rootless Podman, the default user-namespace mapping remaps the host
+    /// user to container UID 0, so pre-existing workspace files appear
+    /// root-owned inside the container and the agent hits `EACCES` on its first
+    /// write. There's no way to fix that from inside ai-pod without weakening
+    /// the namespace boundary, but `PODMAN_USERNS=keep-id` fixes it cleanly.
+    /// Detect the situation up front and print a one-line hint instead of
+    /// letting the user hit an opaque permission error later.
+    ///
+    /// Only fires for rootless Podman: the runtime is Podman, it's not a
+    /// dry-run, `PODMAN_USERNS` isn't already set, we're not running as root,
+    /// and `/etc/subuid` actually has a sub-UID range configured for the current
+    /// user (the precondition for rootless UID remapping — this avoids a false
+    /// positive for rootful Podman invoked by a non-root user).
+    pub fn warn_if_rootless_userns_mismatch(&self) {
+        if self.kind != RuntimeKind::Podman || self.dry_run {
+            return;
+        }
+        if env::var_os("PODMAN_USERNS").is_some() {
+            return;
+        }
+        // SAFETY: `getuid` is always safe to call and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        if uid == 0 {
+            return;
+        }
+        let subuid = std::fs::read_to_string("/etc/subuid").ok();
+        let username = env::var("USER").ok();
+        if !subuid_range_configured(username.as_deref(), uid, subuid.as_deref()) {
+            return;
+        }
+        eprintln!(
+            "{} workspace files may appear root-owned inside the container \
+             (rootless Podman's default UID mapping).\n  \
+             Set {} before running ai-pod to fix this, e.g. `{}`.",
+            "warning:".yellow().bold(),
+            "PODMAN_USERNS=keep-id".bold(),
+            "PODMAN_USERNS=keep-id ai-pod".bold(),
+        );
+    }
+}
+
+/// Whether `/etc/subuid` configures a sub-UID range for the current user,
+/// keyed by either the numeric UID or the login name (both forms are valid in
+/// `subuid(5)`). A missing/unreadable file (`None`) defaults to `true` so the
+/// hint is surfaced rather than silently swallowed on the rootless-Podman hosts
+/// this targets.
+fn subuid_range_configured(username: Option<&str>, uid: u32, subuid: Option<&str>) -> bool {
+    let Some(contents) = subuid else {
+        return true;
+    };
+    let uid_str = uid.to_string();
+    contents.lines().any(|line| {
+        let field = line.split(':').next().unwrap_or("").trim();
+        !field.is_empty() && (field == uid_str || username.is_some_and(|u| field == u))
+    })
 }
 
 #[cfg(test)]
@@ -255,6 +313,50 @@ mod tests {
             let pv = kind.to_possible_value().unwrap();
             assert_eq!(pv.get_name(), kind.as_str());
         }
+    }
+
+    #[test]
+    fn subuid_range_matches_by_username_or_uid() {
+        let contents = "alice:100000:65536\n1000:200000:65536\n";
+        // Matches by login name.
+        assert!(subuid_range_configured(Some("alice"), 4242, Some(contents)));
+        // Matches by numeric uid even when the name differs.
+        assert!(subuid_range_configured(Some("bob"), 1000, Some(contents)));
+    }
+
+    #[test]
+    fn subuid_range_absent_for_unlisted_user() {
+        let contents = "alice:100000:65536\n";
+        assert!(!subuid_range_configured(Some("bob"), 4242, Some(contents)));
+        // No username available and uid not listed → not configured.
+        assert!(!subuid_range_configured(None, 4242, Some(contents)));
+    }
+
+    #[test]
+    fn subuid_range_missing_file_defaults_to_warning() {
+        // A missing/unreadable /etc/subuid should not suppress the hint on the
+        // rootless-Podman hosts this targets.
+        assert!(subuid_range_configured(Some("alice"), 1000, None));
+    }
+
+    #[test]
+    fn warn_userns_noop_for_docker() {
+        // Docker does not do rootless UID remapping the way this warns about;
+        // the guard clause must return before touching the environment.
+        let rt = ContainerRuntime {
+            kind: RuntimeKind::Docker,
+            dry_run: false,
+        };
+        rt.warn_if_rootless_userns_mismatch();
+    }
+
+    #[test]
+    fn warn_userns_noop_in_dry_run() {
+        let rt = ContainerRuntime {
+            kind: RuntimeKind::Podman,
+            dry_run: true,
+        };
+        rt.warn_if_rootless_userns_mismatch();
     }
 
     #[test]
