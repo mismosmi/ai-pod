@@ -13,24 +13,40 @@ case "$ARCH" in
     ;;
 esac
 
-# The musl-static binary runs on every ai-pod base image (Alpine and glibc alike).
-URL="https://github.com/openai/codex/releases/latest/download/codex-${TRIPLE}.tar.gz"
+BASE_URL="https://github.com/openai/codex/releases/latest/download"
 
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
-curl -fsSL "$URL" -o "$TMPDIR/codex.tar.gz"
-tar -xzf "$TMPDIR/codex.tar.gz" -C "$TMPDIR"
+# Fetches one release tarball and installs the single binary it contains under
+# the given name. The tarballs name their binary with the full target triple,
+# so glob for it instead of assuming the exact layout.
+install_release_binary() {
+  asset="$1"
+  dest="$2"
+  dir="$TMPDIR/$dest"
+  mkdir -p "$dir"
 
-# The release tarball names the binary with the full target triple, not "codex".
-# Glob for it so minor naming/layout changes don't break the install.
-BIN="$(find "$TMPDIR" -maxdepth 2 -name 'codex-*-unknown-linux-musl' -type f | head -n1)"
-if [ -z "$BIN" ]; then
-  echo "Could not locate codex binary in release archive" >&2
-  exit 1
-fi
-install -m 0755 "$BIN" /usr/local/bin/codex
-echo "Installed codex at /usr/local/bin/codex"
+  curl -fsSL "$BASE_URL/${asset}-${TRIPLE}.tar.gz" -o "$dir/archive.tar.gz"
+  tar -xzf "$dir/archive.tar.gz" -C "$dir"
+
+  bin="$(find "$dir" -maxdepth 2 -name "${asset}-*-unknown-linux-musl" -type f | head -n1)"
+  if [ -z "$bin" ]; then
+    echo "Could not locate $asset binary in release archive" >&2
+    return 1
+  fi
+  install -m 0755 "$bin" "/usr/local/bin/$dest"
+  echo "Installed $dest at /usr/local/bin/$dest"
+}
+
+# The musl-static binaries run on every ai-pod base image (Alpine and glibc alike).
+install_release_binary codex codex
+
+# Codex spawns this sibling helper when code mode is enabled; without it every
+# code-mode turn fails with "codex-code-mode-host: No such file or directory".
+# Not fatal if the asset is missing from a given release.
+install_release_binary codex-code-mode-host codex-code-mode-host \
+  || echo "Skipping codex-code-mode-host (asset unavailable); code mode will be unavailable" >&2
 
 # Completion-notification helper invoked by codex's `notify` config option.
 # Codex passes a JSON event as $1; we ignore it and send a generic message,
