@@ -99,7 +99,9 @@ pub fn rebuild_and_test_command(
 fn image_exists(rt: &ContainerRuntime, image: &str) -> Result<bool> {
     let status = rt
         .command()
-        .args(["image", "exists", image])
+        .args(["image", "inspect", image])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .context(format!("Failed to run {}", rt.cmd()))?;
     Ok(status.success())
