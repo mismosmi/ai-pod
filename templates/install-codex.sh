@@ -3,50 +3,19 @@
 #   curl http://${HOST_GATEWAY}:7822/install/codex.sh | bash
 set -e
 
-ARCH="$(uname -m)"
-case "$ARCH" in
-  x86_64)  TRIPLE="x86_64-unknown-linux-musl" ;;
-  aarch64) TRIPLE="aarch64-unknown-linux-musl" ;;
-  *)
-    echo "Unsupported architecture: $ARCH" >&2
-    exit 1
-    ;;
-esac
-
-BASE_URL="https://github.com/openai/codex/releases/latest/download"
-
-TMPDIR="$(mktemp -d)"
-trap 'rm -rf "$TMPDIR"' EXIT
-
-# Fetches one release tarball and installs the single binary it contains under
-# the given name. The tarballs name their binary with the full target triple,
-# so glob for it instead of assuming the exact layout.
-install_release_binary() {
-  asset="$1"
-  dest="$2"
-  dir="$TMPDIR/$dest"
-  mkdir -p "$dir"
-
-  curl -fsSL "$BASE_URL/${asset}-${TRIPLE}.tar.gz" -o "$dir/archive.tar.gz"
-  tar -xzf "$dir/archive.tar.gz" -C "$dir"
-
-  bin="$(find "$dir" -maxdepth 2 -name "${asset}-*-unknown-linux-musl" -type f | head -n1)"
-  if [ -z "$bin" ]; then
-    echo "Could not locate $asset binary in release archive" >&2
-    return 1
-  fi
-  install -m 0755 "$bin" "/usr/local/bin/$dest"
-  echo "Installed $dest at /usr/local/bin/$dest"
-}
-
-# The musl-static binaries run on every ai-pod base image (Alpine and glibc alike).
-install_release_binary codex codex
-
-# Codex spawns this sibling helper when code mode is enabled; without it every
-# code-mode turn fails with "codex-code-mode-host: No such file or directory".
-# Not fatal if the asset is missing from a given release.
-install_release_binary codex-code-mode-host codex-code-mode-host \
-  || echo "Skipping codex-code-mode-host (asset unavailable); code mode will be unavailable" >&2
+# Install a tiny shim that lazily fetches the official Codex installer on
+# first invocation, then execs into the real binary. This keeps the image
+# small and lets users always run the latest agent without rebuilding.
+cat > /usr/local/bin/codex <<'SHIM'
+#!/bin/sh
+set -e
+if [ ! -x "$HOME/.local/bin/codex" ]; then
+  curl -fsSL https://chatgpt.com/codex/install.sh | bash
+fi
+exec "$HOME/.local/bin/codex" "$@"
+SHIM
+chmod 0755 /usr/local/bin/codex
+echo "Installed codex shim at /usr/local/bin/codex"
 
 # Completion-notification helper invoked by codex's `notify` config option.
 # Codex passes a JSON event as $1; we ignore it and send a generic message,
