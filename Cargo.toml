@@ -1,6 +1,6 @@
 [package]
 name = "ai-pod"
-version = "0.15.5"
+version = "0.16.0"
 edition = "2024"
 default-run = "ai-pod"
 
