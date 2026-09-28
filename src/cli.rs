@@ -43,6 +43,10 @@ pub struct Cli {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// Publish a container port to the host (repeatable; passed directly to Podman/Docker)
+    #[arg(short = 'p', long, value_name = "PORT")]
+    pub publish: Vec<String>,
+
     /// Container runtime to use (overrides AI_POD_RUNTIME and autodetect)
     #[arg(long, value_enum)]
     pub runtime: Option<crate::runtime::RuntimeKind>,
@@ -283,4 +287,48 @@ pub enum AllowedAction {
         #[arg(long)]
         workdir: Option<PathBuf>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publish_preserves_runtime_syntax_and_command_args() {
+        let cli = Cli::try_parse_from([
+            "ai-pod",
+            "-p",
+            "127.0.0.1:8080:80",
+            "--publish=8000-8005:8000-8005/tcp",
+            "-p",
+            "53/udp",
+            "run",
+            "echo",
+            "-p",
+            "command-arg",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.publish,
+            [
+                "127.0.0.1:8080:80",
+                "8000-8005:8000-8005/tcp",
+                "53/udp",
+            ]
+        );
+        match cli.command.unwrap() {
+            Command::Run { command, args } => {
+                assert_eq!(command, "echo");
+                assert_eq!(args, ["-p", "command-arg"]);
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn publish_is_optional_but_requires_a_value() {
+        assert!(Cli::try_parse_from(["ai-pod"]).unwrap().publish.is_empty());
+        assert!(Cli::try_parse_from(["ai-pod", "-p"]).is_err());
+        assert!(Cli::try_parse_from(["ai-pod", "--publish"]).is_err());
+    }
 }

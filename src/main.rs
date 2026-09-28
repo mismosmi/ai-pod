@@ -299,6 +299,7 @@ async fn launch_flow(cli: &Cli, rt: &ContainerRuntime) -> Result<()> {
         &project_id,
         &state.api_key,
         cli.playwright,
+        &cli.publish,
     );
 
     // The host-side browser server is only useful for the session that asked
@@ -579,6 +580,7 @@ async fn main() -> Result<()> {
                 args,
                 interactive,
                 cli.playwright,
+                &cli.publish,
             );
 
             if let Some(pw) = pw {

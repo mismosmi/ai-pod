@@ -935,6 +935,7 @@ pub fn launch_container(
     project_id: &str,
     api_key: &str,
     playwright: bool,
+    publish: &[String],
 ) -> Result<()> {
     let prefix = container_prefix(workspace);
     let volume_name = gen_volume_name(workspace);
@@ -1073,6 +1074,9 @@ pub fn launch_container(
         "-e",
         &opencode_config_env,
     ]);
+    for port in publish {
+        run_cmd.args(["--publish", port]);
+    }
     run_cmd.arg(image);
     let run_status = run_cmd
         .stdin(Stdio::inherit())
@@ -1102,6 +1106,7 @@ pub fn run_in_container(
     args: &[String],
     interactive: bool,
     playwright: bool,
+    publish: &[String],
 ) -> Result<()> {
     let session_id = new_session_id();
     let container_name = container_name_for(workspace, &session_id);
@@ -1189,6 +1194,9 @@ pub fn run_in_container(
         "-v".into(),
         format!("{}:/app:Z", workspace_str),
     ]);
+    for port in publish {
+        run_args.extend(["--publish".to_string(), port.clone()]);
+    }
     run_args.extend(user_mount_args);
     run_args.extend(mask_args);
     run_args.extend_from_slice(&[

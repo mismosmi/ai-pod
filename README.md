@@ -77,6 +77,7 @@ ai-pod --workdir /path/to/project
 | `--rebuild` | Force a rebuild of the container image |
 | `--no-cache` | Build the image without the Docker/Podman layer cache |
 | `--no-credential-check` | Skip scanning the workspace for credential files |
+| `-p, --publish <PORT>` | Publish a container port; repeatable and passed directly to Podman/Docker (e.g. `ai-pod -p 8080:80` or `ai-pod -p 8080:80 run bash`) |
 | `--dry-run` | Print podman/docker commands instead of executing them |
 | `--playwright` | Start Playwright MCP on the host and wire it into the agent (see [Browser control](#browser-control-with-playwright)) |
 
