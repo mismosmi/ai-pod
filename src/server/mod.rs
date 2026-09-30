@@ -3,14 +3,14 @@ mod control;
 pub mod lifecycle;
 pub mod mcp;
 pub mod notify;
+mod rate_limit;
 pub mod rest;
 pub mod runner;
 
 use axum::{
     Json, Router,
-    extract::{Path as AxumPath, Request, State},
+    extract::{Path as AxumPath, State},
     http::{StatusCode, header},
-    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -21,7 +21,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 
 use crate::config::AppConfig;
 use crate::runtime::ContainerRuntime;
@@ -130,39 +129,7 @@ async fn install_script_handler(AxumPath(name): AxumPath<String>) -> Response {
         .into_response()
 }
 
-/// Middleware that translates tower_governor's non-standard
-/// `x-ratelimit-after` header into the standard `Retry-After` header on 429
-/// responses, per RFC 7231 §7.1.3.
-async fn add_retry_after_header(request: Request, next: Next) -> Response {
-    let mut response = next.run(request).await;
-    if response.status() == StatusCode::TOO_MANY_REQUESTS
-        && !response.headers().contains_key(header::RETRY_AFTER)
-    {
-        if let Some(wait) = response.headers().get("x-ratelimit-after").cloned() {
-            response.headers_mut().insert(header::RETRY_AFTER, wait);
-        }
-    }
-    response
-}
-
 pub fn build_app(state: AppState) -> Router {
-    let governor_conf = Arc::new(
-        GovernorConfigBuilder::default()
-            .per_second(1)
-            .burst_size(50)
-            .finish()
-            .expect("valid governor config"),
-    );
-
-    let governor_limiter = governor_conf.limiter().clone();
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
-        loop {
-            tick.tick().await;
-            governor_limiter.retain_recent();
-        }
-    });
-
     let rate_limited = Router::new()
         .route("/health", get(health_handler))
         .route("/version", get(version_handler))
@@ -177,9 +144,8 @@ pub fn build_app(state: AppState) -> Router {
         .route("/commands/stop", post(rest::stop_command_handler))
         .route("/commands/status", post(rest::command_status_handler))
         .route("/commands/list", post(rest::list_commands_handler))
-        .route("/mcp", post(mcp::mcp_handler))
-        .layer(GovernorLayer::new(governor_conf))
-        .layer(middleware::from_fn(add_retry_after_header));
+        .route("/mcp", post(mcp::mcp_handler));
+    let rate_limited = rate_limit::wrap(rate_limited, state.approval_lock.clone());
 
     // Unthrottled: install scripts (fetched at image build time, idempotent)
     Router::new()
