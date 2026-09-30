@@ -138,7 +138,20 @@ impl ProjectState {
 }
 
 fn is_process_alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+    if pid <= 1 || unsafe { libc::kill(pid as i32, 0) } != 0 {
+        return false;
+    }
+    // An exited child may remain a zombie until its parent reaps it.
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        if stat
+            .rsplit_once(") ")
+            .is_some_and(|(_, rest)| rest.starts_with("Z "))
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Verify that the process at `pid` is still the same binary we spawned.
@@ -239,7 +252,7 @@ pub async fn ensure_shared_server(config: &AppConfig) -> Result<()> {
     let log = create_server_log(&log_path).context("Failed to create server log file")?;
     let log_err = log.try_clone()?;
 
-    let child = Command::new(&exe)
+    let mut child = Command::new(&exe)
         .args(["serve"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log))
@@ -263,8 +276,31 @@ pub async fn ensure_shared_server(config: &AppConfig) -> Result<()> {
     file.write_all(json.as_bytes())
         .context("Failed to write server state contents")?;
 
-    // Wait briefly for server to start
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // Wait for readiness, including after replacing an old server.
+    let client = control_client()?;
+    let base = format!("http://127.0.0.1:{MCP_PORT}");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "Shared server exited with {status}; see {}",
+                log_path.display()
+            );
+        }
+        if fetch_version(&client, &base)
+            .await
+            .is_ok_and(|v| v == CLI_VERSION)
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "Shared server did not become ready; see {}",
+                log_path.display()
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 
     eprintln!(
         "{} (PID {}, port {})",
@@ -326,32 +362,127 @@ fn is_newer_version(server: &str, cli: &str) -> bool {
     }
 }
 
-/// Check that the running server version matches the CLI. Returns Err if CLI is newer.
-pub async fn check_server_version() -> Result<()> {
-    let url = format!("http://127.0.0.1:{}/version", MCP_PORT);
-    let resp: serde_json::Value = reqwest::Client::new()
-        .get(&url)
+fn control_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?)
+}
+
+async fn fetch_version(client: &reqwest::Client, base: &str) -> Result<String> {
+    let resp: serde_json::Value = client
+        .get(format!("{base}/version"))
         .send()
         .await
         .context("Failed to reach server /version")?
+        .error_for_status()?
         .json()
         .await
         .context("Invalid JSON from server /version")?;
-
-    let server_version = resp["version"]
+    resp["version"]
         .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Missing version field in server response"))?;
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("Missing version field in server response"))
+}
 
-    if is_newer_version(server_version, CLI_VERSION) {
-        eprintln!(
-            "{} Server is v{}, CLI is v{}. Finish active ai-pod sessions so a new server can start.",
-            "Version mismatch:".yellow().bold(),
-            server_version,
-            CLI_VERSION,
+/// Negotiate an explicit restart; never stop a server without confirmation.
+/// Returns the PID to wait for, or None when no upgrade is needed.
+async fn request_restart(
+    config: &AppConfig,
+    client: &reqwest::Client,
+    base: &str,
+    confirm: impl FnOnce(&super::control::Status) -> Result<bool> + Send + 'static,
+) -> Result<Option<u32>> {
+    let version = fetch_version(client, base).await?;
+    if !is_newer_version(&version, CLI_VERSION) {
+        return Ok(None);
+    }
+    eprintln!(
+        "{} Server is v{}, CLI is v{}.",
+        "Version mismatch:".yellow().bold(),
+        version,
+        CLI_VERSION
+    );
+    let credentials = super::control::Credentials::load(&config.config_dir).context(
+        "This server predates interactive restarts. Finish all active ai-pod sessions and allow the old server to exit, then retry.")?;
+    let response = client
+        .get(format!("{base}/server/status"))
+        .bearer_auth(&credentials.token)
+        .send()
+        .await?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        anyhow::bail!(
+            "This server predates interactive restarts. Finish all active ai-pod sessions and allow the old server to exit, then retry."
         );
-        anyhow::bail!("Server version mismatch");
+    }
+    if !response.status().is_success() {
+        anyhow::bail!("Could not list active sessions: {}", response.text().await?);
+    }
+    let status: super::control::Status = response.json().await?;
+    if status.pid <= 1 || status.pid != credentials.pid || status.version != version {
+        anyhow::bail!("Server changed while checking its version; retry the command");
     }
 
+    // Keep an idle server alive while the user reads and answers the prompt.
+    let keep_alive_client = client.clone();
+    let keep_alive_url = format!("{base}/keep-alive");
+    let keep_alive = tokio::spawn(async move {
+        loop {
+            let _ = keep_alive_client.post(&keep_alive_url).send().await;
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        }
+    });
+    let pid = status.pid;
+    let accepted = tokio::task::spawn_blocking(move || confirm(&status)).await;
+    keep_alive.abort();
+    if !accepted?? {
+        anyhow::bail!("Server restart declined; existing sessions are still running");
+    }
+    client
+        .post(format!("{base}/server/quit"))
+        .bearer_auth(&credentials.token)
+        .send()
+        .await?
+        .error_for_status()
+        .context("Server refused to quit")?;
+    Ok(Some(pid))
+}
+
+/// Check compatibility and offer to replace an older shared server.
+pub async fn check_server_version(config: &AppConfig) -> Result<()> {
+    let client = control_client()?;
+    let base = format!("http://127.0.0.1:{MCP_PORT}");
+    let pid = request_restart(config, &client, &base, |status| {
+        if status.sessions.is_empty() {
+            eprintln!("No active ai-pod sessions.");
+        } else {
+            eprintln!("Active ai-pod sessions:");
+            for session in &status.sessions {
+                eprintln!("  {}  {}  ({})", session.session_id, session.container, session.runtime);
+            }
+        }
+        eprintln!("Restarting leaves containers running, briefly interrupts server access, and loses tracking of running host commands.");
+        if !crate::is_stdin_tty() {
+            anyhow::bail!("Server restart requires confirmation. Run ai-pod in an interactive terminal, or finish active sessions and retry after the server exits.");
+        }
+        Ok(dialoguer::Confirm::new()
+            .with_prompt("Restart the server anyway?")
+            .default(false)
+            .interact()?)
+    }).await?;
+    let Some(pid) = pid else { return Ok(()) };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    while is_process_alive(pid) {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("Old server did not exit within 15 seconds; no replacement was started");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    ensure_shared_server(config).await?;
+    let version = fetch_version(&client, &base).await?;
+    if version != CLI_VERSION {
+        anyhow::bail!("Replacement server is v{version}, expected v{CLI_VERSION}");
+    }
     Ok(())
 }
 
@@ -369,6 +500,166 @@ mod tests {
             config_dir,
             home_dir: home,
         }
+    }
+
+    async fn mock_server(
+        version: &str,
+        status_code: axum::http::StatusCode,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{
+            Json, Router,
+            routing::{get, post},
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let version = version.to_string();
+        let status_version = version.clone();
+        let quits = Arc::new(AtomicUsize::new(0));
+        let count = quits.clone();
+        let app = Router::new()
+            .route(
+                "/version",
+                get(move || async move { Json(serde_json::json!({"version": version})) }),
+            )
+            .route("/keep-alive", post(|| async { "ok" }))
+            .route(
+                "/server/status",
+                get(move || async move {
+                    (
+                        status_code,
+                        Json(super::super::control::Status {
+                            pid: 12345,
+                            version: status_version,
+                            sessions: vec![super::super::control::Session {
+                                runtime: "docker".into(),
+                                container: "ai-pod-abcdef123456-1234abcd".into(),
+                                session_id: "1234abcd".into(),
+                            }],
+                        }),
+                    )
+                }),
+            )
+            .route(
+                "/server/quit",
+                post(move |headers: axum::http::HeaderMap| async move {
+                    assert_eq!(headers["authorization"], "Bearer secret");
+                    count.fetch_add(1, Ordering::SeqCst);
+                    "quitting"
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (base, quits, task)
+    }
+
+    #[tokio::test]
+    async fn old_server_quits_only_after_session_list_is_confirmed() {
+        use std::sync::atomic::Ordering;
+        for accepted in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let config = temp_config(&dir);
+            super::super::control::Credentials {
+                pid: 12345,
+                token: "secret".into(),
+            }
+            .save(&config.config_dir)
+            .unwrap();
+            let (base, quits, task) = mock_server("0.0.1", axum::http::StatusCode::OK).await;
+            let observed_quits = quits.clone();
+            let result =
+                request_restart(&config, &control_client().unwrap(), &base, move |status| {
+                    assert_eq!(status.sessions.len(), 1);
+                    assert_eq!(status.sessions[0].session_id, "1234abcd");
+                    assert_eq!(observed_quits.load(Ordering::SeqCst), 0);
+                    Ok(accepted)
+                })
+                .await;
+            if accepted {
+                assert_eq!(result.unwrap(), Some(12345));
+            } else {
+                assert!(result.unwrap_err().to_string().contains("declined"));
+            }
+            assert_eq!(quits.load(Ordering::SeqCst), usize::from(accepted));
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn compatible_server_does_not_prompt_or_quit() {
+        for version in [CLI_VERSION, "999.0.0"] {
+            let dir = TempDir::new().unwrap();
+            let config = temp_config(&dir);
+            let (base, quits, task) = mock_server(version, axum::http::StatusCode::OK).await;
+            let result = request_restart(&config, &control_client().unwrap(), &base, |_| {
+                panic!("unexpected prompt")
+            })
+            .await
+            .unwrap();
+            assert_eq!(result, None);
+            assert_eq!(quits.load(std::sync::atomic::Ordering::SeqCst), 0);
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_session_list_never_prompts_or_quits() {
+        for status_code in [
+            axum::http::StatusCode::NOT_FOUND,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let dir = TempDir::new().unwrap();
+            let config = temp_config(&dir);
+            super::super::control::Credentials {
+                pid: 12345,
+                token: "secret".into(),
+            }
+            .save(&config.config_dir)
+            .unwrap();
+            let (base, quits, task) = mock_server("0.0.1", status_code).await;
+            assert!(
+                request_restart(&config, &control_client().unwrap(), &base, |_| panic!(
+                    "unexpected prompt"
+                ))
+                .await
+                .is_err()
+            );
+            assert_eq!(quits.load(std::sync::atomic::Ordering::SeqCst), 0);
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_confirmation_never_quits() {
+        let dir = TempDir::new().unwrap();
+        let config = temp_config(&dir);
+        super::super::control::Credentials {
+            pid: 12345,
+            token: "secret".into(),
+        }
+        .save(&config.config_dir)
+        .unwrap();
+        let (base, quits, task) = mock_server("0.0.1", axum::http::StatusCode::OK).await;
+        assert!(
+            request_restart(
+                &config,
+                &control_client().unwrap(),
+                &base,
+                |_| anyhow::bail!("noninteractive input")
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(quits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        task.abort();
     }
 
     #[test]
