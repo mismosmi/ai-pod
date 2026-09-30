@@ -257,10 +257,9 @@ async fn launch_flow(cli: &Cli, rt: &ContainerRuntime) -> Result<()> {
 
     // 5. Check server version compatibility BEFORE building. A stale server
     //    (e.g. one started by a prior CLI that predates a newly-added agent or
-    //    install route) would serve 404s during the build; bail here with a
-    //    clear "finish active sessions" message instead of producing a broken
-    //    image.
-    server::lifecycle::check_server_version().await?;
+    //    install route) would serve 404s during the build. Offer to restart it
+    //    before producing a broken image.
+    server::lifecycle::check_server_version(&config).await?;
 
     // Prune .ai-pod/commands/ entries for sessions whose container is gone.
     clean_stale_sessions(rt, &workspace);
@@ -441,7 +440,7 @@ async fn main() -> Result<()> {
             }
             server::lifecycle::ensure_shared_server(&config).await?;
             // Catch a stale server before building (see launch_flow for why).
-            server::lifecycle::check_server_version().await?;
+            server::lifecycle::check_server_version(&config).await?;
             let image = image::image_name(&workspace);
             image::ensure_image(&rt, &dockerfile, &image, cli.rebuild, cli.no_cache)?;
         }
@@ -555,7 +554,7 @@ async fn main() -> Result<()> {
             }
             server::lifecycle::ensure_shared_server(&config).await?;
             // Catch a stale server before building (see launch_flow for why).
-            server::lifecycle::check_server_version().await?;
+            server::lifecycle::check_server_version(&config).await?;
             let image = image::image_name(&workspace);
             image::ensure_image(&rt, &dockerfile, &image, cli.rebuild, cli.no_cache)?;
             server::lifecycle::bump_keep_alive().await;

@@ -99,6 +99,15 @@ ai-pod --workdir /path/to/project
 | `serve` | Start the shared MCP server manually (normally auto-started) |
 | `update` | Fetch the latest install script and run it to upgrade |
 
+After an update, starting a client against an older shared server shows the
+running sessions across Docker and Podman and asks whether to restart the server.
+Answering yes waits for the old server to quit, then starts the installed version.
+Containers remain running, but server access is briefly interrupted and tracking
+of running host commands is lost. Answering no leaves the server running and
+cancels startup. Noninteractive clients require an interactive launch to approve
+the restart. Servers from before this restart protocol must exit once (after all
+sessions finish) before this flow is available.
+
 ### Run a specific command in the container
 
 ```sh

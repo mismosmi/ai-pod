@@ -1,4 +1,5 @@
 pub mod commands;
+mod control;
 pub mod lifecycle;
 pub mod mcp;
 pub mod notify;
@@ -168,7 +169,10 @@ pub fn build_app(state: AppState) -> Router {
         .route("/keep-alive", post(keep_alive_handler))
         .route("/reload", post(reload_handler))
         .route("/notify_user", post(rest::notify_user_handler))
-        .route("/list_allowed_commands", post(rest::list_allowed_commands_handler))
+        .route(
+            "/list_allowed_commands",
+            post(rest::list_allowed_commands_handler),
+        )
         .route("/commands/run", post(rest::run_command_handler))
         .route("/commands/stop", post(rest::stop_command_handler))
         .route("/commands/status", post(rest::command_status_handler))
@@ -387,11 +391,21 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
             }
             let output = shutdown_rt
                 .async_command()
-                .args(["ps", "--filter", "label=managed-by=ai-pod", "--format", "{{.Names}}"])
+                .args([
+                    "ps",
+                    "--filter",
+                    "label=managed-by=ai-pod",
+                    "--format",
+                    "{{.Names}}",
+                ])
                 .output()
                 .await;
             let has_containers = output
-                .map(|o| String::from_utf8_lossy(&o.stdout).lines().any(|l| !l.is_empty()))
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .any(|l| !l.is_empty())
+                })
                 .unwrap_or(true);
             if !has_containers {
                 let _ = shutdown_tx.send(());
@@ -400,18 +414,46 @@ pub async fn run_server(port: u16, config: AppConfig, rt: ContainerRuntime) -> a
         }
     });
 
-    let app = build_app(state);
+    let quit = Arc::new(tokio::sync::Notify::new());
+    let credentials = control::Credentials {
+        pid: std::process::id(),
+        token: uuid::Uuid::new_v4().to_string(),
+    };
+    let app = build_app(state.clone()).merge(control::router(
+        state,
+        credentials.token.clone(),
+        quit.clone(),
+    ));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     println!("Shared server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(
+    // Publish credentials only after binding, so a competing server cannot
+    // overwrite the credentials of the process that actually owns the port.
+    credentials.save(&config.config_dir)?;
+    let drained = Arc::new(tokio::sync::Notify::new());
+    let draining = drained.clone();
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(async { shutdown_rx.await.ok(); })
-    .await?;
+    .with_graceful_shutdown(async move {
+        tokio::select! {
+            _ = shutdown_rx => {},
+            _ = quit.notified() => {},
+        }
+        draining.notify_one();
+    });
+    // In-flight MCP calls or idle HTTP connections must not prevent an
+    // explicitly requested restart indefinitely.
+    tokio::select! {
+        result = std::future::IntoFuture::into_future(server) => result?,
+        _ = async {
+            drained.notified().await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        } => {},
+    }
 
     Ok(())
 }
