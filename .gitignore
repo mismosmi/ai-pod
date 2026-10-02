@@ -1,5 +1,5 @@
 /target
-.ai-pod/commands
+.ai-pod
 
 .claude/*.lock
 .DS_Store
