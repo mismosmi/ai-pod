@@ -83,7 +83,7 @@ fn tool_error(text: String) -> Value {
 
 fn tools_definition(runtime: &ContainerRuntime) -> Value {
     let run_command_description = format!(
-        "Run a shell command on the host (outside this container). From inside the container, reach host services via `{}` instead of `localhost`. Waits up to 5 seconds; returns the result inline if finished, otherwise returns a command_id for polling.\n\nOutput goes to `/app/.ai-pod/commands/{{session_id}}/{{command_id}}/{{stdout,stderr,exit}}` — these files live on THIS container's filesystem (the workspace is mounted at `/app`). Read them with your regular file Read tool, not via bash on the host. Re-Read `stdout`/`exit` to poll progress; you do not need to keep calling `command_status`.\n\nKeep the command simple: one command, plain arguments. Do not pipe, redirect, or chain — the full output is written to the files above anyway, so `| head`/`| tail` (rejected outright), `| grep`, `> file` and `2>&1` gain you nothing. Do not start commands with `cd /` either; commands already start in the workspace root. Load the `ai-pod` skill for the full rules.",
+        "Run a shell command on the host (outside this container). From inside the container, reach host services via `{}` instead of `localhost`. Waits up to 5 seconds; returns the result inline if finished, otherwise returns a command_id for polling.\n\nOutput goes to `./.ai-pod/commands/{{session_id}}/{{command_id}}/{{stdout,stderr,exit}}` — these files live on THIS container's filesystem (paths are relative to the workspace directory). Read them with your regular file Read tool, not via bash on the host. Re-Read `stdout`/`exit` to poll progress; you do not need to keep calling `command_status`.\n\nKeep the command simple: one command, plain arguments. Do not pipe, redirect, or chain — the full output is written to the files above anyway, so `| head`/`| tail` (rejected outright), `| grep`, `> file` and `2>&1` gain you nothing. Do not start commands with `cd /` either; commands already start in the workspace root. Load the `ai-pod` skill for the full rules.",
         runtime.host_gateway(),
     );
     json!([
@@ -98,7 +98,7 @@ fn tools_definition(runtime: &ContainerRuntime) -> Value {
         },
         {
             "name": "command_status",
-            "description": "Check the status of a previously started command. Returns running/finished/killed plus the last 10 lines of stdout/stderr. Full streams are at `/app/.ai-pod/commands/{session_id}/{command_id}/{stdout,stderr,exit}` on this container's filesystem — read them with your file Read tool.",
+            "description": "Check the status of a previously started command. Returns running/finished/killed plus the last 10 lines of stdout/stderr. Full streams are at `./.ai-pod/commands/{session_id}/{command_id}/{stdout,stderr,exit}` on this container's filesystem — read them with your file Read tool.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "command_id": { "type": "string" } },
@@ -126,7 +126,7 @@ fn tools_definition(runtime: &ContainerRuntime) -> Value {
         },
         {
             "name": "rebuild_image",
-            "description": "Rebuild this workspace's container image from `/app/ai-pod.Dockerfile` and, if the build succeeds, run `test_command` in a throwaway container of the fresh image so you can verify the tools you added are installed. The throwaway container is removed immediately and does NOT have the workspace mounted — test for tools, not for project builds.\n\nEdit `/app/ai-pod.Dockerfile` first; keep the agent install line, `WORKDIR /app`, the `ai-pod` user and the final `CMD` intact. Build log and test output go to `/app/.ai-pod/commands/{session_id}/{command_id}/{stdout,stderr,exit}` like any other command — read them with your file Read tool. A non-zero `exit` means the build or the test failed.\n\nThe running container is NOT changed: the new image is picked up the next time the user starts ai-pod. Use this instead of running `podman build`/`docker build` via run_command. See the `ai-pod` skill for the full workflow.",
+            "description": "Rebuild this workspace's container image from `./ai-pod.Dockerfile` and, if the build succeeds, run `test_command` in a throwaway container of the fresh image so you can verify the tools you added are installed. The throwaway container is removed immediately and does NOT have the workspace mounted — test for tools, not for project builds.\n\nEdit `./ai-pod.Dockerfile` first; keep the agent install line, `WORKDIR /app`, the `ai-pod` user and the final `CMD` intact. Build log and test output go to `./.ai-pod/commands/{session_id}/{command_id}/{stdout,stderr,exit}` like any other command — read them with your file Read tool. A non-zero `exit` means the build or the test failed.\n\nThe running container is NOT changed: the new image is picked up the next time the user starts ai-pod. Use this instead of running `podman build`/`docker build` via run_command. See the `ai-pod` skill for the full workflow.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -321,7 +321,8 @@ async fn handle_rebuild_image(
         crate::image::rebuild_and_test_command(rt, &dockerfile, &image, no_cache, test_command);
     match runner::spawn_and_wait(state, workspace, session_id, &cmd).await {
         Ok(mut outcome) => {
-            let (s, e, x) = runner::container_paths(&outcome.session_id, &outcome.command_id);
+            let (s, e, x) =
+                runner::container_paths(workspace, &outcome.session_id, &outcome.command_id);
             outcome.stdout_path = s;
             outcome.stderr_path = e;
             outcome.exit_path = x;
@@ -635,7 +636,7 @@ mod tests {
         let v = tools_definition(&test_runtime(RuntimeKind::Podman));
         let desc = v[0]["description"].as_str().unwrap();
         assert!(
-            desc.contains("/app/.ai-pod/commands/"),
+            desc.contains("./.ai-pod/commands/"),
             "description should reference the in-container log path, got: {desc}"
         );
         assert!(
@@ -752,7 +753,7 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(
-            desc.contains("/app/.ai-pod/commands/"),
+            desc.contains("./.ai-pod/commands/"),
             "description should reference the in-container log path, got: {desc}"
         );
         assert!(
@@ -790,6 +791,7 @@ async fn handle_tool_call(
                     match runner::spawn_and_wait(state, workspace, session_id, cmd).await {
                         Ok(mut outcome) => {
                             let (s, e, x) = runner::container_paths(
+                                workspace,
                                 &outcome.session_id,
                                 &outcome.command_id,
                             );
@@ -817,7 +819,8 @@ async fn handle_tool_call(
                 .unwrap_or("");
             match runner::status_for(state, workspace, session_id, cid).await {
                 Some(mut o) => {
-                    let (s, e, x) = runner::container_paths(&o.session_id, &o.command_id);
+                    let (s, e, x) =
+                        runner::container_paths(workspace, &o.session_id, &o.command_id);
                     o.stdout_path = s;
                     o.stderr_path = e;
                     o.exit_path = x;

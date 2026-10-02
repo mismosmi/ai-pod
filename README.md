@@ -108,6 +108,15 @@ cancels startup. Noninteractive clients require an interactive launch to approve
 the restart. Servers from before this restart protocol must exit once (after all
 sessions finish) before this flow is available.
 
+Workspaces outside Linux system directories are mounted at their host path, and the container starts
+in that directory. For Git worktrees, ai-pod also mounts the main checkout; a
+worktree nested inside it (for example in `.ai-pod/worktrees`) needs only the
+main checkout mount. The main checkout and its worktrees share a persistent
+home volume. Workspaces under Linux system directories (such as `/etc`, `/usr`, `/var`,
+`/tmp`, `/opt`, and `/root`) retain the `/app` mount and separate
+home volumes. `clean` on a checkout or worktree targets that shared home volume;
+the runtime will refuse to remove it while another container is using it.
+
 ### Run a specific command in the container
 
 ```sh
@@ -341,7 +350,7 @@ Every host command writes its stdout, stderr, and exit code to files on disk tha
   command      # the shell command string
 ```
 
-The workspace is mounted at `/app` inside the container, so the agent reads these files with its normal `Read` tool. `ai-pod init` offers to add `.ai-pod` to your `.gitignore` automatically when the workspace is a git repo.
+The agent reads these files with its normal `Read` tool relative to the workspace directory. `ai-pod init` offers to add `.ai-pod` to your `.gitignore` automatically when the workspace is a git repo.
 
 ### Inspecting host commands from the host (TUI)
 

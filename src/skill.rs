@@ -98,7 +98,7 @@ mod tests {
         let s = render(&rt(RuntimeKind::Podman));
         // Simple commands, no output shaping — output is already in files.
         assert!(s.contains("| head"), "should call out piping to head/tail");
-        assert!(s.contains("/app/.ai-pod/commands/"));
+        assert!(s.contains("./.ai-pod/commands/"));
         // Stopping goes through the MCP tool, not host signals.
         assert!(s.contains("stop_command"));
         assert!(s.contains("pkill"));

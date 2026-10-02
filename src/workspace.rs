@@ -1,5 +1,128 @@
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Keep system paths isolated from the container's own filesystem.
+fn preserves_host_path(workspace: &Path) -> bool {
+    workspace.is_absolute()
+        && workspace != Path::new("/")
+        && ![
+            "/bin",
+            "/boot",
+            "/dev",
+            "/etc",
+            "/lib",
+            "/lib64",
+            "/lost+found",
+            "/media",
+            "/mnt",
+            "/opt",
+            "/proc",
+            "/root",
+            "/run",
+            "/sbin",
+            "/srv",
+            "/sys",
+            "/tmp",
+            "/usr",
+            "/var",
+        ]
+        .iter()
+        .any(|root| workspace.starts_with(root))
+}
+
+/// Preserve host paths except beneath Linux system directories.
+pub fn container_workdir(workspace: &Path) -> &Path {
+    if preserves_host_path(workspace) {
+        workspace
+    } else {
+        Path::new("/app")
+    }
+}
+
+/// Git lists the main checkout first, followed by its linked worktrees.
+/// Linux system directories retain the original workspace isolation.
+pub fn main_checkout(workspace: &Path) -> Option<PathBuf> {
+    if !preserves_host_path(workspace) {
+        return None;
+    }
+    // A normal checkout (including a subdirectory of one) needs no extra mount.
+    let metadata = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .output()
+        .ok()?;
+    if !metadata.status.success() {
+        return None;
+    }
+    let metadata = std::str::from_utf8(&metadata.stdout).ok()?;
+    let mut paths = metadata.lines();
+    let git_dir = std::fs::canonicalize(paths.next()?).ok()?;
+    let common_dir = std::fs::canonicalize(paths.next()?).ok()?;
+    if git_dir == common_dir {
+        return None;
+    }
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["worktree", "list", "--porcelain", "-z"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let first = output.stdout.split(|b| *b == 0).next()?;
+    let path = std::str::from_utf8(first).ok()?.strip_prefix("worktree ")?;
+    std::fs::canonicalize(path).ok()
+}
+
+/// Bind mounts for the workspace and, for linked worktrees, the main checkout.
+/// Nested worktrees are already included in the main checkout mount.
+pub fn workspace_mount_args(workspace: &Path) -> Vec<String> {
+    let mut roots = vec![workspace.to_path_buf()];
+    if let Some(main) = main_checkout(workspace) {
+        if workspace.starts_with(&main) {
+            roots = vec![main];
+        } else if main != workspace {
+            roots.push(main);
+        }
+    }
+    roots
+        .into_iter()
+        .flat_map(|root| {
+            let target = if preserves_host_path(workspace) {
+                root.as_path()
+            } else {
+                Path::new("/app")
+            };
+            // These checkouts can be mounted by multiple concurrent sessions.
+            vec![
+                "-v".into(),
+                format!(
+                    "{}:{}:{}",
+                    root.display(),
+                    target.display(),
+                    if preserves_host_path(workspace) {
+                        "z"
+                    } else {
+                        "Z"
+                    }
+                ),
+            ]
+        })
+        .collect()
+}
 
 pub fn workspace_hash(workspace: &Path) -> String {
     let workspace_str = workspace.to_string_lossy();
@@ -39,7 +162,11 @@ pub fn session_id_from_container_name(name: &str) -> Option<String> {
 }
 
 pub fn volume_name(workspace: &Path) -> String {
-    format!("ai-pod-{}-home", workspace_hash(workspace))
+    let main = main_checkout(workspace);
+    format!(
+        "ai-pod-{}-home",
+        workspace_hash(main.as_deref().unwrap_or(workspace))
+    )
 }
 
 /// Per-workspace named volume that shadow-mounts /app/{dir} inside the container.
@@ -90,7 +217,8 @@ pub fn validate_service_name(name: &str) -> Result<&str, String> {
         ));
     }
     for c in name.chars() {
-        let ok = c.is_ascii_digit() || (c.is_ascii_alphabetic() && c.is_ascii_lowercase()) || c == '-';
+        let ok =
+            c.is_ascii_digit() || (c.is_ascii_alphabetic() && c.is_ascii_lowercase()) || c == '-';
         if !ok {
             return Err(format!(
                 "service name '{}' contains invalid character '{}' (only [a-z0-9-] allowed)",
@@ -105,6 +233,145 @@ pub fn validate_service_name(name: &str) -> Result<&str, String> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn host_paths_exclude_linux_system_directories() {
+        for path in [
+            "/home/user/project",
+            "/Users/user/project",
+            "/projects/repo",
+            "/homework/project",
+        ] {
+            assert_eq!(container_workdir(Path::new(path)), Path::new(path));
+        }
+        for path in [
+            "/",
+            "/etc/project",
+            "/usr/local/project",
+            "/var/project",
+            "/tmp/project",
+            "/proc",
+            "/root/project",
+            "/opt/project",
+            "/mnt/project",
+            "relative",
+        ] {
+            assert_eq!(container_workdir(Path::new(path)), Path::new("/app"));
+        }
+    }
+
+    #[test]
+    fn home_worktrees_share_volume_and_preserve_paths() {
+        let home = dirs::home_dir().unwrap();
+        if !preserves_host_path(&home) {
+            return; // System directories deliberately use the isolated /app mount.
+        }
+        let temp = tempfile::tempdir_in(home).unwrap();
+        let main = temp.path().join("main checkout");
+        std::fs::create_dir(&main).unwrap();
+        git(&main, &["init"]);
+        git(
+            &main,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        );
+        let nested = main.join(".ai-pod/worktrees/nested");
+        let sibling = temp.path().join("sibling worktree");
+        git(
+            &main,
+            &["worktree", "add", "-b", "nested", nested.to_str().unwrap()],
+        );
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "sibling",
+                sibling.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(main_checkout(&nested), Some(main.clone()));
+        assert_eq!(main_checkout(&sibling), Some(main.clone()));
+        assert_eq!(volume_name(&main), volume_name(&nested));
+        assert_eq!(volume_name(&main), volume_name(&sibling));
+        assert_eq!(container_workdir(&nested), nested);
+        assert_eq!(workspace_mount_args(&nested), workspace_mount_args(&main));
+        assert_eq!(
+            workspace_mount_args(&sibling),
+            vec![
+                "-v".to_string(),
+                format!("{0}:{0}:z", sibling.display()),
+                "-v".to_string(),
+                format!("{0}:{0}:z", main.display())
+            ]
+        );
+        assert_eq!(workspace_mount_args(&main).len(), 2);
+        let subdir = main.join("ordinary-subdirectory");
+        std::fs::create_dir(&subdir).unwrap();
+        assert_eq!(main_checkout(&subdir), None);
+        assert_eq!(
+            workspace_mount_args(&subdir),
+            vec!["-v".to_string(), format!("{0}:{0}:z", subdir.display())]
+        );
+    }
+
+    #[test]
+    fn system_directory_keeps_app_mount_and_independent_volume() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        git(temp.path(), &["init"]);
+        git(
+            temp.path(),
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        );
+        let linked = temp.path().join("linked");
+        git(
+            temp.path(),
+            &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+        );
+        assert_eq!(main_checkout(&linked), None);
+        assert_eq!(container_workdir(&linked), Path::new("/app"));
+        assert_ne!(volume_name(temp.path()), volume_name(&linked));
+        assert_eq!(
+            workspace_mount_args(&linked),
+            vec!["-v".to_string(), format!("{}:/app:Z", linked.display())]
+        );
+        assert_eq!(
+            container_workdir(Path::new("/homework/project")),
+            Path::new("/homework/project")
+        );
+    }
 
     #[test]
     fn hash_is_deterministic() {

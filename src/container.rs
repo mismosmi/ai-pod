@@ -121,7 +121,13 @@ fn mask_mount_args(
     for dir in masks {
         let vol = ensure_mask_volume(rt, workspace, image, dir)?;
         out.push("-v".to_string());
-        out.push(format!("{}:/app/{}:Z", vol, dir));
+        out.push(format!(
+            "{}:{}:Z",
+            vol,
+            crate::workspace::container_workdir(workspace)
+                .join(dir)
+                .display()
+        ));
     }
     Ok(out)
 }
@@ -939,7 +945,8 @@ pub fn launch_container(
 ) -> Result<()> {
     let prefix = container_prefix(workspace);
     let volume_name = gen_volume_name(workspace);
-    let workspace_str = workspace.to_string_lossy();
+    let workspace_mounts = crate::workspace::workspace_mount_args(workspace);
+    let container_workdir = crate::workspace::container_workdir(workspace).to_string_lossy();
 
     rt.warn_if_rootless_userns_mismatch();
 
@@ -1050,9 +1057,10 @@ pub fn launch_container(
         &service_net,
         "-v",
         &format!("{}:{}:z", volume_name, CONTAINER_HOME),
-        "-v",
-        &format!("{}:/app:Z", workspace_str),
+        "--workdir",
+        &container_workdir,
     ]);
+    run_cmd.args(&workspace_mounts);
     for arg in &user_mount_args {
         run_cmd.arg(arg);
     }
@@ -1111,7 +1119,8 @@ pub fn run_in_container(
     let session_id = new_session_id();
     let container_name = container_name_for(workspace, &session_id);
     let volume_name = gen_volume_name(workspace);
-    let workspace_str = workspace.to_string_lossy();
+    let workspace_mounts = crate::workspace::workspace_mount_args(workspace);
+    let container_workdir = crate::workspace::container_workdir(workspace).to_string_lossy();
 
     rt.warn_if_rootless_userns_mismatch();
 
@@ -1191,12 +1200,13 @@ pub fn run_in_container(
         service_net,
         "-v".into(),
         format!("{}:{}:z", volume_name, CONTAINER_HOME),
-        "-v".into(),
-        format!("{}:/app:Z", workspace_str),
+        "--workdir".into(),
+        container_workdir.into_owned(),
     ]);
     for port in publish {
         run_args.extend(["--publish".to_string(), port.clone()]);
     }
+    run_args.extend(workspace_mounts);
     run_args.extend(user_mount_args);
     run_args.extend(mask_args);
     run_args.extend_from_slice(&[
@@ -1596,13 +1606,7 @@ mod tests {
 
     #[test]
     fn codex_config_merge_into_empty() {
-        let out = codex_config_merge(
-            "",
-            "http://host.containers.internal:7822",
-            "k1",
-            "s2",
-            None,
-        );
+        let out = codex_config_merge("", "http://host.containers.internal:7822", "k1", "s2", None);
         let doc = out.parse::<toml_edit::DocumentMut>().unwrap();
         assert_eq!(doc["experimental_use_rmcp_client"].as_bool(), Some(true));
         assert_eq!(doc["approval_policy"].as_str(), Some("never"));

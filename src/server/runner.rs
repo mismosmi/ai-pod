@@ -74,10 +74,17 @@ pub fn command_dir(workspace: &Path, session_id: &str, command_id: &str) -> Path
 }
 
 /// In-container view of the stdout/stderr/exit files. The workspace is bind-mounted
-/// at `/app` (see `src/container.rs`), so this is the path the agent inside the
+/// at its host path outside Linux system directories, or /app otherwise, so this is the path inside the
 /// container sees and can pass to its file Read tool.
-pub fn container_paths(session_id: &str, command_id: &str) -> (String, String, String) {
-    let base = format!("/app/.ai-pod/commands/{session_id}/{command_id}");
+pub fn container_paths(
+    workspace: &Path,
+    session_id: &str,
+    command_id: &str,
+) -> (String, String, String) {
+    let base = format!(
+        "{}/.ai-pod/commands/{session_id}/{command_id}",
+        crate::workspace::container_workdir(workspace).display()
+    );
     (
         format!("{base}/stdout"),
         format!("{base}/stderr"),
@@ -497,8 +504,17 @@ mod tests {
     }
 
     #[test]
+    fn container_paths_preserve_home_workspace() {
+        let (out, _, _) = container_paths(Path::new("/home/user/worktree"), "session", "command");
+        assert_eq!(
+            out,
+            "/home/user/worktree/.ai-pod/commands/session/command/stdout"
+        );
+    }
+
+    #[test]
     fn container_paths_uses_app_mount() {
-        let (out, err, exit) = container_paths("abcd1234", "efgh5678");
+        let (out, err, exit) = container_paths(Path::new("/app"), "abcd1234", "efgh5678");
         assert_eq!(out, "/app/.ai-pod/commands/abcd1234/efgh5678/stdout");
         assert_eq!(err, "/app/.ai-pod/commands/abcd1234/efgh5678/stderr");
         assert_eq!(exit, "/app/.ai-pod/commands/abcd1234/efgh5678/exit");

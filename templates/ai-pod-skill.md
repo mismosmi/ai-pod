@@ -11,8 +11,11 @@ container runtime itself) is reachable only through the `ai-pod` MCP server.
 
 ## Where you are
 
-- **The workspace is mounted at `/app`.** Files you write there land on the
-  user's real filesystem. `/app` is where you do normal work.
+- **The container starts in the workspace directory.** Workspaces outside Linux
+  system directories use the same path as on the host (including `/home` and
+  `/Users`); workspaces in system directories are mounted at `/app`.
+  Files you write there land on the user's real filesystem. Linked worktrees
+  outside system directories also expose the main checkout and share its persistent home volume.
 - **`$HOME` is a persistent volume.** Agent config and login survive restarts.
   It is _not_ the user's home directory.
 - **Everything else in the container is ephemeral.** Packages you install at
@@ -52,12 +55,12 @@ Rules, in order of how often they matter:
 `command_id` back and the output keeps streaming into:
 
 ```
-/app/.ai-pod/commands/{session_id}/{command_id}/stdout
-/app/.ai-pod/commands/{session_id}/{command_id}/stderr
-/app/.ai-pod/commands/{session_id}/{command_id}/exit
+./.ai-pod/commands/{session_id}/{command_id}/stdout
+./.ai-pod/commands/{session_id}/{command_id}/stderr
+./.ai-pod/commands/{session_id}/{command_id}/exit
 ```
 
-These are files in _this_ container (the workspace is mounted at `/app`), so
+These are files in _this_ container (relative to the workspace directory), so
 read them with your normal file Read tool — not with a host command. Re-read
 `stdout` to follow progress and `exit` to see whether it is done: it contains
 the decimal exit code, or `killed`. `command_status` is there for a quick
@@ -90,7 +93,7 @@ you are blocked on a question and the user has walked away.
 
 ## Changing this container
 
-The image is built from `/app/{{DOCKERFILE}}`. Edit that file to add tools,
+The image is built from `./{{DOCKERFILE}}`. Edit that file to add tools,
 runtimes, or system packages permanently.
 
 Keep these intact:
