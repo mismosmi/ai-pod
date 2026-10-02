@@ -230,6 +230,26 @@ pub async fn bump_keep_alive() {
         .await;
 }
 
+/// Whether the server recorded at `pid` answers `/version`.
+///
+/// A live PID alone is not enough: it may be a zombie (undetectable on macOS),
+/// a recycled PID, or a server that is still starting up. Polls briefly so a
+/// concurrently starting server gets a chance to bind the port.
+async fn server_responds(pid: u32) -> Result<bool> {
+    let client = control_client()?;
+    let base = format!("http://127.0.0.1:{MCP_PORT}");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if fetch_version(&client, &base).await.is_ok() {
+            return Ok(true);
+        }
+        if !is_process_alive(pid) || tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 /// Ensure the shared server is running. Starts it if not alive.
 pub async fn ensure_shared_server(config: &AppConfig) -> Result<()> {
     let state_path = config.server_state_file();
@@ -240,6 +260,7 @@ pub async fn ensure_shared_server(config: &AppConfig) -> Result<()> {
 
     if let Some(pid) = state.pid
         && is_server_process_alive(pid, state.exe_path.as_deref())
+        && server_responds(pid).await?
     {
         // Re-arm the inactivity timer so a freshly-arriving CLI command does
         // not inherit a near-expired timer from the previous run.
@@ -301,6 +322,13 @@ pub async fn ensure_shared_server(config: &AppConfig) -> Result<()> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+
+    // Reap the server when it exits. Without this, a long-lived CLI (e.g.
+    // `ai-pod run ... acp`) keeps the exited server as a zombie, and its PID
+    // passes `kill(pid, 0)` on platforms without the /proc zombie check.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 
     eprintln!(
         "{} (PID {}, port {})",
