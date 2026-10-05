@@ -20,6 +20,7 @@ ai-pod manages per-workspace containers that run Claude Code, OpenCode, or OpenA
 - **File-based command output** — every command writes stdout/stderr/exit to `{workspace}/.ai-pod/commands/{session_id}/{command_id}/` so the agent reads long-running output directly
 - **Interactive TUIs** — `ai-pod commands` to inspect/kill running host commands, `ai-pod allowed` to manage the whitelist
 - **Desktop notifications** — Stop hooks notify you on Claude session end, an OpenCode plugin sends notifications when `session.idle` fires, and Codex's `notify` program fires on turn completion
+- **Rate-limit approval** — when a client exhausts the host API's request budget, a desktop notification offers a one-time counter reset. Choose **Wait for cooldown** (or dismiss it) to keep throttling; clients receive HTTP 429 with `Retry-After` until requests can resume. Repeated requests do not duplicate the prompt.
 - **Transparent host networking** — containers reach host services at `host.containers.internal` (Podman) or `host.docker.internal` (Docker); no manual port mapping needed
 - **Browser control on the host** — `--playwright` starts Playwright MCP outside the container, so the agent drives a real, visible browser on your desktop
 - **Auto-update checks** — silently checks for new releases on startup and notifies you when one is available
