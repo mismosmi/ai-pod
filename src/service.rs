@@ -109,10 +109,12 @@ pub fn start_service(
         );
     }
 
+    // No `--rm`: a service that dies during startup must stick around long
+    // enough for us to read its logs. Session cleanup and `stop_service` both
+    // `rm --force`, so exited containers don't leak.
     let mut args: Vec<String> = vec![
         "run".into(),
         "-d".into(),
-        "--rm".into(),
         "--name".into(),
         container_name.clone(),
         "--label".into(),
@@ -135,8 +137,13 @@ pub fn start_service(
         args.push(c.clone());
     }
 
-    let output = rt
-        .command()
+    let mut cmd = rt.command();
+    // `PODMAN_USERNS=keep-id` is recommended for the main container so
+    // workspace bind mounts keep the host user's ownership. Service images
+    // (postgres, ...) expect the default mapping — under keep-id they run as
+    // the host UID and fail on chown/chmod of their data dirs (#173).
+    cmd.env_remove("PODMAN_USERNS");
+    let output = cmd
         .args(&args)
         .output()
         .context("failed to spawn service container")?;
@@ -146,10 +153,64 @@ pub fn start_service(
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
+
+    if !rt.dry_run {
+        check_service_survives_startup(rt, &container_name)?;
+    }
+
     Ok(StartedService {
         host: name.to_string(),
         container_name,
     })
+}
+
+/// How long to watch a freshly started service for an early exit.
+const STARTUP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+const STARTUP_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Watch a just-started service for `STARTUP_GRACE`. If it exits in that
+/// window (bad env, permission errors, ...), remove it and fail with its log
+/// tail so the agent sees why instead of a silently vanished service.
+fn check_service_survives_startup(rt: &ContainerRuntime, container_name: &str) -> Result<()> {
+    let deadline = std::time::Instant::now() + STARTUP_GRACE;
+    loop {
+        let state = rt
+            .command()
+            .args(["inspect", "--format", "{{.State.Status}}", container_name])
+            .output()
+            .context("failed to inspect service container")?;
+        let status = String::from_utf8_lossy(&state.stdout).trim().to_string();
+        if !state.status.success() || status == "exited" || status == "dead" {
+            let logs = rt
+                .command()
+                .args(["logs", "--tail", "50", container_name])
+                .output()
+                .map(|o| {
+                    let mut t = String::from_utf8_lossy(&o.stdout).into_owned();
+                    t.push_str(&String::from_utf8_lossy(&o.stderr));
+                    t
+                })
+                .unwrap_or_default();
+            let _ = rt
+                .command()
+                .args(["rm", "--force", container_name])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            anyhow::bail!(
+                "service container exited during startup{}",
+                if logs.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(". Last log lines:\n{}", logs.trim_end())
+                }
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(());
+        }
+        std::thread::sleep(STARTUP_POLL);
+    }
 }
 
 /// Stop a service container belonging to `session_id`. Returns true on
