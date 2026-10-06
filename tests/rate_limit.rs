@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use ai_pod::runtime::{ContainerRuntime, RuntimeKind};
-use ai_pod::server::{AppState, build_app};
+use ai_pod::server::{AppState, build_app_with_reset_prompt};
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 
@@ -37,7 +37,8 @@ fn make_state(config_dir: &std::path::Path) -> AppState {
 async fn rate_limit_returns_429_with_retry_after() {
     let dir = TempDir::new().unwrap();
     let state = make_state(dir.path());
-    let app = build_app(state);
+    // Deny the reset without showing the real desktop dialog (macOS).
+    let app = build_app_with_reset_prompt(state, Arc::new(|_, _| false));
 
     // Bind to an ephemeral port on localhost.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

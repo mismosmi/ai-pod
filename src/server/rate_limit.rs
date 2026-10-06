@@ -26,7 +26,7 @@ const FULL_COOLDOWN: Duration = Duration::from_secs(BURST as u64);
 const IDLE_RETENTION: Duration = Duration::from_secs(60);
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
 
-type ResetPrompt = Arc<dyn Fn(IpAddr, Duration) -> bool + Send + Sync>;
+pub type ResetPrompt = Arc<dyn Fn(IpAddr, Duration) -> bool + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct BucketKey {
@@ -158,7 +158,11 @@ async fn notify_on_limit(
     response
 }
 
-pub(super) fn wrap<S>(router: Router<S>, approval_lock: Arc<tokio::sync::Mutex<()>>) -> Router<S>
+pub(super) fn wrap<S>(
+    router: Router<S>,
+    approval_lock: Arc<tokio::sync::Mutex<()>>,
+    prompt: ResetPrompt,
+) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
@@ -167,7 +171,7 @@ where
         Notifications {
             extractor: ResettablePeerIp::default(),
             approval_lock,
-            prompt: Arc::new(super::notify::request_rate_limit_reset),
+            prompt,
         },
     )
 }

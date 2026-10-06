@@ -3,7 +3,7 @@ mod control;
 pub mod lifecycle;
 pub mod mcp;
 pub mod notify;
-mod rate_limit;
+pub mod rate_limit;
 pub mod rest;
 pub mod runner;
 
@@ -130,6 +130,12 @@ async fn install_script_handler(AxumPath(name): AxumPath<String>) -> Response {
 }
 
 pub fn build_app(state: AppState) -> Router {
+    build_app_with_reset_prompt(state, Arc::new(notify::request_rate_limit_reset))
+}
+
+/// Like [`build_app`], but with a custom prompt for approving a rate-limit
+/// reset, so tests don't pop up a real desktop dialog.
+pub fn build_app_with_reset_prompt(state: AppState, prompt: rate_limit::ResetPrompt) -> Router {
     let rate_limited = Router::new()
         .route("/health", get(health_handler))
         .route("/version", get(version_handler))
@@ -145,7 +151,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/commands/status", post(rest::command_status_handler))
         .route("/commands/list", post(rest::list_commands_handler))
         .route("/mcp", post(mcp::mcp_handler));
-    let rate_limited = rate_limit::wrap(rate_limited, state.approval_lock.clone());
+    let rate_limited = rate_limit::wrap(rate_limited, state.approval_lock.clone(), prompt);
 
     // Unthrottled: install scripts (fetched at image build time, idempotent)
     Router::new()
