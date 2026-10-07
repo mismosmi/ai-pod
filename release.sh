@@ -39,6 +39,9 @@ cargo test
 # Update version in Cargo.toml
 sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml && rm Cargo.toml.bak
 
+# Regenerate Cargo.lock for the new version (workspace members only, no dependency upgrades)
+cargo update --workspace
+
 # Commit version bump
 git add Cargo.toml Cargo.lock
 git commit -m "chore: bump version to $VERSION"
