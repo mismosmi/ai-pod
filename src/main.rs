@@ -473,8 +473,23 @@ async fn main() -> Result<()> {
             if state.masked_directories.is_empty() {
                 println!("No masked directories.");
             } else {
-                for dir in &state.masked_directories {
-                    println!("{}", dir);
+                let rows: Vec<(String, String)> = state
+                    .masked_directories
+                    .iter()
+                    .map(|dir| {
+                        (
+                            workspace::container_workdir(&workspace)
+                                .join(dir)
+                                .display()
+                                .to_string(),
+                            workspace::mask_volume_name(&workspace, dir),
+                        )
+                    })
+                    .collect();
+                let width = rows.iter().map(|(p, _)| p.len()).max().unwrap_or(0);
+                println!("{:<width$}  {}", "DIRECTORY", "VOLUME", width = width);
+                for (path, vol) in &rows {
+                    println!("{:<width$}  {}", path, vol, width = width);
                 }
             }
         }
