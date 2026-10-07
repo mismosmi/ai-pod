@@ -95,8 +95,9 @@ ai-pod --workdir /path/to/project
 | `commands [list\|run\|kill\|logs]` | View/manage host commands (interactive TUI if no subcommand) |
 | `services [list\|logs\|stop]` | View/manage service containers started by agents (interactive TUI if no subcommand) |
 | `allowed [list\|add\|remove]` | Manage the always-allowed command whitelist (interactive TUI if no subcommand) |
-| `mask <dir> [--workdir PATH]` | Shadow-mount `/app/<dir>` with an isolated per-workspace volume |
-| `unmask <dir> [--workdir PATH]` | Stop masking `<dir>` and delete its shadow volume |
+| `mask add <dir> [--workdir PATH]` | Shadow-mount `/app/<dir>` with an isolated per-workspace volume |
+| `mask list [--workdir PATH]` | List masked directories for the workspace |
+| `mask remove <dir> [--workdir PATH]` | Stop masking `<dir>` and delete its shadow volume |
 | `serve` | Start the shared MCP server manually (normally auto-started) |
 | `update` | Fetch the latest install script and run it to upgrade |
 
@@ -195,8 +196,8 @@ Mask them so the container gets its own per-workspace storage instead of
 overlaying the host's:
 
 ```sh
-ai-pod mask node_modules    # next launch mounts an isolated volume at /app/node_modules
-ai-pod unmask node_modules  # stop masking and delete the volume
+ai-pod mask add node_modules # next launch mounts an isolated volume at /app/node_modules
+ai-pod mask remove node_modules # stop masking and delete the volume
 ```
 
 The shadow volume is named `ai-pod-<workspace-hash>-mask-<dir>` and is

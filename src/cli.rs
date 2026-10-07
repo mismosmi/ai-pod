@@ -136,24 +136,12 @@ pub enum Command {
         workdir: Option<PathBuf>,
     },
 
-    /// Shadow-mount a top-level workspace directory with an isolated per-workspace volume.
-    /// The masked directory inside the container is backed by a named volume instead of
+    /// Shadow-mount top-level workspace directories with isolated per-workspace volumes.
+    /// A masked directory inside the container is backed by a named volume instead of
     /// the host's workspace, so container-only artifacts (e.g. node_modules) don't leak out.
     Mask {
-        /// Top-level directory name under /app (e.g. node_modules, target)
-        dir: String,
-        /// Workspace path (default: cwd)
-        #[arg(long)]
-        workdir: Option<PathBuf>,
-    },
-
-    /// Remove a directory from the mask list and delete its shadow volume.
-    Unmask {
-        /// Top-level directory name to stop masking
-        dir: String,
-        /// Workspace path (default: cwd)
-        #[arg(long)]
-        workdir: Option<PathBuf>,
+        #[command(subcommand)]
+        action: MaskAction,
     },
 
     /// Manage host-path bind mounts applied to every ai-pod container.
@@ -164,6 +152,32 @@ pub enum Command {
 
     /// Update ai-pod to the latest release
     Update,
+}
+
+#[derive(Subcommand)]
+pub enum MaskAction {
+    /// List all masked directories for the current workspace
+    List {
+        /// Workspace path (default: cwd)
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+    },
+    /// Mask a top-level directory with an isolated per-workspace volume
+    Add {
+        /// Top-level directory name under /app (e.g. node_modules, target)
+        dir: String,
+        /// Workspace path (default: cwd)
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+    },
+    /// Stop masking a directory and delete its shadow volume
+    Remove {
+        /// Top-level directory name to stop masking
+        dir: String,
+        /// Workspace path (default: cwd)
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]

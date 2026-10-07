@@ -8,7 +8,7 @@ use clap::Parser;
 use colored::Colorize;
 use std::path::Path;
 
-use cli::{AllowedAction, Cli, Command, CommandsAction, EnvFilesAction, MountAction, ServicesAction};
+use cli::{AllowedAction, Cli, Command, CommandsAction, EnvFilesAction, MaskAction, MountAction, ServicesAction};
 use config::AppConfig;
 use runtime::ContainerRuntime;
 
@@ -461,7 +461,26 @@ async fn main() -> Result<()> {
             let workspace = resolve_workspace(&ws)?;
             container::clean_container(&rt, &config, &workspace)?;
         }
-        Some(Command::Mask { dir, workdir }) => {
+        Some(Command::Mask {
+            action: MaskAction::List { workdir },
+        }) => {
+            let config = AppConfig::new()?;
+            let ws = workdir.clone().or_else(|| cli.workdir.clone());
+            let workspace = resolve_workspace(&ws)?;
+            let hash = workspace::workspace_hash(&workspace);
+            let state =
+                server::lifecycle::ProjectState::load(&config.project_state_file(&hash));
+            if state.masked_directories.is_empty() {
+                println!("No masked directories.");
+            } else {
+                for dir in &state.masked_directories {
+                    println!("{}", dir);
+                }
+            }
+        }
+        Some(Command::Mask {
+            action: MaskAction::Add { dir, workdir },
+        }) => {
             let config = AppConfig::new()?;
             config.init()?;
             let ws = workdir.clone().or_else(|| cli.workdir.clone());
@@ -487,7 +506,9 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Some(Command::Unmask { dir, workdir }) => {
+        Some(Command::Mask {
+            action: MaskAction::Remove { dir, workdir },
+        }) => {
             let config = AppConfig::new()?;
             config.init()?;
             let ws = workdir.clone().or_else(|| cli.workdir.clone());
@@ -509,7 +530,7 @@ async fn main() -> Result<()> {
                 !container::containers_for_prefix(&rt, &prefix, true)?.is_empty();
             if container_running {
                 println!(
-                    "{} a container is running for this workspace; the volume will be left in place. Stop the container and re-run `ai-pod unmask {}` (or `ai-pod clean`) to delete its data.",
+                    "{} a container is running for this workspace; the volume will be left in place. Stop the container and re-run `ai-pod mask remove {}` (or `ai-pod clean`) to delete its data.",
                     "Note:".yellow().bold(),
                     dir
                 );
