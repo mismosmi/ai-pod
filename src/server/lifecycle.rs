@@ -46,6 +46,10 @@ pub struct ProjectState {
     /// `commands::rebuild_approval_key`.
     #[serde(default)]
     pub allowed_rebuilds: Vec<String>,
+    /// Egress filtering for this workspace (`ai-pod egress`). `None` means
+    /// unfiltered network access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<crate::egress::EgressConfig>,
 }
 
 impl ProjectState {
@@ -710,6 +714,7 @@ mod tests {
             masked_directories: vec![],
             allowed_services: vec![],
             allowed_rebuilds: vec![],
+            egress: None,
         };
         state.save(&path).unwrap();
         let perms = std::fs::metadata(&path).unwrap().permissions();
@@ -746,6 +751,7 @@ mod tests {
             masked_directories: vec![],
             allowed_services: vec![],
             allowed_rebuilds: vec![],
+            egress: None,
         };
         state.save(&path).unwrap();
         let loaded = ProjectState::load(&path);

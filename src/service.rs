@@ -68,8 +68,8 @@ pub fn ensure_service_network(rt: &ContainerRuntime, workspace: &std::path::Path
     );
 }
 
-/// Start a detached service container on the workspace network with a DNS
-/// alias matching `name`. Returns the host the agent should use plus the
+/// Start a detached service container on the workspace network (or on
+/// `network`, for egress-filtered sessions) with a DNS alias matching `name`. Returns the host the agent should use plus the
 /// container's full name.
 ///
 /// The main container is expected to already be attached to the workspace
@@ -81,12 +81,16 @@ pub fn start_service(
     rt: &ContainerRuntime,
     workspace: &std::path::Path,
     session_id: &str,
+    network: Option<&str>,
     image: &str,
     name: &str,
     env: &[(String, String)],
     command: &[String],
 ) -> Result<StartedService> {
-    let net = ensure_service_network(rt, workspace)?;
+    let net = match network {
+        Some(n) => n.to_string(),
+        None => ensure_service_network(rt, workspace)?,
+    };
     let container_name = service_container_name(workspace, session_id, name);
 
     // Refuse to silently clobber an existing service of the same name.

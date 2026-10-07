@@ -98,6 +98,7 @@ ai-pod --workdir /path/to/project
 | `mask add <dir> [--workdir PATH]` | Shadow-mount `/app/<dir>` with an isolated per-workspace volume |
 | `mask list [--workdir PATH]` | List masked directories for the workspace |
 | `mask remove <dir> [--workdir PATH]` | Stop masking `<dir>` and delete its shadow volume |
+| `egress [status\|proxy\|image\|off] [--workdir PATH]` | Filter the agent's network traffic through an HTTP proxy |
 | `serve` | Start the shared MCP server manually (normally auto-started) |
 | `update` | Fetch the latest install script and run it to upgrade |
 
@@ -204,6 +205,36 @@ The shadow volume is named `ai-pod-<workspace-hash>-mask-<dir>` and is
 removed automatically by `ai-pod clean`. Only top-level directory names are
 accepted (no slashes, no hidden dirs). Changes apply to the next container
 launch; a warning is printed if a container is currently running.
+
+### Filtering network access
+
+By default the agent has unrestricted network access. `ai-pod egress` routes
+all of a workspace's traffic through an HTTP proxy of your choice, which
+decides what is allowed (for example squid with an allow-list):
+
+```sh
+ai-pod egress proxy localhost:3128   # use a proxy you already run (localhost = the host machine)
+ai-pod egress image docker.io/ubuntu/squid \
+  -v ~/squid.conf:/etc/squid/squid.conf:ro   # or let ai-pod start one per session
+ai-pod egress                        # show the current setting
+ai-pod egress off                    # back to unrestricted access
+```
+
+With a filter configured, the container and any service containers it starts
+join an internal network with no route outside. A small per-session gateway
+container (`alpine/socat`) is the only way out: it forwards the ai-pod server,
+Playwright (if enabled) and the proxy port. `HTTP_PROXY`/`HTTPS_PROXY` point at
+it, and tools that ignore those variables can't connect at all. Without a
+filter, none of this runs.
+
+Notes:
+
+- `--playwright` drives a browser **on the host**, which the filter does not
+  cover. ai-pod warns and asks for confirmation before starting with both.
+- Ports published with `-p` are not reachable while filtering is on.
+- HTTP services started with `start_service` are reached through the proxy
+  too, so allow them there if needed.
+- Changes apply to sessions started afterwards.
 
 ---
 

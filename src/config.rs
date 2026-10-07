@@ -118,6 +118,11 @@ pub fn session_state_path(config_dir: &Path, session_id: &str) -> PathBuf {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SessionState {
     pub runtime: crate::runtime::RuntimeKind,
+    /// Network the main container was attached to when it differs from the
+    /// per-workspace service network (egress filtering). Service containers
+    /// must join the same one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
 }
 
 impl SessionState {
@@ -303,6 +308,7 @@ mod tests {
 
         SessionState {
             runtime: RuntimeKind::Docker,
+            network: None,
         }
         .save(&config, "sess0001")
         .unwrap();
