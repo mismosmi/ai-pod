@@ -144,6 +144,17 @@ pub enum Command {
         action: MaskAction,
     },
 
+    /// Filter the agent's network traffic through an HTTP proxy for the
+    /// current workspace. Run with no subcommand to show the current setting.
+    Egress {
+        #[command(subcommand)]
+        action: Option<EgressAction>,
+
+        /// Workspace path (default: cwd)
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+    },
+
     /// Manage host-path bind mounts applied to every ai-pod container.
     Mount {
         #[command(subcommand)]
@@ -178,6 +189,33 @@ pub enum MaskAction {
         #[arg(long)]
         workdir: Option<PathBuf>,
     },
+}
+
+#[derive(Subcommand)]
+pub enum EgressAction {
+    /// Show the egress filter configured for this workspace
+    Status,
+    /// Send all traffic through a proxy you already run (e.g. squid on the
+    /// host). `localhost` refers to the host machine.
+    Proxy {
+        /// `host:port` of the proxy, e.g. `localhost:3128`
+        address: String,
+    },
+    /// Start a proxy container from this image for every session
+    /// (e.g. `ubuntu/squid` with your own allow-list mounted in).
+    Image {
+        /// Proxy image, e.g. `docker.io/ubuntu/squid`
+        image: String,
+        /// Port the proxy listens on inside its container
+        #[arg(long, default_value_t = 3128)]
+        port: u16,
+        /// Volume for the proxy container (repeatable; passed directly to
+        /// Podman/Docker), e.g. `~/squid.conf:/etc/squid/squid.conf:ro`
+        #[arg(short = 'v', long = "volume", value_name = "VOLUME")]
+        volumes: Vec<String>,
+    },
+    /// Disable egress filtering (unrestricted network access)
+    Off,
 }
 
 #[derive(Subcommand)]

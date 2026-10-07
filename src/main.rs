@@ -1,6 +1,6 @@
 use ai_pod::{
-    cli, commands_cli, config, container, credentials, env_files_cli, image, mount_cli, playwright,
-    runtime, server, services_cli, update, workspace,
+    cli, commands_cli, config, container, credentials, egress, env_files_cli, image, mount_cli,
+    playwright, runtime, server, services_cli, update, workspace,
 };
 
 use anyhow::{Context, Result};
@@ -8,7 +8,10 @@ use clap::Parser;
 use colored::Colorize;
 use std::path::Path;
 
-use cli::{AllowedAction, Cli, Command, CommandsAction, EnvFilesAction, MaskAction, MountAction, ServicesAction};
+use cli::{
+    AllowedAction, Cli, Command, CommandsAction, EgressAction, EnvFilesAction, MaskAction,
+    MountAction, ServicesAction,
+};
 use config::AppConfig;
 use runtime::ContainerRuntime;
 
@@ -36,6 +39,82 @@ fn validate_mask_dir(dir: &str) -> Result<()> {
             "Directory name may only contain ASCII letters, digits, '_', '-' or '.'"
         );
     }
+    Ok(())
+}
+
+/// `--playwright` drives a browser on the host, outside the egress filter.
+/// Warn and require confirmation before launching with both. Returns false if
+/// the user declined.
+fn confirm_playwright_with_egress(config: &AppConfig, workspace: &Path, playwright: bool) -> Result<bool> {
+    if !playwright {
+        return Ok(true);
+    }
+    let hash = workspace::workspace_hash(workspace);
+    let state = server::lifecycle::ProjectState::load(&config.project_state_file(&hash));
+    let Some(egress) = state.egress else {
+        return Ok(true);
+    };
+    eprintln!(
+        "{} egress filtering is enabled for this workspace ({}), but --playwright\n  \
+         lets the agent drive a browser on the host, which is NOT filtered.",
+        "Warning:".yellow().bold(),
+        egress.describe()
+    );
+    if !ai_pod::is_stdin_tty() {
+        anyhow::bail!(
+            "Refusing to start with both --playwright and egress filtering without a terminal to confirm. \
+             Drop --playwright or run `ai-pod egress off`."
+        );
+    }
+    Ok(dialoguer::Confirm::new()
+        .with_prompt("Start anyway?")
+        .default(false)
+        .interact()
+        .unwrap_or(false))
+}
+
+fn run_egress(config: &AppConfig, workspace: &Path, action: &Option<EgressAction>) -> Result<()> {
+    let hash = workspace::workspace_hash(workspace);
+    let state_path = config.project_state_file(&hash);
+    let mut state = server::lifecycle::ProjectState::load(&state_path);
+    let new = match action {
+        None | Some(EgressAction::Status) => {
+            match &state.egress {
+                Some(e) => println!("Egress filtered {}", e.describe()),
+                None => println!("Egress unfiltered (run `ai-pod egress proxy` or `ai-pod egress image` to enable)"),
+            }
+            return Ok(());
+        }
+        Some(EgressAction::Proxy { address }) => {
+            egress::validate_address(address)?;
+            Some(egress::EgressConfig::Proxy {
+                address: address.clone(),
+            })
+        }
+        Some(EgressAction::Image {
+            image,
+            port,
+            volumes,
+        }) => Some(egress::EgressConfig::Image {
+            image: image.clone(),
+            port: *port,
+            volumes: volumes
+                .iter()
+                .map(|v| match v.strip_prefix("~/") {
+                    Some(rest) => format!("{}/{}", config.home_dir.display(), rest),
+                    None => v.clone(),
+                })
+                .collect(),
+        }),
+        Some(EgressAction::Off) => None,
+    };
+    state.egress = new;
+    state.save(&state_path)?;
+    match &state.egress {
+        Some(e) => println!("{} filtered {}", "Egress:".green().bold(), e.describe()),
+        None => println!("{} unfiltered", "Egress:".green().bold()),
+    }
+    println!("Applies to sessions started from now on.");
     Ok(())
 }
 
@@ -251,6 +330,11 @@ async fn launch_flow(cli: &Cli, rt: &ContainerRuntime) -> Result<()> {
         }
     }
 
+    if !confirm_playwright_with_egress(&config, &workspace, cli.playwright)? {
+        eprintln!("{}", "Aborted.".red());
+        return Ok(());
+    }
+
     // 4. Ensure shared server is running (must be up before image build so the
     //    Dockerfile can fetch /install/{agent}.sh from http://{gateway}:7822)
     server::lifecycle::ensure_shared_server(&config).await?;
@@ -357,6 +441,14 @@ async fn main() -> Result<()> {
                     env_files_cli::run_unignore(&config, &workspace, path)?
                 }
             }
+            return Ok(());
+        }
+        Some(Command::Egress { action, workdir }) => {
+            let config = AppConfig::new()?;
+            config.init()?;
+            let ws = workdir.clone().or_else(|| cli.workdir.clone());
+            let workspace = resolve_workspace(&ws)?;
+            run_egress(&config, &workspace, action)?;
             return Ok(());
         }
         Some(Command::Mount { action }) => {
@@ -587,6 +679,10 @@ async fn main() -> Result<()> {
                     eprintln!("{}", "Aborted.".red());
                     return Ok(());
                 }
+            }
+            if !confirm_playwright_with_egress(&config, &workspace, cli.playwright)? {
+                eprintln!("{}", "Aborted.".red());
+                return Ok(());
             }
             server::lifecycle::ensure_shared_server(&config).await?;
             // Catch a stale server before building (see launch_flow for why).

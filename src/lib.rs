@@ -3,6 +3,7 @@ pub mod commands_cli;
 pub mod config;
 pub mod container;
 pub mod credentials;
+pub mod egress;
 pub mod env_files_cli;
 pub mod image;
 pub mod mount_cli;

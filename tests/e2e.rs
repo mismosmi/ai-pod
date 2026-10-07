@@ -824,6 +824,7 @@ fn e2e_service_start_reach_cleanup() {
         &rt,
         workspace,
         session_id,
+        None,
         SERVICE_TEST_IMAGE,
         "db",
         &[("MARKER".to_string(), "hello".to_string())],
@@ -917,6 +918,7 @@ fn e2e_service_stop_respects_parent_label() {
         &rt,
         workspace,
         session_a,
+        None,
         SERVICE_TEST_IMAGE,
         "svc",
         &[],
@@ -961,6 +963,7 @@ fn e2e_service_name_collision_within_session() {
         &rt,
         workspace,
         session_id,
+        None,
         SERVICE_TEST_IMAGE,
         "dup",
         &[],
@@ -972,6 +975,7 @@ fn e2e_service_name_collision_within_session() {
         &rt,
         workspace,
         session_id,
+        None,
         SERVICE_TEST_IMAGE,
         "dup",
         &[],
@@ -986,4 +990,107 @@ fn e2e_service_name_collision_within_session() {
     service::cleanup_services_for_session(&rt, session_id);
     cleanup_container(&rt, &main_name);
     cleanup_network(&rt, &net);
+}
+
+// ---------------------------------------------------------------------------
+// Egress filtering
+// ---------------------------------------------------------------------------
+
+use ai_pod::egress;
+
+/// A container on the filtered network reaches the upstream proxy through the
+/// gateway (port 3128 on the host-gateway name) but has no direct route out,
+/// and `cleanup_for_session` removes the gateway again. The production server
+/// stands in for the upstream proxy: it's an HTTP server on the host.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_egress_gateway_forwards_proxy_and_blocks_direct_access() {
+    let rt = match try_runtime() {
+        Some(rt) => rt,
+        None => {
+            eprintln!("SKIPPED: no container runtime (docker/podman) available");
+            return;
+        }
+    };
+    let tag = shared_image_tag(&rt);
+
+    let port = find_free_port();
+    let server_rt = rt.clone();
+    let (_server_dir, server_config) = make_test_config();
+    let server_handle = tokio::spawn(async move {
+        let _ = server::run_server(port, server_config, server_rt).await;
+    });
+    let client = reqwest::Client::new();
+    let health_url = format!("http://127.0.0.1:{}/health", port);
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if client.get(&health_url).send().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(ready.is_ok(), "server did not become ready within 5s");
+
+    let ws_dir = tempfile::TempDir::new().unwrap();
+    let workspace = ws_dir.path();
+    let session_id = "e2eegrs0";
+    let cfg = egress::EgressConfig::Proxy {
+        address: format!("localhost:{}", port),
+    };
+    let session = egress::start(&rt, workspace, session_id, &cfg, false).expect("egress::start");
+    assert_eq!(session.network, egress::filtered_network_name(workspace));
+
+    let curl = |url: &str, extra: &[&str]| {
+        let mut args: Vec<String> = vec![
+            "run".into(),
+            "--rm".into(),
+            "--network".into(),
+            session.network.clone(),
+            session.add_host_arg.clone(),
+        ];
+        args.push(tag.into());
+        args.extend(["curl", "-s", "--max-time", "10"].map(String::from));
+        args.extend(extra.iter().map(|s| s.to_string()));
+        args.push(url.into());
+        rt.command().args(&args).output().unwrap()
+    };
+
+    // Through the gateway's proxy port to the "upstream" on the host.
+    let proxied = curl(
+        &format!("http://{}:{}/health", rt.host_gateway(), egress::PROXY_PORT),
+        &["-f"],
+    );
+    assert!(
+        proxied.status.success(),
+        "proxy port via gateway failed: {}",
+        String::from_utf8_lossy(&proxied.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&proxied.stdout).trim(), "ok");
+
+    // No direct route to the internet.
+    let direct = curl("http://1.1.1.1", &["--noproxy", "*"]);
+    assert!(
+        !direct.status.success(),
+        "direct internet access from the filtered network should fail"
+    );
+
+    egress::cleanup_for_session(&rt, session_id);
+    let left = rt
+        .command()
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("name={}", egress::gateway_container_name(workspace, session_id)),
+            "--format",
+            "{{.Names}}",
+        ])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&left.stdout).trim().is_empty());
+
+    egress::remove_filtered_network(&rt, workspace);
+    cleanup_network(&rt, &workspace::service_network_name(workspace));
+    server_handle.abort();
 }

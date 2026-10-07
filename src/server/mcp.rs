@@ -414,6 +414,10 @@ async fn handle_start_service(
         commands::ApprovalOutcome::Approved | commands::ApprovalOutcome::AlwaysAllow => {}
     }
 
+    // Sessions with egress filtering run on an internal network; their
+    // services must join that one, both to be reachable and to stay filtered.
+    let network = crate::config::SessionState::load_from_dir(&state.config_dir, session_id)
+        .and_then(|s| s.network);
     let rt = rt.clone();
     let workspace_owned = workspace.to_path_buf();
     let session_owned = session_id.to_string();
@@ -422,6 +426,7 @@ async fn handle_start_service(
             &rt,
             &workspace_owned,
             &session_owned,
+            network.as_deref(),
             &image,
             &name,
             &env_pairs,
@@ -589,6 +594,7 @@ mod tests {
         };
         crate::config::SessionState {
             runtime: RuntimeKind::Docker,
+            network: None,
         }
         .save(&config, "sess42")
         .unwrap();
