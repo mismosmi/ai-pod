@@ -210,7 +210,9 @@ async fn sweep_orphan_services_one(rt: &ContainerRuntime) {
             let labels = parts.next().unwrap_or("");
             // Skip containers that are themselves services — their parent label
             // makes them ineligible to be a "main" container.
-            if labels.contains("ai-pod-service=true") {
+            if labels.contains(crate::service::SERVICE_LABEL)
+                || labels.contains(crate::egress::EGRESS_LABEL)
+            {
                 continue;
             }
             if let Some(sid) = crate::workspace::session_id_from_container_name(name) {
@@ -219,23 +221,26 @@ async fn sweep_orphan_services_one(rt: &ContainerRuntime) {
         }
     }
 
-    // List services and reap any whose parent session isn't live.
-    let services = rt
-        .async_command()
-        .args([
-            "ps",
-            "-a",
-            "--filter",
-            "label=ai-pod-service=true",
-            "--format",
-            "{{.Names}}\t{{.Labels}}",
-        ])
-        .output()
-        .await;
-    let services = match services {
-        Ok(o) => o.stdout,
-        Err(_) => return,
-    };
+    // List services and egress gateways/proxies, and reap any whose parent
+    // session isn't live.
+    let mut services = Vec::new();
+    for label in [crate::service::SERVICE_LABEL, crate::egress::EGRESS_LABEL] {
+        if let Ok(o) = rt
+            .async_command()
+            .args([
+                "ps",
+                "-a",
+                "--filter",
+                &format!("label={}", label),
+                "--format",
+                "{{.Names}}\t{{.Labels}}",
+            ])
+            .output()
+            .await
+        {
+            services.extend_from_slice(&o.stdout);
+        }
+    }
     for line in String::from_utf8_lossy(&services).lines() {
         let mut parts = line.splitn(2, '\t');
         let name = parts.next().unwrap_or("");
