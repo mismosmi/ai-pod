@@ -992,7 +992,11 @@ pub fn launch_container(
 
     // Record the runtime for this session before the container starts, so the
     // shared server runs service containers on the same runtime.
-    crate::config::SessionState { runtime: rt.kind }.save(config, &session_id)?;
+    crate::config::SessionState {
+        runtime: rt.kind,
+        network: None,
+    }
+    .save(config, &session_id)?;
 
     refresh_claude_mcp_in_volume(
         rt,
@@ -1020,7 +1024,6 @@ pub fn launch_container(
 
     refresh_skill_in_volume(rt, config, &volume_name, &prefix, image)?;
 
-    let add_host = rt.add_host_arg();
     let host_gw_env = format!("HOST_GATEWAY={}", rt.host_gateway());
     let server_url_env = format!("AI_POD_SERVER_URL={}", rt.server_url());
     let opencode_config_env = format!(
@@ -1044,7 +1047,15 @@ pub fn launch_container(
     // be added to additional networks), so any later `start_service` call would
     // fail. Doing it here makes service-container requests work on every
     // runtime without restarting the session.
-    let service_net = crate::service::ensure_service_network(rt, workspace)?;
+    let net = session_network(
+        rt,
+        config,
+        workspace,
+        &session_id,
+        project_state.egress.as_ref(),
+        playwright,
+        publish,
+    )?;
 
     let mut run_cmd = rt.command();
     run_cmd.args(["run", "--rm", "-it"]);
@@ -1054,7 +1065,7 @@ pub fn launch_container(
         "--label",
         "managed-by=ai-pod",
         "--network",
-        &service_net,
+        &net.network,
         "-v",
         &format!("{}:{}:z", volume_name, CONTAINER_HOME),
         "--workdir",
@@ -1067,8 +1078,11 @@ pub fn launch_container(
     for arg in &mask_args {
         run_cmd.arg(arg);
     }
+    for env in &net.env {
+        run_cmd.args(["-e", env]);
+    }
     run_cmd.args([
-        &add_host,
+        &net.add_host_arg,
         "-e",
         &host_gw_env,
         "-e",
@@ -1097,6 +1111,7 @@ pub fn launch_container(
     // agent started for this session. Best-effort: this is also covered by the
     // server's periodic orphan sweep if the CLI was killed.
     crate::service::cleanup_services_for_session(rt, &session_id);
+    crate::egress::cleanup_for_session(rt, &session_id);
     let _ = std::fs::remove_file(config.session_state_file(&session_id));
     let _ = run_status;
 
@@ -1126,7 +1141,11 @@ pub fn run_in_container(
 
     // Record the runtime for this session before the container starts, so the
     // shared server runs service containers on the same runtime.
-    crate::config::SessionState { runtime: rt.kind }.save(config, &session_id)?;
+    crate::config::SessionState {
+        runtime: rt.kind,
+        network: None,
+    }
+    .save(config, &session_id)?;
 
     // Init home volume if it doesn't exist
     if !volume_exists(rt, &volume_name)? {
@@ -1182,7 +1201,15 @@ pub fn run_in_container(
     // See the matching comment in launch_container — main goes on the
     // per-workspace service network at launch so service containers can be
     // attached later on rootless podman.
-    let service_net = crate::service::ensure_service_network(rt, workspace)?;
+    let net = session_network(
+        rt,
+        config,
+        workspace,
+        &session_id,
+        project_state.egress.as_ref(),
+        playwright,
+        publish,
+    )?;
 
     // Without a tty on stdin (e.g. an IDE driving ai-pod over stdio for
     // ACP), `-t` would allocate a pseudo-TTY that mangles the JSON-RPC
@@ -1197,7 +1224,7 @@ pub fn run_in_container(
         "--label".into(),
         "managed-by=ai-pod".into(),
         "--network".into(),
-        service_net,
+        net.network,
         "-v".into(),
         format!("{}:{}:z", volume_name, CONTAINER_HOME),
         "--workdir".into(),
@@ -1209,8 +1236,11 @@ pub fn run_in_container(
     run_args.extend(workspace_mounts);
     run_args.extend(user_mount_args);
     run_args.extend(mask_args);
+    for env in net.env {
+        run_args.extend(["-e".into(), env]);
+    }
     run_args.extend_from_slice(&[
-        rt.add_host_arg(),
+        net.add_host_arg,
         "-e".into(),
         format!("HOST_GATEWAY={}", rt.host_gateway()),
         "-e".into(),
@@ -1247,6 +1277,7 @@ pub fn run_in_container(
         .context("Failed to run command in container")?;
 
     crate::service::cleanup_services_for_session(rt, &session_id);
+    crate::egress::cleanup_for_session(rt, &session_id);
     let _ = std::fs::remove_file(config.session_state_file(&session_id));
 
     if !status.success() {
@@ -1254,6 +1285,47 @@ pub fn run_in_container(
     }
 
     Ok(())
+}
+
+/// The per-workspace service network by default; with egress filtering
+/// configured, the internal filtered network behind a per-session gateway.
+fn session_network(
+    rt: &ContainerRuntime,
+    config: &AppConfig,
+    workspace: &Path,
+    session_id: &str,
+    egress: Option<&crate::egress::EgressConfig>,
+    playwright: bool,
+    publish: &[String],
+) -> Result<crate::egress::EgressSession> {
+    let Some(egress) = egress else {
+        return Ok(crate::egress::EgressSession {
+            network: crate::service::ensure_service_network(rt, workspace)?,
+            add_host_arg: rt.add_host_arg(),
+            env: Vec::new(),
+        });
+    };
+
+    eprintln!(
+        "{} network access filtered {}",
+        "Egress:".blue().bold(),
+        egress.describe()
+    );
+    if !publish.is_empty() {
+        eprintln!(
+            "{} published ports may not be reachable: the container is on an internal network.",
+            "Warning:".yellow().bold()
+        );
+    }
+    let session = crate::egress::start(rt, workspace, session_id, egress, playwright)?;
+    // Let the server put this session's service containers on the same
+    // internal network.
+    crate::config::SessionState {
+        runtime: rt.kind,
+        network: Some(session.network.clone()),
+    }
+    .save(config, session_id)?;
+    Ok(session)
 }
 
 pub fn list_containers(rt: &ContainerRuntime) -> Result<()> {
@@ -1381,8 +1453,9 @@ pub fn clean_container(
         let _ = remove_mask_volume(rt, workspace, dir);
     }
 
-    // Remove the per-workspace service-container network if it exists.
+    // Remove the per-workspace service-container networks if they exist.
     crate::service::remove_service_network(rt, workspace);
+    crate::egress::remove_filtered_network(rt, workspace);
 
     Ok(())
 }
