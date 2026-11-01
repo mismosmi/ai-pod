@@ -30,5 +30,11 @@ jobs:
       - name: Run unit tests
         run: cargo test --lib
 
+      - name: Test OpenCode install shim
+        run: bash tests/opencode_shim.sh
+
+      - name: Test OpenCode notification plugin
+        run: node --test tests/opencode_plugin.mjs
+
       - name: Run e2e tests
         run: cargo test --test e2e
