@@ -52,7 +52,7 @@ pub struct Cli {
 
     /// Start Playwright MCP on the host and expose it to the agent in the
     /// container, so it drives a real browser with your own logins.
-    /// The MCP entry is always configured; without this flag it may fail to connect.
+    /// Without this flag the managed Playwright MCP entry is removed.
     #[arg(long)]
     pub playwright: bool,
 }

@@ -181,8 +181,8 @@ and can take a while; output goes to `~/.ai-pod/playwright.log`.
 
 The server is stopped again when the session that started it exits; a server
 that was already running (another session, or one you started by hand) is
-reused and left alone. The `playwright` MCP entry is always present. Without
-`--playwright`, it may fail to connect; agents are instructed to ask you to
+reused and left alone. The managed `playwright` MCP entry is added with
+`--playwright` and removed without it. Agents are instructed to ask you to
 run `ai-pod --playwright` when they need browser access.
 
 > **Note:** the Playwright MCP server binds all interfaces and has no
@@ -244,9 +244,9 @@ Home volumes carry the creating ai-pod version as a label. ai-pod injects settin
 
 Codex is installed as a complete package under `/usr/lib/codex`, with native executable symlinks in `/usr/bin` so every container user can run it. Keeping the package isolated supports Codex’s background server.
 
-Session credentials are passed as environment variables to the main container. Claude's persistent MCP entry references `${AI_POD_SERVER_URL}`, `${AI_POD_API_KEY}`, and `${AI_POD_SESSION_ID}`; Codex uses `env_http_headers`. OpenCode receives its runtime configuration through `OPENCODE_CONFIG_CONTENT`. Existing homes are migrated once to this format; subsequent launches leave these files unchanged.
+Session credentials are passed as environment variables to the main container. Claude's persistent MCP entry references `${AI_POD_SERVER_URL}`, `${AI_POD_API_KEY}`, and `${AI_POD_SESSION_ID}`; Codex uses `env_http_headers`. OpenCode receives its runtime configuration through `OPENCODE_CONFIG_CONTENT`. Existing homes are migrated once to this format; session credentials do not require config rewrites.
 
-Playwright MCP is always configured for all three agents. `--playwright` starts the host server; without it, the MCP connection may fail. The injected general `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md` each tell the agent to ask the user to run `ai-pod --playwright` when browser access is needed. No Playwright launcher scripts or per-launch CLI overrides are used.
+Playwright MCP is configured only with `--playwright`. At launch, ai-pod reads the actual Claude and Codex config files through the stopped main container and updates them only if needed. It then starts that same container; no separate helper container or Playwright state tag is used. OpenCode receives its per-launch selection through `OPENCODE_CONFIG_CONTENT`. Settings, skills, plugins, and auth retain their version gate. The general `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md` explain how to request browser access.
 
 ---
 

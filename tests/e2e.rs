@@ -1164,7 +1164,14 @@ test -z "${AI_POD_CODEX_PLAYWRIGHT_CONFIG+x}"
     );
     std::fs::write(config.claude_md_path(), &large_instructions).unwrap();
 
+    let events_since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .to_string();
+    let calls = std::cell::Cell::new(0usize);
     let run = |script: &str, playwright: bool| {
+        calls.set(calls.get() + 1);
         container::run_in_container(
             &rt,
             &config,
@@ -1199,20 +1206,35 @@ test -z "${AI_POD_CODEX_PLAYWRIGHT_CONFIG+x}"
         inspect[0]["Labels"][container::HOME_VERSION_LABEL],
         env!("CARGO_PKG_VERSION")
     );
+    let absent = r#"! grep -q '8931/mcp' "$HOME/.claude.json" && ! grep -q '8931/mcp' "$HOME/.codex/config.toml" && ! printf %s "$OPENCODE_CONFIG_CONTENT" | grep -q '8931/mcp'"#;
+    let present = r#"grep -q '8931/mcp' "$HOME/.claude.json" && grep -q '8931/mcp' "$HOME/.codex/config.toml" && printf %s "$OPENCODE_CONFIG_CONTENT" | grep -q '8931/mcp'"#;
+    run(absent, false);
     run(
-        r#"grep -q 'Keep my Codex preferences.' "$HOME/.codex/AGENTS.md" && grep -q 'Keep my Claude preferences.' "$HOME/.claude/CLAUDE.md" && grep -q 'ai-pod --playwright' "$HOME/.codex/AGENTS.md" && grep -q 'ai-pod --playwright' "$HOME/.claude/CLAUDE.md" && grep -q '8931/mcp' "$HOME/.claude.json" && grep -q '8931/mcp' "$HOME/.codex/config.toml" && printf %s "$OPENCODE_CONFIG_CONTENT" | grep -q '8931/mcp'"#,
-        false,
-    );
-    run(
-        r#"test "$AI_POD_API_KEY" = key && test -n "$AI_POD_SESSION_ID" && grep -Fq '${AI_POD_SESSION_ID}' "$HOME/.claude.json" && grep -q env_http_headers "$HOME/.codex/config.toml" && cd "$HOME" && sha256sum .claude.json .codex/config.toml > .config-checksums"#,
+        r#"grep -q 'Keep my Codex preferences.' "$HOME/.codex/AGENTS.md" && grep -q 'ai-pod --playwright' "$HOME/.claude/CLAUDE.md" && cd "$HOME" && sha256sum .claude.json .codex/config.toml > .config-checksums"#,
         false,
     );
     run(
         r#"cd "$HOME" && sha256sum -c .config-checksums && test "$(cat .claude/skills/ai-pod/SKILL.md)" = preserved && test "$(cat .codex/auth.json)" = auth"#,
+        false,
+    );
+    run(present, true);
+    run(
+        r#"cd "$HOME" && sha256sum .claude.json .codex/config.toml > .config-checksums"#,
         true,
     );
+    run(
+        r#"cd "$HOME" && sha256sum -c .config-checksums && test "$(cat .claude/skills/ai-pod/SKILL.md)" = preserved"#,
+        true,
+    );
+    // Editing the file directly must be detected without relying on a state tag.
+    run(
+        r#"sed -i '/^\[mcp_servers\.playwright\]/,$d' "$HOME/.codex/config.toml""#,
+        true,
+    );
+    run(present, true);
     for playwright in [false, true] {
         for agent in ["claude", "codex"] {
+            calls.set(calls.get() + 1);
             container::run_in_container(
                 &rt,
                 &config,
@@ -1229,6 +1251,11 @@ test -z "${AI_POD_CODEX_PLAYWRIGHT_CONFIG+x}"
             .unwrap();
         }
     }
+    run(absent, false);
+    run(
+        r#"cd "$HOME" && sha256sum .claude.json .codex/config.toml > .config-checksums"#,
+        false,
+    );
     run(
         r#"cd "$HOME" && sha256sum -c .config-checksums && printf old-version > .ai-pod-version"#,
         false,
@@ -1236,6 +1263,52 @@ test -z "${AI_POD_CODEX_PLAYWRIGHT_CONFIG+x}"
     run(
         r#"grep -q '^name: ai-pod$' "$HOME/.claude/skills/ai-pod/SKILL.md" && test "$(cat "$HOME/.codex/auth.json")" = auth"#,
         false,
+    );
+    let until = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 1)
+    .to_string();
+    let events = rt
+        .command()
+        .args([
+            "events",
+            "--since",
+            &events_since,
+            "--until",
+            &until,
+            "--filter",
+            "type=container",
+            "--filter",
+            "event=create",
+            "--format",
+            "{{json .}}",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        events.status.success(),
+        "{}",
+        String::from_utf8_lossy(&events.stderr)
+    );
+    let prefix = workspace::container_prefix(ws.path());
+    let names: std::collections::HashSet<String> = String::from_utf8(events.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| {
+            let event: serde_json::Value = serde_json::from_str(line).unwrap();
+            event["Name"]
+                .as_str()
+                .or_else(|| event["Actor"]["Attributes"]["name"].as_str())
+                .map(|n| n.trim_start_matches('/').to_owned())
+        })
+        .filter(|name| name.starts_with(&format!("{prefix}-")))
+        .collect();
+    assert_eq!(
+        names.len(),
+        calls.get(),
+        "Each launch must create only its main container: {names:?}"
     );
     container::clean_container(&rt, &config, ws.path()).unwrap();
 }

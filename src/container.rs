@@ -344,7 +344,7 @@ fn opencode_config_content(
     server_url: &str,
     api_key: &str,
     session_id: &str,
-    host_gateway: &str,
+    playwright: Option<&str>,
 ) -> String {
     let mut value = serde_json::json!({
         "$schema": "https://opencode.ai/config.json",
@@ -360,9 +360,9 @@ fn opencode_config_content(
             }
         }
     });
-    // The server is always configured. Without --playwright, connection may
-    // fail; agents can ask the user to enable host browser access when needed.
-    value["mcp"]["playwright"] = playwright_mcp_entry(host_gateway, true);
+    if let Some(host_gateway) = playwright {
+        value["mcp"]["playwright"] = playwright_mcp_entry(host_gateway, true);
+    }
     serde_json::to_string(&value).expect("serialize opencode config content")
 }
 
@@ -381,7 +381,12 @@ fn opencode_config_content(
 ///     and OpenCode's YOLO mode; a user's stricter value is intentionally
 ///     overridden when versioned defaults are installed)
 ///   - `notify` (points at the in-container notify helper)
-fn codex_config_merge(existing: &str, server_url: &str, host_gateway: &str) -> String {
+fn codex_config_merge(
+    existing: &str,
+    server_url: &str,
+    host_gateway: &str,
+    playwright: bool,
+) -> String {
     // Missing OR unparsable config -> start from an empty document.
     let mut doc = existing
         .parse::<toml_edit::DocumentMut>()
@@ -395,12 +400,17 @@ fn codex_config_merge(existing: &str, server_url: &str, host_gateway: &str) -> S
     notify.push("/usr/local/bin/ai-pod-codex-notify");
     doc["notify"] = toml_edit::value(notify);
 
-    update_codex_connection(&mut doc, server_url, host_gateway);
+    update_codex_connection(&mut doc, server_url, host_gateway, playwright);
 
     doc.to_string()
 }
 
-fn update_codex_connection(doc: &mut toml_edit::DocumentMut, server_url: &str, host_gateway: &str) {
+fn update_codex_connection(
+    doc: &mut toml_edit::DocumentMut,
+    server_url: &str,
+    host_gateway: &str,
+    playwright: bool,
+) {
     let server = &mut doc["mcp_servers"]["ai-pod"];
     server["url"] = toml_edit::value(format!("{}/mcp", server_url));
     // Migrate literal headers written by older ai-pod versions without
@@ -414,10 +424,63 @@ fn update_codex_connection(doc: &mut toml_edit::DocumentMut, server_url: &str, h
     }
     server["env_http_headers"]["X-Api-Key"] = toml_edit::value("AI_POD_API_KEY");
     server["env_http_headers"]["X-Ai-Pod-Session-Id"] = toml_edit::value("AI_POD_SESSION_ID");
-    let playwright = &mut doc["mcp_servers"]["playwright"];
-    playwright["url"] = toml_edit::value(crate::playwright::mcp_url(host_gateway));
-    playwright["http_headers"]["Host"] = toml_edit::value(crate::playwright::host_header());
-    playwright["enabled"] = toml_edit::value(true);
+    sync_codex_playwright(doc, host_gateway, playwright);
+}
+
+fn managed_playwright_url(url: Option<&str>) -> bool {
+    url.is_some_and(|url| {
+        ["host.containers.internal", "host.docker.internal"]
+            .iter()
+            .any(|host| url == crate::playwright::mcp_url(host))
+    })
+}
+
+fn sync_claude_playwright(
+    servers: &mut serde_json::Map<String, serde_json::Value>,
+    host: &str,
+    enabled: bool,
+) {
+    if enabled {
+        servers.insert("playwright".into(), playwright_mcp_entry(host, false));
+    } else if managed_playwright_url(servers.get("playwright").and_then(|v| v["url"].as_str())) {
+        servers.remove("playwright");
+    }
+}
+
+/// Compare owned fields semantically so custom formatting and unrelated settings
+/// do not cause a rewrite on every launch.
+fn sync_codex_playwright(doc: &mut toml_edit::DocumentMut, host: &str, enabled: bool) -> bool {
+    let current = doc.get("mcp_servers").and_then(|v| v.get("playwright"));
+    if !enabled {
+        if managed_playwright_url(current.and_then(|v| v.get("url")).and_then(|v| v.as_str())) {
+            doc.get_mut("mcp_servers")
+                .and_then(|v| v.as_table_like_mut())
+                .unwrap()
+                .remove("playwright");
+            return true;
+        }
+        return false;
+    }
+    let url = crate::playwright::mcp_url(host);
+    let header = crate::playwright::host_header();
+    if current.and_then(|v| v.get("url")).and_then(|v| v.as_str()) == Some(url.as_str())
+        && current
+            .and_then(|v| v.get("http_headers"))
+            .and_then(|v| v.get("Host"))
+            .and_then(|v| v.as_str())
+            == Some(header.as_str())
+        && current
+            .and_then(|v| v.get("enabled"))
+            .map(|v| v.as_bool() == Some(true))
+            .unwrap_or(true)
+    {
+        return false;
+    }
+    let server = &mut doc["mcp_servers"]["playwright"];
+    server["url"] = toml_edit::value(url);
+    server["http_headers"]["Host"] = toml_edit::value(header);
+    server["enabled"] = toml_edit::value(true);
+    true
 }
 
 fn read_git_global(key: &str) -> Option<String> {
@@ -525,13 +588,14 @@ fn execute_main_container(
     rt: &ContainerRuntime,
     mut command: std::process::Command,
     name: &str,
-    script: Option<&str>,
+    config: &AppConfig,
+    playwright: bool,
     script_path: &str,
     user: &ImageUser,
 ) -> Result<std::process::ExitStatus> {
-    if let Some(script) = script {
-        checked_status(command.status()?, "create main container")?;
-        let result = (|| -> Result<std::process::ExitStatus> {
+    checked_status(command.status()?, "create main container")?;
+    let result = (|| -> Result<std::process::ExitStatus> {
+        if let Some(script) = prepare_home_volume(rt, config, name, &user.home, playwright)? {
             let mut archive = tempfile::tempfile()?;
             {
                 let mut builder = tar::Builder::new(&mut archive);
@@ -558,26 +622,19 @@ fn execute_main_container(
                     .status()?,
                 "copy private startup script",
             )?;
-            rt.command()
-                .args(["start", "--attach", "--interactive", name])
-                .stdin(Stdio::inherit())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .status()
-                .context("Failed to start container")
-        })();
-        if result.is_err() {
-            let _ = rt.command().args(["rm", "--force", name]).status();
         }
-        result
-    } else {
-        command
+        rt.command()
+            .args(["start", "--attach", "--interactive", name])
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status()
-            .context("Failed to run container")
+            .context("Failed to start container")
+    })();
+    if result.is_err() {
+        let _ = rt.command().args(["rm", "--force", name]).status();
     }
+    result
 }
 
 fn image_command(rt: &ContainerRuntime, image: &str) -> Result<Vec<String>> {
@@ -609,7 +666,7 @@ fn home_write(script: &mut String, path: &str, content: &str) {
 
 fn read_home_file(
     rt: &ContainerRuntime,
-    helper: &str,
+    container: &str,
     home: &str,
     path: &str,
     tmp: &Path,
@@ -620,7 +677,7 @@ fn read_home_file(
         .command()
         .args([
             "cp",
-            &format!("{helper}:{home}/{path}"),
+            &format!("{container}:{home}/{path}"),
             &target.to_string_lossy(),
         ])
         .output()?;
@@ -637,25 +694,8 @@ fn read_home_file(
     Ok(Some(std::fs::read_to_string(target)?))
 }
 
-/// Persistent settings/auth/plugins/skills are applied only on creation or a
-/// CLI version change. Session values arrive through environment variables.
-/// A stopped helper reads the volume; the main container writes as its USER.
-fn prepare_home_volume(
-    rt: &ContainerRuntime,
-    config: &AppConfig,
-    volume: &str,
-    prefix: &str,
-    image: &str,
-    home: &str,
-) -> Result<Option<String>> {
-    if rt.dry_run {
-        return Ok(None);
-    }
-    // One-time migration for volumes seeded by the earlier literal-header
-    // format at this same development version; subsequent launches skip writes.
-    let version = format!("{}:env-playwright-v2", env!("CARGO_PKG_VERSION"));
-    let fresh = !volume_exists(rt, volume)?;
-    if fresh {
+fn ensure_home_volume(rt: &ContainerRuntime, volume: &str) -> Result<()> {
+    if !volume_exists(rt, volume)? {
         checked_status(
             rt.command()
                 .args([
@@ -671,148 +711,164 @@ fn prepare_home_volume(
             "create home volume",
         )?;
     }
+    Ok(())
+}
+
+const MAIN_BOOTSTRAP: &str = r#"init=$1
+shift
+if [ -f "$init" ]; then exec sh "$init" "$@"; fi
+exec "$@"
+"#;
+
+/// Persistent settings/auth/plugins/skills are applied only on creation or a
+/// CLI version change. Session values arrive through environment variables.
+/// Read the mounted home through the stopped main container; it performs any
+/// required writes as its configured USER when started.
+fn prepare_home_volume(
+    rt: &ContainerRuntime,
+    config: &AppConfig,
+    container: &str,
+    home: &str,
+    playwright: bool,
+) -> Result<Option<String>> {
+    if rt.dry_run {
+        return Ok(None);
+    }
+    // One-time migration for volumes seeded by the earlier literal-header
+    // format at this same development version; subsequent launches skip writes.
+    let version = format!("{}:env-playwright-v2", env!("CARGO_PKG_VERSION"));
     let tmp = tempfile::tempdir()?;
-    let helper = format!("{prefix}-init-{}", new_session_id());
-    checked_status(
-        rt.command()
-            .args([
-                "create",
-                "-i",
-                "--name",
-                &helper,
-                "--label",
-                "managed-by=ai-pod",
-                "-v",
-                &format!("{volume}:{home}:z"),
-                "--entrypoint",
-                "sh",
-                image,
-                "-s",
-            ])
-            .status()?,
-        "create home helper",
-    )?;
-    let result = (|| -> Result<Option<String>> {
-        let previous = read_home_file(rt, &helper, home, HOME_VERSION_FILE, tmp.path())?;
-        let inject = previous.as_deref() != Some(version.as_str());
-        if !inject {
-            return Ok(None);
+    let previous = read_home_file(rt, container, home, HOME_VERSION_FILE, tmp.path())?;
+    let inject = previous.as_deref() != Some(version.as_str());
+    let mut script =
+        "set -eu\nai_pod_start_dir=$PWD\nai_pod_umask=$(umask)\numask 077\ncd \"$HOME\"\n"
+            .to_string();
+    if inject {
+        generate_runtime_settings(config)?;
+        home_write(
+            &mut script,
+            ".claude/settings.json",
+            &std::fs::read_to_string(&config.runtime_settings)?,
+        );
+        for (source, target) in [
+            (config.claude_md_path(), ".claude/CLAUDE.md"),
+            (config.codex_dir().join("AGENTS.md"), ".codex/AGENTS.md"),
+        ] {
+            let existing = if source.exists() {
+                std::fs::read_to_string(source)?
+            } else {
+                read_home_file(rt, container, home, target, tmp.path())?.unwrap_or_default()
+            };
+            home_write(&mut script, target, &with_playwright_guidance(&existing));
         }
-        let mut script =
-            "set -eu\nai_pod_start_dir=$PWD\nai_pod_umask=$(umask)\numask 077\ncd \"$HOME\"\n"
-                .to_string();
-        if inject {
-            generate_runtime_settings(config)?;
+        let plugin = config.config_dir.join("opencode-plugin.js");
+        if plugin.exists() {
             home_write(
                 &mut script,
-                ".claude/settings.json",
-                &std::fs::read_to_string(&config.runtime_settings)?,
+                ".config/opencode/plugins/ai-pod.js",
+                &std::fs::read_to_string(plugin)?,
             );
+        }
+        // Existing auth and user preferences survive upgrades.
+        if previous.is_none() {
             for (source, target) in [
-                (config.claude_md_path(), ".claude/CLAUDE.md"),
-                (config.codex_dir().join("AGENTS.md"), ".codex/AGENTS.md"),
+                (config.home_dir.join(".claude.json"), ".claude.json"),
+                (config.codex_auth_path(), ".codex/auth.json"),
+                (config.codex_config_path(), ".codex/config.toml"),
             ] {
-                let existing = if source.exists() {
-                    std::fs::read_to_string(source)?
-                } else {
-                    read_home_file(rt, &helper, home, target, tmp.path())?.unwrap_or_default()
-                };
-                home_write(&mut script, target, &with_playwright_guidance(&existing));
-            }
-            let plugin = config.config_dir.join("opencode-plugin.js");
-            if plugin.exists() {
-                home_write(
-                    &mut script,
-                    ".config/opencode/plugins/ai-pod.js",
-                    &std::fs::read_to_string(plugin)?,
-                );
-            }
-            // Existing auth and user preferences survive upgrades.
-            if previous.is_none() {
-                for (source, target) in [
-                    (config.home_dir.join(".claude.json"), ".claude.json"),
-                    (config.codex_auth_path(), ".codex/auth.json"),
-                    (config.codex_config_path(), ".codex/config.toml"),
-                ] {
-                    if source.exists() {
-                        script.push_str(&format!("if [ ! -e {} ]; then\n", shell_quote(target)));
-                        home_write(&mut script, target, &std::fs::read_to_string(source)?);
-                        script.push_str("fi\n");
-                    }
+                if source.exists() {
+                    script.push_str(&format!("if [ ! -e {} ]; then\n", shell_quote(target)));
+                    home_write(&mut script, target, &std::fs::read_to_string(source)?);
+                    script.push_str("fi\n");
                 }
-            }
-            if let Some(auth) = read_home_file(rt, &helper, home, ".codex/auth.json", tmp.path())? {
-                // Re-home legacy root-owned copies without replacing the login.
-                home_write(&mut script, ".codex/auth.json", &auth);
-            }
-            let mut git = String::from("[user]\n");
-            for key in ["name", "email"] {
-                if let Some(value) = read_git_global(&format!("user.{key}")) {
-                    git.push_str(&format!("\t{key} = {value}\n"));
-                }
-            }
-            if git != "[user]\n" {
-                home_write(&mut script, ".gitconfig", &git);
-            }
-            for path in crate::skill::skill_paths("") {
-                home_write(
-                    &mut script,
-                    path.trim_start_matches('/'),
-                    &crate::skill::render(rt),
-                );
             }
         }
-        let claude = read_home_file(rt, &helper, home, ".claude.json", tmp.path())?.or_else(|| {
-            previous
-                .is_none()
-                .then(|| std::fs::read_to_string(config.home_dir.join(".claude.json")).ok())
-                .flatten()
-        });
-        let mut value: serde_json::Value = claude
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_else(|| serde_json::json!({}));
-        let obj = value
-            .as_object_mut()
-            .context("claude.json root must be an object")?;
+        if let Some(auth) = read_home_file(rt, container, home, ".codex/auth.json", tmp.path())? {
+            // Re-home legacy root-owned copies without replacing the login.
+            home_write(&mut script, ".codex/auth.json", &auth);
+        }
+        let mut git = String::from("[user]\n");
+        for key in ["name", "email"] {
+            if let Some(value) = read_git_global(&format!("user.{key}")) {
+                git.push_str(&format!("\t{key} = {value}\n"));
+            }
+        }
+        if git != "[user]\n" {
+            home_write(&mut script, ".gitconfig", &git);
+        }
+        for path in crate::skill::skill_paths("") {
+            home_write(
+                &mut script,
+                path.trim_start_matches('/'),
+                &crate::skill::render(rt),
+            );
+        }
+    }
+    let claude = read_home_file(rt, container, home, ".claude.json", tmp.path())?.or_else(|| {
+        previous
+            .is_none()
+            .then(|| std::fs::read_to_string(config.home_dir.join(".claude.json")).ok())
+            .flatten()
+    });
+    let mut value: serde_json::Value = match claude.as_deref() {
+        Some(text) => serde_json::from_str(text).context("Invalid Claude configuration")?,
+        None => serde_json::json!({}),
+    };
+    let original_claude = value.clone();
+    let obj = value
+        .as_object_mut()
+        .context("claude.json root must be an object")?;
+    if inject || playwright || obj.contains_key("mcpServers") {
         let servers = obj
             .entry("mcpServers")
             .or_insert_with(|| serde_json::json!({}));
         let servers = servers
             .as_object_mut()
             .context("mcpServers must be an object")?;
-        servers.insert("ai-pod".into(), claude_mcp_entry());
-        servers.insert(
-            "playwright".into(),
-            playwright_mcp_entry(rt.host_gateway(), false),
-        );
+        if inject {
+            servers.insert("ai-pod".into(), claude_mcp_entry());
+        }
+        sync_claude_playwright(servers, rt.host_gateway(), playwright);
+    }
+    let claude_changed = value != original_claude;
+    if inject || claude_changed {
         home_write(
             &mut script,
             ".claude.json",
             &serde_json::to_string_pretty(&value)?,
         );
-        let codex = read_home_file(rt, &helper, home, ".codex/config.toml", tmp.path())?
-            .or_else(|| {
-                previous
-                    .is_none()
-                    .then(|| std::fs::read_to_string(config.codex_config_path()).ok())
-                    .flatten()
-            })
-            .unwrap_or_default();
-        let codex = codex_config_merge(&codex, &rt.server_url(), rt.host_gateway());
-        home_write(&mut script, ".codex/config.toml", &codex);
-        // Only mark success once all writes have completed.
-        if inject {
-            home_write(&mut script, HOME_VERSION_FILE, &version);
-        }
-        script.push_str("cd \"$ai_pod_start_dir\"\numask \"$ai_pod_umask\"\n");
-        script.push_str("exec \"$@\"\n");
-        Ok(Some(script))
-    })();
-    let cleanup = rt.command().args(["rm", "--force", &helper]).status();
-    let script = result?;
-    checked_status(cleanup?, "remove home helper")?;
-    Ok(script)
+    }
+    let codex = read_home_file(rt, container, home, ".codex/config.toml", tmp.path())?
+        .or_else(|| {
+            previous
+                .is_none()
+                .then(|| std::fs::read_to_string(config.codex_config_path()).ok())
+                .flatten()
+        })
+        .unwrap_or_default();
+    let mut codex_doc = codex
+        .parse::<toml_edit::DocumentMut>()
+        .context("Invalid Codex configuration")?;
+    let codex_changed = if inject {
+        codex_doc = codex_config_merge(&codex, &rt.server_url(), rt.host_gateway(), playwright)
+            .parse::<toml_edit::DocumentMut>()?;
+        true
+    } else {
+        sync_codex_playwright(&mut codex_doc, rt.host_gateway(), playwright)
+    };
+    if codex_changed {
+        home_write(&mut script, ".codex/config.toml", &codex_doc.to_string());
+    }
+    if !inject && !claude_changed && !codex_changed {
+        return Ok(None);
+    }
+    // Only mark success once all writes have completed.
+    if inject {
+        home_write(&mut script, HOME_VERSION_FILE, &version);
+    }
+    script.push_str("cd \"$ai_pod_start_dir\"\numask \"$ai_pod_umask\"\n");
+    script.push_str("exec \"$@\"\n");
+    Ok(Some(script))
 }
 
 /// Explicit skill refresh used by tools/tests. Writes as the image user.
@@ -895,7 +951,7 @@ pub fn launch_container(
     }
     .save(config, &session_id)?;
 
-    let home_script = prepare_home_volume(rt, config, &volume_name, &prefix, image, &home)?;
+    ensure_home_volume(rt, &volume_name)?;
 
     let host_gw_env = format!("HOST_GATEWAY={}", rt.host_gateway());
     let server_url_env = format!("AI_POD_SERVER_URL={}", rt.server_url());
@@ -905,7 +961,7 @@ pub fn launch_container(
             &rt.server_url(),
             api_key,
             &session_id,
-            rt.host_gateway(),
+            playwright.then(|| rt.host_gateway()),
         )
     );
 
@@ -932,7 +988,7 @@ pub fn launch_container(
 
     let script_path = format!("{home}/.ai-pod-init-{session_id}.sh");
     let mut run_cmd = rt.command();
-    run_cmd.args([if home_script.is_some() { "create" } else { "run" }, "--rm", "-it"]);
+    run_cmd.args(["create", "--rm", "-it"]);
     run_cmd.args([
         "--name",
         &container_name,
@@ -973,13 +1029,9 @@ pub fn launch_container(
     for port in publish {
         run_cmd.args(["--publish", port]);
     }
-    if home_script.is_some() {
-        run_cmd.args(["--entrypoint", "sh", image, &script_path]);
-        run_cmd.args(image_command(rt, image)?);
-    } else {
-        run_cmd.arg(image);
-    }
-    let run_status = execute_main_container(rt, run_cmd, &container_name, home_script.as_deref(), &script_path, &user)?;
+    run_cmd.args(["--entrypoint", "sh", image, "-c", MAIN_BOOTSTRAP, "ai-pod-init", &script_path]);
+    run_cmd.args(image_command(rt, image)?);
+    let run_status = execute_main_container(rt, run_cmd, &container_name, config, playwright, &script_path, &user)?;
 
     // Main container has exited (cleanly or otherwise); tear down anything the
     // agent started for this session. Best-effort: this is also covered by the
@@ -1022,7 +1074,7 @@ pub fn run_in_container(
 
     let user = image_user(rt, config, image)?;
     let home = &user.home;
-    let home_script = prepare_home_volume(rt, config, &volume_name, &container_name, image, &home)?;
+    ensure_home_volume(rt, &volume_name)?;
 
     eprintln!(
         "{} {} {}",
@@ -1055,7 +1107,7 @@ pub fn run_in_container(
     let stdio_flag = if interactive { "-it" } else { "-i" };
     let script_path = format!("{home}/.ai-pod-init-{session_id}.sh");
     let mut run_args: Vec<String> = vec![
-        if home_script.is_some() { "create".into() } else { "run".into() },
+        "create".into(),
         "--rm".into(),
         stdio_flag.into(),
     ];
@@ -1099,22 +1151,19 @@ pub fn run_in_container(
             &rt.server_url(),
             api_key,
             &session_id,
-            rt.host_gateway(),
+            playwright.then(|| rt.host_gateway()),
         )
         ),
     ]);
-    if home_script.is_some() {
-        run_args.extend([
-            "--entrypoint".into(), "sh".into(), image.into(), script_path.clone(), command.into(),
-        ]);
-    } else {
-        run_args.extend(["--entrypoint".into(), command.into(), image.into()]);
-    }
+    run_args.extend([
+        "--entrypoint".into(), "sh".into(), image.into(), "-c".into(), MAIN_BOOTSTRAP.into(),
+        "ai-pod-init".into(), script_path.clone(), command.into(),
+    ]);
     run_args.extend_from_slice(args);
 
     let mut run_cmd = rt.command();
     run_cmd.args(&run_args);
-    let status = execute_main_container(rt, run_cmd, &container_name, home_script.as_deref(), &script_path, &user)?;
+    let status = execute_main_container(rt, run_cmd, &container_name, config, playwright, &script_path, &user)?;
 
     crate::service::cleanup_services_for_session(rt, &session_id);
     crate::egress::cleanup_for_session(rt, &session_id);
@@ -1502,7 +1551,7 @@ mod tests {
             "http://host.containers.internal:7822",
             "k1",
             "s2",
-            "host.containers.internal",
+            None,
         );
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["mcp"]["ai-pod"]["type"], "remote");
@@ -1516,12 +1565,12 @@ mod tests {
     }
 
     #[test]
-    fn opencode_config_always_includes_playwright() {
+    fn opencode_config_includes_playwright_when_enabled() {
         let s = opencode_config_content(
             "http://host.containers.internal:7822",
             "k1",
             "s2",
-            "host.containers.internal",
+            Some("host.containers.internal"),
         );
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["mcp"]["playwright"]["type"], "remote");
@@ -1534,7 +1583,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_playwright_entry_is_permanent_http_config() {
+    fn claude_playwright_entry_is_http_config() {
         let entry = playwright_mcp_entry("host.containers.internal", false);
         assert_eq!(entry["type"], "http");
         assert_eq!(entry["url"], "http://host.containers.internal:8931/mcp");
@@ -1543,13 +1592,12 @@ mod tests {
     }
 
     #[test]
-    fn codex_config_always_enables_playwright() {
+    fn codex_config_enables_playwright_when_requested() {
         let existing = "[mcp_servers.playwright]\nurl = \"http://old-host/mcp\"\nenabled = false\n";
         let out = codex_config_merge(
             existing,
             "http://host.containers.internal:7822",
-            "host.containers.internal",
-        );
+            "host.containers.internal", true);
         let doc = out.parse::<toml_edit::DocumentMut>().unwrap();
         let server = &doc["mcp_servers"]["playwright"];
         assert_eq!(
@@ -1561,6 +1609,39 @@ mod tests {
             Some("localhost:8931")
         );
         assert_eq!(server["enabled"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn playwright_config_is_omitted_and_removed_when_disabled() {
+        let opencode: serde_json::Value = serde_json::from_str(&opencode_config_content("http://host", "key", "session", None)).unwrap();
+        assert!(opencode["mcp"]["playwright"].is_null());
+        let mut servers = serde_json::Map::new();
+        servers.insert("other".into(), serde_json::json!({"url":"http://other/mcp"}));
+        sync_claude_playwright(&mut servers, "host.containers.internal", true);
+        sync_claude_playwright(&mut servers, "host.containers.internal", false);
+        assert!(!servers.contains_key("playwright"));
+        assert!(servers.contains_key("other"));
+        let mut doc = codex_config_merge("model = \"mine\"\n", "http://host", "host.containers.internal", true).parse::<toml_edit::DocumentMut>().unwrap();
+        assert!(sync_codex_playwright(&mut doc, "host.containers.internal", false));
+        assert!(doc["mcp_servers"].get("playwright").is_none());
+        assert_eq!(doc["model"].as_str(), Some("mine"));
+        assert!(!sync_codex_playwright(&mut doc, "host.containers.internal", false));
+    }
+
+    #[test]
+    fn matching_playwright_config_keeps_custom_formatting_and_headers() {
+        let input = "# keep this comment\n[mcp_servers.playwright]\nurl='http://host.containers.internal:8931/mcp'\nenabled=true\n[mcp_servers.playwright.http_headers]\nHost='localhost:8931'\nOther='keep'\n";
+        let mut doc = input.parse::<toml_edit::DocumentMut>().unwrap();
+        assert!(!sync_codex_playwright(&mut doc, "host.containers.internal", true));
+        assert_eq!(doc.to_string(), input);
+        let implicit = input.replace("enabled=true\n", "");
+        let mut doc = implicit.parse::<toml_edit::DocumentMut>().unwrap();
+        assert!(!sync_codex_playwright(&mut doc, "host.containers.internal", true));
+        assert_eq!(doc.to_string(), implicit);
+        let mut servers = serde_json::Map::new();
+        servers.insert("playwright".into(), serde_json::json!({"url":"http://personal/mcp"}));
+        sync_claude_playwright(&mut servers, "host.containers.internal", false);
+        assert!(servers.contains_key("playwright"));
     }
 
     #[test]
@@ -1581,8 +1662,7 @@ mod tests {
         let out = codex_config_merge(
             "",
             "http://host.containers.internal:7822",
-            "host.containers.internal",
-        );
+            "host.containers.internal", true);
         let doc = out.parse::<toml_edit::DocumentMut>().unwrap();
         assert_eq!(doc["experimental_use_rmcp_client"].as_bool(), Some(true));
         assert_eq!(doc["approval_policy"].as_str(), Some("never"));
@@ -1612,8 +1692,7 @@ mod tests {
         let out = codex_config_merge(
             existing,
             "http://host.containers.internal:7822",
-            "host.containers.internal",
-        );
+            "host.containers.internal", true);
         // The user's key and comment survive (toml_edit, not a typed rewrite).
         assert!(
             out.contains("# my comment"),
@@ -1635,8 +1714,7 @@ mod tests {
         let out = codex_config_merge(
             "",
             "http://host.docker.internal:7822",
-            "host.docker.internal",
-        );
+            "host.docker.internal", true);
         let doc = out.parse::<toml_edit::DocumentMut>().unwrap();
         assert_eq!(
             doc["mcp_servers"]["ai-pod"]["url"].as_str(),
@@ -1647,7 +1725,7 @@ mod tests {
     #[test]
     fn codex_config_migrates_literal_credentials() {
         let existing = "[mcp_servers.ai-pod.http_headers]\nX-Api-Key = \"old-key\"\nX-Ai-Pod-Session-Id = \"old-session\"\nOther = \"preserved\"\n";
-        let output = codex_config_merge(existing, "http://h:7822", "host.containers.internal");
+        let output = codex_config_merge(existing, "http://h:7822", "host.containers.internal", true);
         let doc = output.parse::<toml_edit::DocumentMut>().unwrap();
         let server = &doc["mcp_servers"]["ai-pod"];
         assert_eq!(server["http_headers"]["Other"].as_str(), Some("preserved"));
