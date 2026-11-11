@@ -3,7 +3,7 @@
 # working container where the agent binary is installed and runnable.
 #
 # Usage:  ./tests/e2e_agents.sh <agent> <image>
-# Example: ./tests/e2e_agents.sh claude alpine
+# Example: ./tests/e2e_agents.sh claude ubuntu
 set -euo pipefail
 
 AGENT="${1:?Usage: e2e_agents.sh <agent> <image>}"

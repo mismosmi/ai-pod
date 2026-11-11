@@ -30,11 +30,25 @@ jobs:
       - name: Run unit tests
         run: cargo test --lib
 
-      - name: Test OpenCode install shim
-        run: bash tests/opencode_shim.sh
+      - name: Test agent binary installers
+        run: bash tests/agent_installers.sh
 
       - name: Test OpenCode notification plugin
         run: node --test tests/opencode_plugin.mjs
 
       - name: Run e2e tests
         run: cargo test --test e2e
+
+  installers:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        agent: [claude, codex, opencode]
+        image: [ubuntu, node, rust, python]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test installer in a real container
+        env:
+          CONTAINER_ENGINE: docker
+        run: bash tests/container_installers.sh "${{ matrix.agent }}" "${{ matrix.image }}"

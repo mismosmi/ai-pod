@@ -90,7 +90,7 @@ ai-pod --workdir /path/to/project
 | `build` | Build the container image without launching |
 | `attach` | Attach to a running ai-pod container session |
 | `list` | List all ai-pod containers |
-| `clean [--workdir PATH]` | Stop and remove the container for a workspace |
+| `clean [--workdir PATH]` | Remove workspace containers, image, volumes, networks, and runtime state; rebuild from scratch next launch |
 | `run <command> [args...]` | Run a command in the container instead of the default |
 | `commands [list\|run\|kill\|logs]` | View/manage host commands (interactive TUI if no subcommand) |
 | `services [list\|logs\|stop]` | View/manage service containers started by agents (interactive TUI if no subcommand) |
@@ -181,9 +181,9 @@ and can take a while; output goes to `~/.ai-pod/playwright.log`.
 
 The server is stopped again when the session that started it exits; a server
 that was already running (another session, or one you started by hand) is
-reused and left alone. Launching **without** `--playwright` removes the
-`playwright` MCP entry again, so the agent only ever sees it when you asked for
-it. An entry you added yourself pointing somewhere else is never touched.
+reused and left alone. The managed `playwright` MCP entry is added with
+`--playwright` and removed without it. Agents are instructed to ask you to
+run `ai-pod --playwright` when they need browser access.
 
 > **Note:** the Playwright MCP server binds all interfaces and has no
 > authentication — while it runs, anyone who can reach port 8931 on your machine
@@ -240,9 +240,13 @@ Notes:
 
 ## Configuration
 
-Your host `~/.claude/CLAUDE.md` and `~/.claude/settings.json` are merged with container defaults at launch time, and your `~/.claude.json` is copied in on first init, so your personal Claude preferences carry over automatically.
+Home volumes carry the creating ai-pod version as a label. ai-pod injects settings, skills, plugins, and git identity on first use and after an ai-pod version change. Initial login files are copied only into a new volume; upgrades preserve authentication and user preferences. Files are written by the main container as the `USER` configured in `ai-pod.Dockerfile`, under that user's `$HOME`.
 
-The MCP server entry for ai-pod is written into `~/.claude.json` (`mcpServers.ai-pod`), injected into OpenCode via the `OPENCODE_CONFIG_CONTENT` env var, and merged into Codex's `~/.codex/config.toml` (`[mcp_servers.ai-pod]`, a streamable-HTTP MCP server), all with the per-session credentials baked in literally — no env-var interpolation, so `claude doctor` stays clean. Your personal Codex login (`~/.codex/auth.json`) and other `config.toml` preferences (model, provider) carry over and are preserved; ai-pod only rewrites the keys it owns.
+Codex is installed as a complete package under `/usr/lib/codex`, with native executable symlinks in `/usr/bin` so every container user can run it. Keeping the package isolated supports Codex’s background server.
+
+Session credentials are passed as environment variables to the main container. Claude's persistent MCP entry references `${AI_POD_SERVER_URL}`, `${AI_POD_API_KEY}`, and `${AI_POD_SESSION_ID}`; Codex uses `env_http_headers`. OpenCode receives its runtime configuration through `OPENCODE_CONFIG_CONTENT`. Existing homes are migrated once to this format; session credentials do not require config rewrites.
+
+Playwright MCP is configured only with `--playwright`. At launch, ai-pod reads the actual Claude and Codex config files through the stopped main container and updates them only if needed. It then starts that same container; no separate helper container or Playwright state tag is used. OpenCode receives its per-launch selection through `OPENCODE_CONFIG_CONTENT`. Settings, skills, plugins, and auth retain their version gate. The general `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md` explain how to request browser access.
 
 ---
 
@@ -258,7 +262,7 @@ ai-pod init
 
 This writes an `ai-pod.Dockerfile` to the workspace root based on the default image. Edit it to add anything your project needs (e.g. Node, Python, Playwright, project-specific MCP servers). When `ai-pod` launches, it automatically uses `ai-pod.Dockerfile` if present, otherwise falls back to the global default.
 
-The default image is based on Ubuntu. The Dockerfile downloads the agent (Claude Code, OpenCode, or Codex) via `curl http://${HOST_GATEWAY}:7822/install/{agent}.sh` — the shared host server vends per-agent install scripts. The generated Dockerfile includes commented-out examples for common additions like Playwright and MCP servers.
+`ai-pod init --image` supports `ubuntu`, `node`, `rust`, and `python`. The default image is based on Ubuntu. The Dockerfile downloads the agent (Claude Code, OpenCode, or Codex) via `curl http://${HOST_GATEWAY}:7822/install/{agent}.sh` — the shared host server vends per-agent install scripts. The generated Dockerfile includes commented-out examples for common additions like Playwright and MCP servers.
 
 ---
 
@@ -266,8 +270,8 @@ The default image is based on Ubuntu. The Dockerfile downloads the agent (Claude
 
 Every container gets an `ai-pod` skill written into the home volume, at
 `~/.claude/skills/ai-pod/SKILL.md` (read by Claude Code and OpenCode) and
-`~/.codex/skills/ai-pod/SKILL.md` (read by Codex). It is refreshed on every
-launch, so upgrading ai-pod updates the instructions in existing volumes.
+`~/.codex/skills/ai-pod/SKILL.md` (read by Codex). It is refreshed when the ai-pod version changes, so upgrades update the
+instructions in existing volumes.
 
 Agents load a skill on demand, so the guidance costs nothing until the agent
 actually needs it. It covers:
@@ -357,7 +361,7 @@ Services are **ephemeral**. A fresh anonymous volume is allocated each
 session and discarded when the session ends; the service container
 itself is removed as soon as the main ai-pod container exits (or, as a
 backstop, by a periodic sweep in the shared server). `ai-pod clean`
-also removes the per-workspace network.
+also removes service containers, their anonymous volumes, and the per-workspace network.
 
 #### Inspecting services from the host
 

@@ -593,6 +593,7 @@ mod tests {
             home_dir: dir.path().to_path_buf(),
         };
         crate::config::SessionState {
+            workspace: None,
             runtime: RuntimeKind::Docker,
             network: None,
         }
