@@ -241,13 +241,13 @@ mod tests {
         };
         let output = rt
             .command()
-            .args(["run", "--rm", "alpine", "true"])
+            .args(["run", "--rm", "ubuntu", "true"])
             .output()
             .expect("echo should execute");
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            stdout.contains("podman run --rm alpine true"),
+            stdout.contains("podman run --rm ubuntu true"),
             "stdout should contain the full podman invocation, got: {stdout}"
         );
     }

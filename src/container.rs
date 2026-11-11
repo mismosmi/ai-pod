@@ -306,17 +306,15 @@ fn generate_runtime_settings(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
-/// MCP server entry consumed by Claude Code. Lives under `mcpServers.ai-pod`
-/// inside `~/.claude.json`. We bake the api key and session id in as literals
-/// (rather than `${VAR}` placeholders) because `claude doctor` eagerly
-/// validates referenced env vars and warns if any context can't see them.
-fn claude_mcp_entry(server_url: &str, api_key: &str, session_id: &str) -> serde_json::Value {
+/// Persistent Claude configuration resolves credentials from the main
+/// container's environment, so each session needs no home-file rewrite.
+fn claude_mcp_entry() -> serde_json::Value {
     serde_json::json!({
         "type": "http",
-        "url": format!("{}/mcp", server_url),
+        "url": "${AI_POD_SERVER_URL}/mcp",
         "headers": {
-            "X-Api-Key": api_key,
-            "X-Ai-Pod-Session-Id": session_id,
+            "X-Api-Key": "${AI_POD_API_KEY}",
+            "X-Ai-Pod-Session-Id": "${AI_POD_SESSION_ID}",
         }
     })
 }
@@ -339,13 +337,6 @@ fn playwright_mcp_entry(host_gateway: &str, opencode: bool) -> serde_json::Value
     entry
 }
 
-/// Whether an existing MCP entry is one ai-pod wrote for the host-side
-/// Playwright server. Guards removal so a user's own `playwright` entry
-/// (pointing somewhere else) is never deleted.
-fn is_ai_pod_playwright_entry(entry: &serde_json::Value, host_gateway: &str) -> bool {
-    entry["url"].as_str() == Some(crate::playwright::mcp_url(host_gateway).as_str())
-}
-
 /// Full inline config injected into OpenCode via the `OPENCODE_CONFIG_CONTENT`
 /// env var. Since the env var is set per-launch, we can bake the literal
 /// values in directly — no interpolation needed.
@@ -353,7 +344,7 @@ fn opencode_config_content(
     server_url: &str,
     api_key: &str,
     session_id: &str,
-    playwright: Option<&str>,
+    host_gateway: &str,
 ) -> String {
     let mut value = serde_json::json!({
         "$schema": "https://opencode.ai/config.json",
@@ -369,11 +360,9 @@ fn opencode_config_content(
             }
         }
     });
-    // The env var is rebuilt on every launch, so omitting the entry is all
-    // that's needed to disable Playwright for a run without `--playwright`.
-    if let Some(host_gateway) = playwright {
-        value["mcp"]["playwright"] = playwright_mcp_entry(host_gateway, true);
-    }
+    // The server is always configured. Without --playwright, connection may
+    // fail; agents can ask the user to enable host browser access when needed.
+    value["mcp"]["playwright"] = playwright_mcp_entry(host_gateway, true);
     serde_json::to_string(&value).expect("serialize opencode config content")
 }
 
@@ -383,21 +372,16 @@ fn opencode_config_content(
 /// `~/.codex/auth.json` and is never touched here. We use `toml_edit` so a
 /// user's persisted, possibly hand-edited config (model, provider, comments,
 /// other `[mcp_servers.*]`) survives byte-for-byte — only the five keys we own
-/// are rewritten on every launch:
+/// are installed on creation/version changes. Credentials resolve from the
+/// environment at runtime:
 ///   - `experimental_use_rmcp_client` (enables native streamable-HTTP MCP)
-///   - `[mcp_servers.ai-pod]` (url + http_headers, with literal session creds)
+///   - `[mcp_servers.ai-pod]` (url + env_http_headers)
 ///   - `approval_policy = "never"` and `sandbox_mode = "danger-full-access"`
 ///     (the container is the sandbox, matching Claude's `bypassPermissions`
 ///     and OpenCode's YOLO mode; a user's stricter value is intentionally
-///     overridden each launch)
+///     overridden when versioned defaults are installed)
 ///   - `notify` (points at the in-container notify helper)
-fn codex_config_merge(
-    existing: &str,
-    server_url: &str,
-    api_key: &str,
-    session_id: &str,
-    playwright: Option<&str>,
-) -> String {
+fn codex_config_merge(existing: &str, server_url: &str, host_gateway: &str) -> String {
     // Missing OR unparsable config -> start from an empty document.
     let mut doc = existing
         .parse::<toml_edit::DocumentMut>()
@@ -411,44 +395,29 @@ fn codex_config_merge(
     notify.push("/usr/local/bin/ai-pod-codex-notify");
     doc["notify"] = toml_edit::value(notify);
 
-    // Nested tables auto-vivify, so this works on an empty document too.
-    let server = &mut doc["mcp_servers"]["ai-pod"];
-    server["url"] = toml_edit::value(format!("{}/mcp", server_url));
-    server["http_headers"]["X-Api-Key"] = toml_edit::value(api_key);
-    server["http_headers"]["X-Ai-Pod-Session-Id"] = toml_edit::value(session_id);
-
-    // `~/.codex/config.toml` persists in the home volume, so a run without
-    // `--playwright` has to actively remove the entry we wrote earlier.
-    match playwright {
-        Some(host_gateway) => {
-            let pw = &mut doc["mcp_servers"]["playwright"];
-            pw["url"] = toml_edit::value(crate::playwright::mcp_url(host_gateway));
-            pw["http_headers"]["Host"] = toml_edit::value(crate::playwright::host_header());
-        }
-        None => remove_codex_playwright(&mut doc),
-    }
+    update_codex_connection(&mut doc, server_url, host_gateway);
 
     doc.to_string()
 }
 
-/// Drop `[mcp_servers.playwright]` from a Codex config, but only when it is
-/// the entry ai-pod wrote (url pointing at a container-runtime host gateway).
-/// A user's own `playwright` server is left alone.
-fn remove_codex_playwright(doc: &mut toml_edit::DocumentMut) {
-    let Some(servers) = doc.get_mut("mcp_servers").and_then(|s| s.as_table_like_mut()) else {
-        return;
-    };
-    let ours = servers
-        .get("playwright")
-        .and_then(|pw| pw.get("url"))
-        .and_then(|u| u.as_str())
-        .is_some_and(|url| {
-            url == crate::playwright::mcp_url("host.containers.internal")
-                || url == crate::playwright::mcp_url("host.docker.internal")
-        });
-    if ours {
-        servers.remove("playwright");
+fn update_codex_connection(doc: &mut toml_edit::DocumentMut, server_url: &str, host_gateway: &str) {
+    let server = &mut doc["mcp_servers"]["ai-pod"];
+    server["url"] = toml_edit::value(format!("{}/mcp", server_url));
+    // Migrate literal headers written by older ai-pod versions without
+    // discarding unrelated headers a user added.
+    if let Some(headers) = server
+        .get_mut("http_headers")
+        .and_then(|v| v.as_table_like_mut())
+    {
+        headers.remove("X-Api-Key");
+        headers.remove("X-Ai-Pod-Session-Id");
     }
+    server["env_http_headers"]["X-Api-Key"] = toml_edit::value("AI_POD_API_KEY");
+    server["env_http_headers"]["X-Ai-Pod-Session-Id"] = toml_edit::value("AI_POD_SESSION_ID");
+    let playwright = &mut doc["mcp_servers"]["playwright"];
+    playwright["url"] = toml_edit::value(crate::playwright::mcp_url(host_gateway));
+    playwright["http_headers"]["Host"] = toml_edit::value(crate::playwright::host_header());
+    playwright["enabled"] = toml_edit::value(true);
 }
 
 fn read_git_global(key: &str) -> Option<String> {
@@ -462,474 +431,428 @@ fn read_git_global(key: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Copy the host user's git identity into the container volume as ~/.gitconfig.
-/// This overrides the system-level git config set in the Dockerfile.
-fn write_gitconfig_to_volume(
-    rt: &ContainerRuntime,
-    config: &AppConfig,
-    init_container: &str,
-) -> Result<()> {
-    let name = read_git_global("user.name");
-    let email = read_git_global("user.email");
-    if name.is_none() && email.is_none() {
-        return Ok(());
-    }
+const PLAYWRIGHT_GUIDANCE: &str = "If you need browser access and Playwright MCP is unavailable, ask the user to run `ai-pod --playwright`.";
 
-    let mut lines = vec!["[user]".to_string()];
-    if let Some(n) = name {
-        lines.push(format!("\tname = {}", n));
+fn with_playwright_guidance(existing: &str) -> String {
+    let mut content = existing.to_string();
+    if !content.contains(PLAYWRIGHT_GUIDANCE) {
+        if !content.is_empty() {
+            if !content.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push('\n');
+        }
+        content.push_str(PLAYWRIGHT_GUIDANCE);
+        content.push('\n');
     }
-    if let Some(e) = email {
-        lines.push(format!("\temail = {}", e));
-    }
+    content
+}
 
-    let tmp = config.config_dir.join("gitconfig.tmp");
-    std::fs::write(&tmp, lines.join("\n") + "\n")?;
-    let _ = rt
-        .command()
-        .args([
-            "cp",
-            tmp.to_str().unwrap(),
-            &format!("{}:{}/.gitconfig", init_container, CONTAINER_HOME),
-        ])
-        .status();
+/// Label records the creating CLI; the in-volume marker records the last
+/// successfully applied injection version (volume labels are immutable).
+pub const HOME_VERSION_LABEL: &str = "ai-pod.created-version";
+const HOME_VERSION_FILE: &str = ".ai-pod-version";
+
+fn checked_status(status: std::process::ExitStatus, what: &str) -> Result<()> {
+    anyhow::ensure!(status.success(), "{what} failed");
     Ok(())
 }
 
-/// Populate a home volume via a temporary stopped container.
-/// Handles directory creation, runtime config, skill file, opencode config, and git identity.
-/// Set `copy_claude_json` to copy `~/.claude.json` (first-time init only; skipped on reseed).
-///
-/// Note: the `mcpServers.ai-pod` entry is *not* written here — `refresh_claude_mcp_in_volume`
-/// handles that on every launch with the current session id baked in.
-fn seed_home_volume(
-    rt: &ContainerRuntime,
-    config: &AppConfig,
-    volume_name: &str,
-    container_name: &str,
-    image: &str,
-    copy_claude_json: bool,
-) -> Result<()> {
-    let init_container = format!("{}-init", container_name);
-    let status = rt
-        .command()
-        .args([
-            "create",
-            "--name",
-            &init_container,
-            "-v",
-            &format!("{}:{}", volume_name, CONTAINER_HOME),
-            image,
-            "true",
-        ])
-        .status()
-        .context("Failed to create init container")?;
-    if !status.success() {
-        anyhow::bail!("Failed to create init container");
-    }
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ImageUser {
+    home: String,
+    uid: u64,
+    gid: u64,
+}
 
-    if copy_claude_json {
-        let host_claude_json = config.home_dir.join(".claude.json");
-        if host_claude_json.exists() {
-            let _ = rt
-                .command()
-                .args([
-                    "cp",
-                    &host_claude_json.to_string_lossy(),
-                    &format!("{}:{}/", init_container, CONTAINER_HOME),
-                ])
-                .status();
+/// Cache the image's effective identity by immutable image ID. Legacy HOME-only
+/// cache entries are re-probed once to obtain ownership for transferred files.
+fn image_user(rt: &ContainerRuntime, config: &AppConfig, image: &str) -> Result<ImageUser> {
+    if rt.dry_run {
+        return Ok(ImageUser {
+            home: CONTAINER_HOME.into(),
+            uid: 1000,
+            gid: 1000,
+        });
+    }
+    let output = rt.command().args(["image", "inspect", image]).output()?;
+    checked_status(output.status, "inspect image")?;
+    let images: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let id = images[0]["Id"].as_str().context("Image has no ID")?;
+    let cache = config
+        .config_dir
+        .join("image-homes")
+        .join(id.replace(':', "-"));
+    if let Ok(data) = std::fs::read(&cache) {
+        if let Ok(user) = serde_json::from_slice::<ImageUser>(&data) {
+            return Ok(user);
         }
     }
-
-    let _ = rt
+    let output = rt
         .command()
         .args([
             "run",
             "--rm",
-            "-v",
-            &format!("{}:{}:z", volume_name, CONTAINER_HOME),
+            "--entrypoint",
+            "sh",
             image,
-            "mkdir",
-            "-p",
-            &format!("{}/.claude", CONTAINER_HOME),
-            &format!("{}/.codex", CONTAINER_HOME),
-            &format!("{}/.config", CONTAINER_HOME),
-            &format!("{}/.config/opencode/plugins", CONTAINER_HOME),
+            "-c",
+            "test -n \"$HOME\" && printf '%s\\n' \"$HOME\" && id -u && id -g",
         ])
-        .status();
+        .output()?;
+    checked_status(output.status, "resolve image user")?;
+    let text = String::from_utf8(output.stdout)?;
+    let mut fields = text.lines();
+    let home = fields.next().context("Missing image HOME")?.to_string();
+    anyhow::ensure!(
+        home.starts_with('/') && home != "/",
+        "Invalid image HOME: {home}"
+    );
+    let user = ImageUser {
+        home,
+        uid: fields.next().context("Missing image UID")?.parse()?,
+        gid: fields.next().context("Missing image GID")?.parse()?,
+    };
+    std::fs::create_dir_all(cache.parent().unwrap())?;
+    std::fs::write(cache, serde_json::to_vec(&user)?)?;
+    Ok(user)
+}
 
-    generate_runtime_settings(config)?;
-
-    let _ = rt
-        .command()
-        .args([
-            "cp",
-            &config.runtime_settings.to_string_lossy(),
-            &format!("{}:{}/.claude/settings.json", init_container, CONTAINER_HOME),
-        ])
-        .status();
-
-    // Copy the host's personal CLAUDE.md into the container (no ai-pod preamble)
-    let host_claude_md = config.claude_md_path();
-    if host_claude_md.exists() {
-        let _ = rt
-            .command()
-            .args([
-                "cp",
-                &host_claude_md.to_string_lossy(),
-                &format!("{}:{}/.claude/CLAUDE.md", init_container, CONTAINER_HOME),
-            ])
-            .status();
-    }
-
-    let opencode_plugin = config.config_dir.join("opencode-plugin.js");
-    if opencode_plugin.exists() {
-        let _ = rt
-            .command()
-            .args([
-                "cp",
-                &opencode_plugin.to_string_lossy(),
-                &format!(
-                    "{}:{}/.config/opencode/plugins/ai-pod.js",
-                    init_container, CONTAINER_HOME
-                ),
-            ])
-            .status();
-    }
-
-    // First-time init only: carry the host's Codex login + prefs into the
-    // volume so the user starts logged in. `refresh_codex_config_in_volume`
-    // later merges ai-pod's keys over the copied config.toml. Auth lives in
-    // auth.json and is preserved untouched across reseeds.
-    if copy_claude_json {
-        for host_path in [config.codex_auth_path(), config.codex_config_path()] {
-            if host_path.exists() {
-                let _ = rt
-                    .command()
-                    .args([
-                        "cp",
-                        &host_path.to_string_lossy(),
-                        &format!("{}:{}/.codex/", init_container, CONTAINER_HOME),
-                    ])
-                    .status();
+/// A startup script can contain large configuration/login files. Transfer it
+/// to the stopped main container, rather than putting it in a command argument
+/// (Linux limits each individual argument to roughly 128 KiB).
+fn execute_main_container(
+    rt: &ContainerRuntime,
+    mut command: std::process::Command,
+    name: &str,
+    script: Option<&str>,
+    script_path: &str,
+    user: &ImageUser,
+) -> Result<std::process::ExitStatus> {
+    if let Some(script) = script {
+        checked_status(command.status()?, "create main container")?;
+        let result = (|| -> Result<std::process::ExitStatus> {
+            let mut archive = tempfile::tempfile()?;
+            {
+                let mut builder = tar::Builder::new(&mut archive);
+                let mut header = tar::Header::new_gnu();
+                header.set_mode(0o600);
+                header.set_uid(user.uid);
+                header.set_gid(user.gid);
+                let content = format!("set -eu\nrm -f -- \"$0\"\n{script}");
+                header.set_size(content.len() as u64);
+                header.set_mtime(0);
+                header.set_cksum();
+                let basename = Path::new(script_path)
+                    .file_name()
+                    .context("Invalid init script path")?;
+                builder.append_data(&mut header, basename, content.as_bytes())?;
+                builder.finish()?;
             }
+            use std::io::Seek;
+            archive.rewind()?;
+            checked_status(
+                rt.command()
+                    .args(["cp", "--archive", "-", &format!("{name}:{}/", user.home)])
+                    .stdin(Stdio::from(archive))
+                    .status()?,
+                "copy private startup script",
+            )?;
+            rt.command()
+                .args(["start", "--attach", "--interactive", name])
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .status()
+                .context("Failed to start container")
+        })();
+        if result.is_err() {
+            let _ = rt.command().args(["rm", "--force", name]).status();
+        }
+        result
+    } else {
+        command
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .context("Failed to run container")
+    }
+}
+
+fn image_command(rt: &ContainerRuntime, image: &str) -> Result<Vec<String>> {
+    if rt.dry_run {
+        return Ok(vec!["<image-default-command>".into()]);
+    }
+    let output = rt.command().args(["image", "inspect", image]).output()?;
+    checked_status(output.status, "inspect image command")?;
+    let images: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let mut args = Vec::new();
+    for key in ["Entrypoint", "Cmd"] {
+        if let Some(values) = images[0]["Config"][key].as_array() {
+            args.extend(values.iter().filter_map(|v| v.as_str()).map(str::to_owned));
         }
     }
-
-    write_gitconfig_to_volume(rt, config, &init_container)?;
-
-    let _ = rt.command().args(["rm", &init_container]).status();
-
-    Ok(())
+    anyhow::ensure!(!args.is_empty(), "Image has no entrypoint or command");
+    Ok(args)
 }
 
-/// Insert or remove the `playwright` MCP entry in a JSON map of MCP servers.
-/// Removal only touches an entry ai-pod itself wrote (see
-/// [`is_ai_pod_playwright_entry`]).
-fn apply_playwright_entry(
-    servers: &mut serde_json::Map<String, serde_json::Value>,
-    host_gateway: &str,
-    enabled: bool,
-) {
-    if enabled {
-        servers.insert(
-            "playwright".to_string(),
-            playwright_mcp_entry(host_gateway, false),
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Append an atomic write performed by the main container as its configured USER.
+fn home_write(script: &mut String, path: &str, content: &str) {
+    let path = shell_quote(path);
+    script.push_str(&format!("mkdir -p \"$(dirname {path})\"\nai_pod_tmp=$(mktemp \"$(dirname {path})/.ai-pod-write.XXXXXX\")\nprintf %s {} > \"$ai_pod_tmp\"\nmv -f \"$ai_pod_tmp\" {path}\n", shell_quote(content)));
+}
+
+fn read_home_file(
+    rt: &ContainerRuntime,
+    helper: &str,
+    home: &str,
+    path: &str,
+    tmp: &Path,
+) -> Result<Option<String>> {
+    let target = tmp.join("read");
+    let _ = std::fs::remove_file(&target);
+    let output = rt
+        .command()
+        .args([
+            "cp",
+            &format!("{helper}:{home}/{path}"),
+            &target.to_string_lossy(),
+        ])
+        .output()?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr).to_lowercase();
+        anyhow::ensure!(
+            error.contains("no such")
+                || error.contains("not found")
+                || error.contains("does not exist"),
+            "Failed reading {path}: {error}"
         );
-    } else if servers
-        .get("playwright")
-        .is_some_and(|e| is_ai_pod_playwright_entry(e, host_gateway))
-    {
-        servers.remove("playwright");
+        return Ok(None);
     }
+    Ok(Some(std::fs::read_to_string(target)?))
 }
 
-/// Update the `mcpServers.ai-pod` entry in the volume's `~/.claude.json`
-/// with literal api_key + session_id values. Runs on every launch so the
-/// in-volume config matches the env the agent will see.
-fn refresh_claude_mcp_in_volume(
+/// Persistent settings/auth/plugins/skills are applied only on creation or a
+/// CLI version change. Session values arrive through environment variables.
+/// A stopped helper reads the volume; the main container writes as its USER.
+fn prepare_home_volume(
     rt: &ContainerRuntime,
     config: &AppConfig,
-    volume_name: &str,
-    container_name: &str,
+    volume: &str,
+    prefix: &str,
     image: &str,
-    server_url: &str,
-    api_key: &str,
-    session_id: &str,
-    playwright: bool,
-) -> Result<()> {
-    let init_container = format!("{}-mcp", container_name);
-    let status = rt
-        .command()
-        .args([
-            "create",
-            "--name",
-            &init_container,
-            "-v",
-            &format!("{}:{}", volume_name, CONTAINER_HOME),
-            image,
-            "true",
-        ])
-        .status()
-        .context("Failed to create mcp-refresh container")?;
-    if !status.success() {
-        anyhow::bail!("Failed to create mcp-refresh container");
+    home: &str,
+) -> Result<Option<String>> {
+    if rt.dry_run {
+        return Ok(None);
     }
-
-    // Pull the existing .claude.json out of the volume (may not exist yet, so
-    // silence the runtime's "no such file" complaint — a missing config is the
-    // normal first-launch case and is handled by the empty-object default below).
-    let tmp_in = config.config_dir.join("claude-in.json");
-    let _ = std::fs::remove_file(&tmp_in);
-    let _ = rt
-        .command()
-        .args([
-            "cp",
-            &format!("{}:{}/.claude.json", init_container, CONTAINER_HOME),
-            tmp_in.to_str().unwrap(),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-
-    let mut value: serde_json::Value = std::fs::read_to_string(&tmp_in)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    let obj = value
-        .as_object_mut()
-        .expect("claude.json root must be an object");
-    let servers = obj
-        .entry("mcpServers".to_string())
-        .or_insert_with(|| serde_json::json!({}));
-    let servers = servers
-        .as_object_mut()
-        .expect("mcpServers must be an object");
-    servers.insert(
-        "ai-pod".to_string(),
-        claude_mcp_entry(server_url, api_key, session_id),
-    );
-    // `~/.claude.json` persists in the home volume, so the entry has to be
-    // removed again on a launch without `--playwright`.
-    apply_playwright_entry(servers, rt.host_gateway(), playwright);
-
-    let tmp_out = config.config_dir.join("claude-out.json");
-    std::fs::write(&tmp_out, serde_json::to_string_pretty(&value)?)?;
-    let _ = rt
-        .command()
-        .args([
-            "cp",
-            tmp_out.to_str().unwrap(),
-            &format!("{}:{}/.claude.json", init_container, CONTAINER_HOME),
-        ])
-        .status();
-
-    let _ = rt.command().args(["rm", &init_container]).status();
-    let _ = std::fs::remove_file(&tmp_in);
-    let _ = std::fs::remove_file(&tmp_out);
-    Ok(())
+    // One-time migration for volumes seeded by the earlier literal-header
+    // format at this same development version; subsequent launches skip writes.
+    let version = format!("{}:env-playwright-v2", env!("CARGO_PKG_VERSION"));
+    let fresh = !volume_exists(rt, volume)?;
+    if fresh {
+        checked_status(
+            rt.command()
+                .args([
+                    "volume",
+                    "create",
+                    "--label",
+                    "managed-by=ai-pod",
+                    "--label",
+                    &format!("{HOME_VERSION_LABEL}={}", env!("CARGO_PKG_VERSION")),
+                    volume,
+                ])
+                .status()?,
+            "create home volume",
+        )?;
+    }
+    let tmp = tempfile::tempdir()?;
+    let helper = format!("{prefix}-init-{}", new_session_id());
+    checked_status(
+        rt.command()
+            .args([
+                "create",
+                "-i",
+                "--name",
+                &helper,
+                "--label",
+                "managed-by=ai-pod",
+                "-v",
+                &format!("{volume}:{home}:z"),
+                "--entrypoint",
+                "sh",
+                image,
+                "-s",
+            ])
+            .status()?,
+        "create home helper",
+    )?;
+    let result = (|| -> Result<Option<String>> {
+        let previous = read_home_file(rt, &helper, home, HOME_VERSION_FILE, tmp.path())?;
+        let inject = previous.as_deref() != Some(version.as_str());
+        if !inject {
+            return Ok(None);
+        }
+        let mut script =
+            "set -eu\nai_pod_start_dir=$PWD\nai_pod_umask=$(umask)\numask 077\ncd \"$HOME\"\n"
+                .to_string();
+        if inject {
+            generate_runtime_settings(config)?;
+            home_write(
+                &mut script,
+                ".claude/settings.json",
+                &std::fs::read_to_string(&config.runtime_settings)?,
+            );
+            for (source, target) in [
+                (config.claude_md_path(), ".claude/CLAUDE.md"),
+                (config.codex_dir().join("AGENTS.md"), ".codex/AGENTS.md"),
+            ] {
+                let existing = if source.exists() {
+                    std::fs::read_to_string(source)?
+                } else {
+                    read_home_file(rt, &helper, home, target, tmp.path())?.unwrap_or_default()
+                };
+                home_write(&mut script, target, &with_playwright_guidance(&existing));
+            }
+            let plugin = config.config_dir.join("opencode-plugin.js");
+            if plugin.exists() {
+                home_write(
+                    &mut script,
+                    ".config/opencode/plugins/ai-pod.js",
+                    &std::fs::read_to_string(plugin)?,
+                );
+            }
+            // Existing auth and user preferences survive upgrades.
+            if previous.is_none() {
+                for (source, target) in [
+                    (config.home_dir.join(".claude.json"), ".claude.json"),
+                    (config.codex_auth_path(), ".codex/auth.json"),
+                    (config.codex_config_path(), ".codex/config.toml"),
+                ] {
+                    if source.exists() {
+                        script.push_str(&format!("if [ ! -e {} ]; then\n", shell_quote(target)));
+                        home_write(&mut script, target, &std::fs::read_to_string(source)?);
+                        script.push_str("fi\n");
+                    }
+                }
+            }
+            if let Some(auth) = read_home_file(rt, &helper, home, ".codex/auth.json", tmp.path())? {
+                // Re-home legacy root-owned copies without replacing the login.
+                home_write(&mut script, ".codex/auth.json", &auth);
+            }
+            let mut git = String::from("[user]\n");
+            for key in ["name", "email"] {
+                if let Some(value) = read_git_global(&format!("user.{key}")) {
+                    git.push_str(&format!("\t{key} = {value}\n"));
+                }
+            }
+            if git != "[user]\n" {
+                home_write(&mut script, ".gitconfig", &git);
+            }
+            for path in crate::skill::skill_paths("") {
+                home_write(
+                    &mut script,
+                    path.trim_start_matches('/'),
+                    &crate::skill::render(rt),
+                );
+            }
+        }
+        let claude = read_home_file(rt, &helper, home, ".claude.json", tmp.path())?.or_else(|| {
+            previous
+                .is_none()
+                .then(|| std::fs::read_to_string(config.home_dir.join(".claude.json")).ok())
+                .flatten()
+        });
+        let mut value: serde_json::Value = claude
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let obj = value
+            .as_object_mut()
+            .context("claude.json root must be an object")?;
+        let servers = obj
+            .entry("mcpServers")
+            .or_insert_with(|| serde_json::json!({}));
+        let servers = servers
+            .as_object_mut()
+            .context("mcpServers must be an object")?;
+        servers.insert("ai-pod".into(), claude_mcp_entry());
+        servers.insert(
+            "playwright".into(),
+            playwright_mcp_entry(rt.host_gateway(), false),
+        );
+        home_write(
+            &mut script,
+            ".claude.json",
+            &serde_json::to_string_pretty(&value)?,
+        );
+        let codex = read_home_file(rt, &helper, home, ".codex/config.toml", tmp.path())?
+            .or_else(|| {
+                previous
+                    .is_none()
+                    .then(|| std::fs::read_to_string(config.codex_config_path()).ok())
+                    .flatten()
+            })
+            .unwrap_or_default();
+        let codex = codex_config_merge(&codex, &rt.server_url(), rt.host_gateway());
+        home_write(&mut script, ".codex/config.toml", &codex);
+        // Only mark success once all writes have completed.
+        if inject {
+            home_write(&mut script, HOME_VERSION_FILE, &version);
+        }
+        script.push_str("cd \"$ai_pod_start_dir\"\numask \"$ai_pod_umask\"\n");
+        script.push_str("exec \"$@\"\n");
+        Ok(Some(script))
+    })();
+    let cleanup = rt.command().args(["rm", "--force", &helper]).status();
+    let script = result?;
+    checked_status(cleanup?, "remove home helper")?;
+    Ok(script)
 }
 
-/// Update the `~/.codex/config.toml` in the volume with ai-pod's MCP entry and
-/// runtime settings (see [`codex_config_merge`]). Runs on every launch so the
-/// in-volume config matches the env the agent will see, mirroring
-/// [`refresh_claude_mcp_in_volume`].
-fn refresh_codex_config_in_volume(
-    rt: &ContainerRuntime,
-    config: &AppConfig,
-    volume_name: &str,
-    container_name: &str,
-    image: &str,
-    server_url: &str,
-    api_key: &str,
-    session_id: &str,
-    playwright: bool,
-) -> Result<()> {
-    let init_container = format!("{}-codex", container_name);
-    let status = rt
-        .command()
-        .args([
-            "create",
-            "--name",
-            &init_container,
-            "-v",
-            &format!("{}:{}", volume_name, CONTAINER_HOME),
-            image,
-            "true",
-        ])
-        .status()
-        .context("Failed to create codex-refresh container")?;
-    if !status.success() {
-        anyhow::bail!("Failed to create codex-refresh container");
-    }
-
-    // Pull the existing config.toml out of the volume (may not exist yet, so
-    // silence the runtime's "no such file" complaint — a missing config is the
-    // normal first-launch case and is handled by the empty-string default below).
-    let tmp_in = config.config_dir.join("codex-config-in.toml");
-    let _ = std::fs::remove_file(&tmp_in);
-    let _ = rt
-        .command()
-        .args([
-            "cp",
-            &format!("{}:{}/.codex/config.toml", init_container, CONTAINER_HOME),
-            tmp_in.to_str().unwrap(),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-
-    let existing = std::fs::read_to_string(&tmp_in).unwrap_or_default();
-    let merged = codex_config_merge(
-        &existing,
-        server_url,
-        api_key,
-        session_id,
-        playwright.then(|| rt.host_gateway()),
-    );
-
-    let tmp_out = config.config_dir.join("codex-config-out.toml");
-    std::fs::write(&tmp_out, merged)?;
-    let _ = rt
-        .command()
-        .args([
-            "cp",
-            tmp_out.to_str().unwrap(),
-            &format!("{}:{}/.codex/config.toml", init_container, CONTAINER_HOME),
-        ])
-        .status();
-
-    let _ = rt.command().args(["rm", &init_container]).status();
-    let _ = std::fs::remove_file(&tmp_in);
-    let _ = std::fs::remove_file(&tmp_out);
-    Ok(())
-}
-
-/// Write the `ai-pod` agent skill into the home volume.
-///
-/// Runs on every launch (not just on seed) so an ai-pod upgrade refreshes the
-/// instructions in long-lived volumes, mirroring the MCP-config refreshes
-/// above. The file is dropped into every agent's global skills directory; the
-/// agent loads it on demand instead of carrying the guidance in its context.
+/// Explicit skill refresh used by tools/tests. Writes as the image user.
 pub fn refresh_skill_in_volume(
     rt: &ContainerRuntime,
-    config: &AppConfig,
-    volume_name: &str,
-    container_name: &str,
+    _config: &AppConfig,
+    volume: &str,
+    _prefix: &str,
     image: &str,
 ) -> Result<()> {
-    let skill_file = config.config_dir.join("ai-pod-skill.md");
-    std::fs::write(&skill_file, crate::skill::render(rt))
-        .context("Failed to render ai-pod skill")?;
-
-    let mut mkdir = rt.command();
-    mkdir.args([
-        "run",
-        "--rm",
-        "-v",
-        &format!("{}:{}:z", volume_name, CONTAINER_HOME),
-        image,
-        "mkdir",
-        "-p",
-    ]);
-    for dir in crate::skill::skill_dirs(CONTAINER_HOME) {
-        mkdir.arg(dir);
+    use std::io::Write;
+    let mut script = "set -eu\numask 077\ncd \"$HOME\"\n".to_string();
+    for path in crate::skill::skill_paths("") {
+        home_write(
+            &mut script,
+            path.trim_start_matches('/'),
+            &crate::skill::render(rt),
+        );
     }
-    let _ = mkdir.status();
-
-    let init_container = format!("{}-skill", container_name);
-    let status = rt
+    let mut child = rt
         .command()
         .args([
-            "create",
-            "--name",
-            &init_container,
+            "run",
+            "--rm",
+            "-i",
             "-v",
-            &format!("{}:{}", volume_name, CONTAINER_HOME),
+            &format!("{volume}:{CONTAINER_HOME}:z"),
+            "--entrypoint",
+            "sh",
             image,
-            "true",
+            "-s",
         ])
-        .status()
-        .context("Failed to create skill-refresh container")?;
-    if !status.success() {
-        anyhow::bail!("Failed to create skill-refresh container");
-    }
-
-    for path in crate::skill::skill_paths(CONTAINER_HOME) {
-        let _ = rt
-            .command()
-            .args([
-                "cp",
-                &skill_file.to_string_lossy(),
-                &format!("{}:{}", init_container, path),
-            ])
-            .status();
-    }
-
-    let _ = rt.command().args(["rm", &init_container]).status();
-    let _ = std::fs::remove_file(&skill_file);
-    Ok(())
-}
-
-/// Initialize a named home volume for the first time.
-fn init_home_volume(
-    rt: &ContainerRuntime,
-    config: &AppConfig,
-    volume_name: &str,
-    container_name: &str,
-    image: &str,
-    project_id: &str,
-    api_key: &str,
-) -> Result<()> {
-    eprintln!(
-        "{} {}",
-        "Initialising home volume:".blue().bold(),
-        volume_name
-    );
-
-    let status = rt
-        .command()
-        .args(["volume", "create", volume_name])
-        .status()
-        .context("Failed to create volume")?;
-    if !status.success() {
-        anyhow::bail!("Failed to create volume {}", volume_name);
-    }
-
-    seed_home_volume(rt, config, volume_name, container_name, image, true)?;
-
-    let _ = (project_id, api_key); // used via env vars at runtime
-
-    eprintln!("{}", "Home volume initialised.".green());
-
-    Ok(())
-}
-
-/// Re-apply runtime config after a rebuild.
-/// Does NOT wipe the volume — auth state is preserved.
-fn reseed_home_volume(
-    rt: &ContainerRuntime,
-    config: &AppConfig,
-    volume_name: &str,
-    container_name: &str,
-    image: &str,
-    project_id: &str,
-    api_key: &str,
-) -> Result<()> {
-    eprintln!(
-        "{} {}",
-        "Refreshing home volume config:".blue().bold(),
-        volume_name
-    );
-
-    seed_home_volume(rt, config, volume_name, container_name, image, false)?;
-
-    let _ = (project_id, api_key); // used via env vars at runtime
-
-    eprintln!("{}", "Home volume reseeded.".green());
-
-    Ok(())
+        .stdin(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .context("helper stdin missing")?
+        .write_all(script.as_bytes())?;
+    checked_status(child.wait()?, "write skill")
 }
 
 pub fn launch_container(
@@ -950,41 +873,14 @@ pub fn launch_container(
 
     rt.warn_if_rootless_userns_mismatch();
 
-    // On rebuild: stop all existing containers for this workspace and reseed the volume
+    // Rebuild replaces containers; persistent home injections are versioned.
     if rebuild {
         for name in containers_for_prefix(rt, &prefix, false)? {
-            eprintln!(
-                "{} {}",
-                "Removing container for rebuild:".blue().bold(),
-                name
-            );
-            let _ = rt.command().args(["rm", "--force", &name]).status();
-        }
-        if volume_exists(rt, &volume_name)? {
-            reseed_home_volume(
-                rt,
-                config,
-                &volume_name,
-                &prefix,
-                image,
-                project_id,
-                api_key,
-            )?;
+            checked_status(rt.command().args(["rm", "--force", &name]).status()?, "remove container for rebuild")?;
         }
     }
-
-    // Init home volume if it doesn't exist
-    if !volume_exists(rt, &volume_name)? {
-        init_home_volume(
-            rt,
-            config,
-            &volume_name,
-            &prefix,
-            image,
-            project_id,
-            api_key,
-        )?;
-    }
+    let user = image_user(rt, config, image)?;
+    let home = &user.home;
 
     let session_id = new_session_id();
     let container_name = container_name_for(workspace, &session_id);
@@ -993,36 +889,13 @@ pub fn launch_container(
     // Record the runtime for this session before the container starts, so the
     // shared server runs service containers on the same runtime.
     crate::config::SessionState {
+        workspace: Some(workspace_hash(workspace)),
         runtime: rt.kind,
         network: None,
     }
     .save(config, &session_id)?;
 
-    refresh_claude_mcp_in_volume(
-        rt,
-        config,
-        &volume_name,
-        &prefix,
-        image,
-        &rt.server_url(),
-        api_key,
-        &session_id,
-        playwright,
-    )?;
-
-    refresh_codex_config_in_volume(
-        rt,
-        config,
-        &volume_name,
-        &prefix,
-        image,
-        &rt.server_url(),
-        api_key,
-        &session_id,
-        playwright,
-    )?;
-
-    refresh_skill_in_volume(rt, config, &volume_name, &prefix, image)?;
+    let home_script = prepare_home_volume(rt, config, &volume_name, &prefix, image, &home)?;
 
     let host_gw_env = format!("HOST_GATEWAY={}", rt.host_gateway());
     let server_url_env = format!("AI_POD_SERVER_URL={}", rt.server_url());
@@ -1032,7 +905,7 @@ pub fn launch_container(
             &rt.server_url(),
             api_key,
             &session_id,
-            playwright.then(|| rt.host_gateway()),
+            rt.host_gateway(),
         )
     );
 
@@ -1057,8 +930,9 @@ pub fn launch_container(
         publish,
     )?;
 
+    let script_path = format!("{home}/.ai-pod-init-{session_id}.sh");
     let mut run_cmd = rt.command();
-    run_cmd.args(["run", "--rm", "-it"]);
+    run_cmd.args([if home_script.is_some() { "create" } else { "run" }, "--rm", "-it"]);
     run_cmd.args([
         "--name",
         &container_name,
@@ -1067,7 +941,7 @@ pub fn launch_container(
         "--network",
         &net.network,
         "-v",
-        &format!("{}:{}:z", volume_name, CONTAINER_HOME),
+        &format!("{}:{}:z", volume_name, home),
         "--workdir",
         &container_workdir,
     ]);
@@ -1099,13 +973,13 @@ pub fn launch_container(
     for port in publish {
         run_cmd.args(["--publish", port]);
     }
-    run_cmd.arg(image);
-    let run_status = run_cmd
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .context("Failed to run container")?;
+    if home_script.is_some() {
+        run_cmd.args(["--entrypoint", "sh", image, &script_path]);
+        run_cmd.args(image_command(rt, image)?);
+    } else {
+        run_cmd.arg(image);
+    }
+    let run_status = execute_main_container(rt, run_cmd, &container_name, home_script.as_deref(), &script_path, &user)?;
 
     // Main container has exited (cleanly or otherwise); tear down anything the
     // agent started for this session. Best-effort: this is also covered by the
@@ -1113,9 +987,7 @@ pub fn launch_container(
     crate::service::cleanup_services_for_session(rt, &session_id);
     crate::egress::cleanup_for_session(rt, &session_id);
     let _ = std::fs::remove_file(config.session_state_file(&session_id));
-    let _ = run_status;
-
-    Ok(())
+    checked_status(run_status, "run container")
 }
 
 pub fn run_in_container(
@@ -1142,49 +1014,15 @@ pub fn run_in_container(
     // Record the runtime for this session before the container starts, so the
     // shared server runs service containers on the same runtime.
     crate::config::SessionState {
+        workspace: Some(workspace_hash(workspace)),
         runtime: rt.kind,
         network: None,
     }
     .save(config, &session_id)?;
 
-    // Init home volume if it doesn't exist
-    if !volume_exists(rt, &volume_name)? {
-        init_home_volume(
-            rt,
-            config,
-            &volume_name,
-            &container_name,
-            image,
-            project_id,
-            api_key,
-        )?;
-    }
-
-    refresh_claude_mcp_in_volume(
-        rt,
-        config,
-        &volume_name,
-        &container_name,
-        image,
-        &rt.server_url(),
-        api_key,
-        &session_id,
-        playwright,
-    )?;
-
-    refresh_codex_config_in_volume(
-        rt,
-        config,
-        &volume_name,
-        &container_name,
-        image,
-        &rt.server_url(),
-        api_key,
-        &session_id,
-        playwright,
-    )?;
-
-    refresh_skill_in_volume(rt, config, &volume_name, &container_name, image)?;
+    let user = image_user(rt, config, image)?;
+    let home = &user.home;
+    let home_script = prepare_home_volume(rt, config, &volume_name, &container_name, image, &home)?;
 
     eprintln!(
         "{} {} {}",
@@ -1215,18 +1053,21 @@ pub fn run_in_container(
     // ACP), `-t` would allocate a pseudo-TTY that mangles the JSON-RPC
     // byte stream the agent emits. Keep `-i` so stdin stays attached.
     let stdio_flag = if interactive { "-it" } else { "-i" };
+    let script_path = format!("{home}/.ai-pod-init-{session_id}.sh");
     let mut run_args: Vec<String> = vec![
-        "run".into(),
+        if home_script.is_some() { "create".into() } else { "run".into() },
         "--rm".into(),
         stdio_flag.into(),
     ];
     run_args.extend_from_slice(&[
+        "--name".into(),
+        container_name.clone(),
         "--label".into(),
         "managed-by=ai-pod".into(),
         "--network".into(),
         net.network,
         "-v".into(),
-        format!("{}:{}:z", volume_name, CONTAINER_HOME),
+        format!("{}:{}:z", volume_name, home),
         "--workdir".into(),
         container_workdir.into_owned(),
     ]);
@@ -1258,23 +1099,22 @@ pub fn run_in_container(
             &rt.server_url(),
             api_key,
             &session_id,
-            playwright.then(|| rt.host_gateway()),
+            rt.host_gateway(),
         )
         ),
-        "--entrypoint".into(),
-        command.to_string(),
-        image.to_string(),
     ]);
+    if home_script.is_some() {
+        run_args.extend([
+            "--entrypoint".into(), "sh".into(), image.into(), script_path.clone(), command.into(),
+        ]);
+    } else {
+        run_args.extend(["--entrypoint".into(), command.into(), image.into()]);
+    }
     run_args.extend_from_slice(args);
 
-    let status = rt
-        .command()
-        .args(&run_args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .context("Failed to run command in container")?;
+    let mut run_cmd = rt.command();
+    run_cmd.args(&run_args);
+    let status = execute_main_container(rt, run_cmd, &container_name, home_script.as_deref(), &script_path, &user)?;
 
     crate::service::cleanup_services_for_session(rt, &session_id);
     crate::egress::cleanup_for_session(rt, &session_id);
@@ -1321,6 +1161,7 @@ fn session_network(
     // Let the server put this session's service containers on the same
     // internal network.
     crate::config::SessionState {
+        workspace: Some(workspace_hash(workspace)),
         runtime: rt.kind,
         network: Some(session.network.clone()),
     }
@@ -1412,50 +1253,143 @@ pub fn attach_container(rt: &ContainerRuntime) -> Result<()> {
     Ok(())
 }
 
-pub fn clean_container(
-    rt: &ContainerRuntime,
-    config: &AppConfig,
-    workspace: &Path,
-) -> Result<()> {
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn clean_container(rt: &ContainerRuntime, config: &AppConfig, workspace: &Path) -> Result<()> {
     let prefix = container_prefix(workspace);
-    let volume_name = gen_volume_name(workspace);
-
-    let containers = containers_for_prefix(rt, &prefix, false)?;
-
-    if containers.is_empty() {
-        println!("{}", "No containers found for this workspace.".yellow());
-    } else {
-        for name in &containers {
-            println!("{} {}", "Removing container:".red().bold(), name);
-            let _ = rt.command().args(["rm", "--force", name]).status();
+    // Include stopped initialization helpers, services, and egress containers,
+    // which do not all carry the main container's managed-by label.
+    let output = rt
+        .command()
+        .args([
+            "ps",
+            "-a",
+            "--format",
+            "{{.Names}}",
+            "--filter",
+            &format!("name=^{prefix}-"),
+        ])
+        .output()?;
+    checked_status(output.status, "list workspace containers")?;
+    for name in String::from_utf8(output.stdout)?
+        .lines()
+        .filter(|n| n.starts_with(&format!("{prefix}-")))
+    {
+        let inspection = rt.command().args(["inspect", name]).output()?;
+        checked_status(inspection.status, "inspect workspace container")?;
+        let data: serde_json::Value = serde_json::from_slice(&inspection.stdout)?;
+        let labels = &data[0]["Config"]["Labels"];
+        if let Some(session) = labels[crate::service::PARENT_LABEL_KEY].as_str() {
+            remove_file_if_exists(&config.session_state_file(session))?;
         }
-        println!("{}", "Containers removed.".green());
+        if let Some(env) = data[0]["Config"]["Env"].as_array() {
+            for value in env.iter().filter_map(|v| v.as_str()) {
+                if let Some(session) = value.strip_prefix("AI_POD_SESSION_ID=") {
+                    remove_file_if_exists(&config.session_state_file(session))?;
+                }
+            }
+        }
+        checked_status(
+            rt.command()
+                .args(["rm", "--force", "--volumes", name])
+                .status()?,
+            "remove workspace container",
+        )?;
     }
 
-    // Remove named home volume
-    if volume_exists(rt, &volume_name)? {
-        println!("{} {}", "Removing volume:".red().bold(), volume_name);
+    let output = rt
+        .command()
+        .args([
+            "volume",
+            "ls",
+            "--format",
+            "{{.Name}}",
+            "--filter",
+            &format!("name=^{prefix}-"),
+        ])
+        .output()?;
+    checked_status(output.status, "list workspace volumes")?;
+    let home = gen_volume_name(workspace);
+    let mut volumes: Vec<String> = String::from_utf8(output.stdout)?
+        .lines()
+        .filter(|n| n.starts_with(&format!("{prefix}-")))
+        .map(str::to_owned)
+        .collect();
+    if volume_exists(rt, &home)? && !volumes.contains(&home) {
+        volumes.push(home);
+    }
+    for volume in volumes {
+        checked_status(
+            rt.command().args(["volume", "rm", &volume]).status()?,
+            "remove workspace volume",
+        )?;
+    }
+
+    for network in [
+        crate::workspace::service_network_name(workspace),
+        crate::egress::filtered_network_name(workspace),
+    ] {
         let status = rt
             .command()
-            .args(["volume", "rm", &volume_name])
-            .status()
-            .context("Failed to remove volume")?;
+            .args(["network", "inspect", &network])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
         if status.success() {
-            println!("{}", "Volume removed.".green());
+            checked_status(
+                rt.command().args(["network", "rm", &network]).status()?,
+                "remove workspace network",
+            )?;
         }
     }
-
-    // Remove per-mask volumes recorded in this workspace's state. Config (the
-    // list of masked dirs) is preserved so the volumes are re-created on next
-    // launch — `clean` resets runtime state, not user config.
-    let state = load_project_state(config, workspace);
-    for dir in &state.masked_directories {
-        let _ = remove_mask_volume(rt, workspace, dir);
+    let image = crate::image::image_name(workspace);
+    if !crate::image::needs_build(rt, &image, false)? {
+        checked_status(
+            rt.command().args(["image", "rm", &image]).status()?,
+            "remove workspace image",
+        )?;
     }
-
-    // Remove the per-workspace service-container networks if they exist.
-    crate::service::remove_service_network(rt, workspace);
-    crate::egress::remove_filtered_network(rt, workspace);
+    if rt.dry_run {
+        return Ok(());
+    }
+    if config.sessions_dir().exists() {
+        for entry in std::fs::read_dir(config.sessions_dir())? {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path)?;
+            if let Ok(state) = serde_json::from_str::<crate::config::SessionState>(&raw) {
+                if state.workspace.as_deref() == Some(workspace_hash(workspace).as_str())
+                    || state.network.as_deref()
+                        == Some(crate::egress::filtered_network_name(workspace).as_str())
+                {
+                    remove_file_if_exists(&path)?;
+                }
+            }
+        }
+    }
+    remove_file_if_exists(&config.project_state_file(&workspace_hash(workspace)))?;
+    let commands = crate::server::runner::commands_root(workspace);
+    if commands.exists() {
+        std::fs::remove_dir_all(commands)?;
+    }
+    // Preserve source files, including ai-pod.Dockerfile and linked worktrees.
+    // The next build must ignore cached layers, even if base layers remain
+    // shared with other workspaces.
+    let marker = crate::image::clean_build_marker(workspace);
+    std::fs::create_dir_all(marker.parent().unwrap())?;
+    std::fs::write(marker, "")?;
+    println!(
+        "{}",
+        "Workspace runtime data removed; next launch will build from scratch.".green()
+    );
 
     Ok(())
 }
@@ -1551,17 +1485,25 @@ mod tests {
     }
 
     #[test]
-    fn claude_mcp_entry_bakes_literal_values() {
-        let entry = claude_mcp_entry("http://host.containers.internal:7822", "k1", "s2");
+    fn claude_mcp_entry_uses_environment() {
+        let entry = claude_mcp_entry();
         assert_eq!(entry["type"], "http");
-        assert_eq!(entry["url"], "http://host.containers.internal:7822/mcp");
-        assert_eq!(entry["headers"]["X-Api-Key"], "k1");
-        assert_eq!(entry["headers"]["X-Ai-Pod-Session-Id"], "s2");
+        assert_eq!(entry["url"], "${AI_POD_SERVER_URL}/mcp");
+        assert_eq!(entry["headers"]["X-Api-Key"], "${AI_POD_API_KEY}");
+        assert_eq!(
+            entry["headers"]["X-Ai-Pod-Session-Id"],
+            "${AI_POD_SESSION_ID}"
+        );
     }
 
     #[test]
     fn opencode_config_content_bakes_literal_values() {
-        let s = opencode_config_content("http://host.containers.internal:7822", "k1", "s2", None);
+        let s = opencode_config_content(
+            "http://host.containers.internal:7822",
+            "k1",
+            "s2",
+            "host.containers.internal",
+        );
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["mcp"]["ai-pod"]["type"], "remote");
         assert_eq!(
@@ -1574,12 +1516,12 @@ mod tests {
     }
 
     #[test]
-    fn opencode_config_includes_playwright_when_enabled() {
+    fn opencode_config_always_includes_playwright() {
         let s = opencode_config_content(
             "http://host.containers.internal:7822",
             "k1",
             "s2",
-            Some("host.containers.internal"),
+            "host.containers.internal",
         );
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["mcp"]["playwright"]["type"], "remote");
@@ -1592,94 +1534,55 @@ mod tests {
     }
 
     #[test]
-    fn opencode_config_omits_playwright_when_disabled() {
-        let s = opencode_config_content("http://host.containers.internal:7822", "k1", "s2", None);
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert!(v["mcp"]["playwright"].is_null());
-    }
-
-    #[test]
-    fn claude_playwright_entry_is_added_and_removed() {
-        let mut servers = serde_json::Map::new();
-        apply_playwright_entry(&mut servers, "host.containers.internal", true);
-        let entry = &servers["playwright"];
+    fn claude_playwright_entry_is_permanent_http_config() {
+        let entry = playwright_mcp_entry("host.containers.internal", false);
         assert_eq!(entry["type"], "http");
         assert_eq!(entry["url"], "http://host.containers.internal:8931/mcp");
         assert_eq!(entry["headers"]["Host"], "localhost:8931");
-        // OpenCode's `enabled` key is not part of the Claude entry.
         assert!(entry["enabled"].is_null());
-
-        apply_playwright_entry(&mut servers, "host.containers.internal", false);
-        assert!(!servers.contains_key("playwright"));
     }
 
     #[test]
-    fn claude_keeps_a_user_defined_playwright_entry() {
-        let mut servers = serde_json::Map::new();
-        servers.insert(
-            "playwright".to_string(),
-            serde_json::json!({"type": "http", "url": "http://example.test/mcp"}),
-        );
-        apply_playwright_entry(&mut servers, "host.containers.internal", false);
-        assert_eq!(
-            servers["playwright"]["url"], "http://example.test/mcp",
-            "a playwright entry ai-pod did not write must survive"
-        );
-    }
-
-    #[test]
-    fn codex_config_adds_and_removes_playwright() {
-        let with_pw = codex_config_merge(
-            "",
-            "http://host.containers.internal:7822",
-            "k1",
-            "s2",
-            Some("host.containers.internal"),
-        );
-        let doc = with_pw.parse::<toml_edit::DocumentMut>().unwrap();
-        assert_eq!(
-            doc["mcp_servers"]["playwright"]["url"].as_str(),
-            Some("http://host.containers.internal:8931/mcp")
-        );
-        assert_eq!(
-            doc["mcp_servers"]["playwright"]["http_headers"]["Host"].as_str(),
-            Some("localhost:8931")
-        );
-
-        // A later launch without --playwright must drop the entry again while
-        // leaving ai-pod's own server intact.
-        let without = codex_config_merge(
-            &with_pw,
-            "http://host.containers.internal:7822",
-            "k1",
-            "s3",
-            None,
-        );
-        let doc = without.parse::<toml_edit::DocumentMut>().unwrap();
-        assert!(doc["mcp_servers"].get("playwright").is_none());
-        assert!(doc["mcp_servers"].get("ai-pod").is_some());
-    }
-
-    #[test]
-    fn codex_config_keeps_a_user_defined_playwright_entry() {
-        let existing = "[mcp_servers.playwright]\nurl = \"http://example.test/mcp\"\n";
+    fn codex_config_always_enables_playwright() {
+        let existing = "[mcp_servers.playwright]\nurl = \"http://old-host/mcp\"\nenabled = false\n";
         let out = codex_config_merge(
             existing,
             "http://host.containers.internal:7822",
-            "k1",
-            "s2",
-            None,
+            "host.containers.internal",
         );
         let doc = out.parse::<toml_edit::DocumentMut>().unwrap();
+        let server = &doc["mcp_servers"]["playwright"];
         assert_eq!(
-            doc["mcp_servers"]["playwright"]["url"].as_str(),
-            Some("http://example.test/mcp")
+            server["url"].as_str(),
+            Some("http://host.containers.internal:8931/mcp")
+        );
+        assert_eq!(
+            server["http_headers"]["Host"].as_str(),
+            Some("localhost:8931")
+        );
+        assert_eq!(server["enabled"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn playwright_guidance_preserves_instructions_without_duplication() {
+        let existing = "# Personal instructions\nKeep my preferred style.\n";
+        let updated = with_playwright_guidance(existing);
+        assert!(updated.starts_with(existing));
+        assert!(updated.contains(PLAYWRIGHT_GUIDANCE));
+        assert_eq!(with_playwright_guidance(&updated), updated);
+        assert_eq!(
+            with_playwright_guidance(""),
+            format!("{PLAYWRIGHT_GUIDANCE}\n")
         );
     }
 
     #[test]
     fn codex_config_merge_into_empty() {
-        let out = codex_config_merge("", "http://host.containers.internal:7822", "k1", "s2", None);
+        let out = codex_config_merge(
+            "",
+            "http://host.containers.internal:7822",
+            "host.containers.internal",
+        );
         let doc = out.parse::<toml_edit::DocumentMut>().unwrap();
         assert_eq!(doc["experimental_use_rmcp_client"].as_bool(), Some(true));
         assert_eq!(doc["approval_policy"].as_str(), Some("never"));
@@ -1693,10 +1596,13 @@ mod tests {
             server["url"].as_str(),
             Some("http://host.containers.internal:7822/mcp")
         );
-        assert_eq!(server["http_headers"]["X-Api-Key"].as_str(), Some("k1"));
         assert_eq!(
-            server["http_headers"]["X-Ai-Pod-Session-Id"].as_str(),
-            Some("s2")
+            server["env_http_headers"]["X-Api-Key"].as_str(),
+            Some("AI_POD_API_KEY")
+        );
+        assert_eq!(
+            server["env_http_headers"]["X-Ai-Pod-Session-Id"].as_str(),
+            Some("AI_POD_SESSION_ID")
         );
     }
 
@@ -1706,18 +1612,19 @@ mod tests {
         let out = codex_config_merge(
             existing,
             "http://host.containers.internal:7822",
-            "k1",
-            "s2",
-            None,
+            "host.containers.internal",
         );
         // The user's key and comment survive (toml_edit, not a typed rewrite).
-        assert!(out.contains("# my comment"), "comment should survive: {out}");
+        assert!(
+            out.contains("# my comment"),
+            "comment should survive: {out}"
+        );
         let doc = out.parse::<toml_edit::DocumentMut>().unwrap();
         assert_eq!(doc["model"].as_str(), Some("gpt-5"));
         // ...and ai-pod's keys are still merged in.
         assert_eq!(
-            doc["mcp_servers"]["ai-pod"]["http_headers"]["X-Api-Key"].as_str(),
-            Some("k1")
+            doc["mcp_servers"]["ai-pod"]["env_http_headers"]["X-Api-Key"].as_str(),
+            Some("AI_POD_API_KEY")
         );
     }
 
@@ -1725,7 +1632,11 @@ mod tests {
     fn codex_config_merge_url_uses_runtime_gateway() {
         // On Docker the gateway is host.docker.internal — the url must reflect
         // whatever server_url is passed, not a hardcoded host.
-        let out = codex_config_merge("", "http://host.docker.internal:7822", "k1", "s2", None);
+        let out = codex_config_merge(
+            "",
+            "http://host.docker.internal:7822",
+            "host.docker.internal",
+        );
         let doc = out.parse::<toml_edit::DocumentMut>().unwrap();
         assert_eq!(
             doc["mcp_servers"]["ai-pod"]["url"].as_str(),
@@ -1734,19 +1645,18 @@ mod tests {
     }
 
     #[test]
-    fn codex_config_merge_overwrites_stale_session() {
-        let first = codex_config_merge("", "http://h:7822", "k1", "old-session", None);
-        let second = codex_config_merge(&first, "http://h:7822", "k2", "new-session", None);
-        let doc = second.parse::<toml_edit::DocumentMut>().unwrap();
+    fn codex_config_migrates_literal_credentials() {
+        let existing = "[mcp_servers.ai-pod.http_headers]\nX-Api-Key = \"old-key\"\nX-Ai-Pod-Session-Id = \"old-session\"\nOther = \"preserved\"\n";
+        let output = codex_config_merge(existing, "http://h:7822", "host.containers.internal");
+        let doc = output.parse::<toml_edit::DocumentMut>().unwrap();
         let server = &doc["mcp_servers"]["ai-pod"];
-        assert_eq!(server["http_headers"]["X-Api-Key"].as_str(), Some("k2"));
+        assert_eq!(server["http_headers"]["Other"].as_str(), Some("preserved"));
         assert_eq!(
-            server["http_headers"]["X-Ai-Pod-Session-Id"].as_str(),
-            Some("new-session")
+            server["env_http_headers"]["X-Api-Key"].as_str(),
+            Some("AI_POD_API_KEY")
         );
-        // No stale session credential left behind.
-        assert!(second.contains("new-session"));
-        assert!(!second.contains("old-session"), "stale session must be gone: {second}");
+        assert!(!output.contains("old-key"));
+        assert!(!output.contains("old-session"));
     }
 
     #[test]

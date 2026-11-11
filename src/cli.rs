@@ -10,7 +10,6 @@ pub enum Agent {
 
 #[derive(ValueEnum, Clone, Debug, PartialEq)]
 pub enum BaseImage {
-    Alpine,
     Ubuntu,
     Node,
     Rust,
@@ -53,7 +52,7 @@ pub struct Cli {
 
     /// Start Playwright MCP on the host and expose it to the agent in the
     /// container, so it drives a real browser with your own logins.
-    /// Without this flag the Playwright MCP entry is removed again.
+    /// The MCP entry is always configured; without this flag it may fail to connect.
     #[arg(long)]
     pub playwright: bool,
 }
@@ -87,7 +86,7 @@ pub enum Command {
     /// List all ai-pod containers
     List,
 
-    /// Remove the container for current/specified workspace
+    /// Remove workspace containers, image, volumes, networks, and runtime state
     Clean {
         /// Workspace path (default: cwd)
         #[arg(long)]
@@ -344,6 +343,14 @@ pub enum AllowedAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_supports_only_glibc_base_images() {
+        for image in ["ubuntu", "node", "rust", "python"] {
+            assert!(Cli::try_parse_from(["ai-pod", "init", "--image", image]).is_ok());
+        }
+        assert!(Cli::try_parse_from(["ai-pod", "init", "--image", "alpine"]).is_err());
+    }
 
     #[test]
     fn publish_preserves_runtime_syntax_and_command_args() {

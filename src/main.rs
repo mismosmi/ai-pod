@@ -145,33 +145,22 @@ fn resolve_agent(agent: Option<cli::Agent>) -> Result<cli::Agent> {
     }
 }
 
-fn resolve_base_image(agent: &cli::Agent, image: Option<cli::BaseImage>) -> Result<cli::BaseImage> {
-    if let Some(ref i) = image {
-        if matches!(agent, cli::Agent::Opencode) && matches!(i, cli::BaseImage::Alpine) {
-            anyhow::bail!("opencode is not supported on Alpine (glibc-linked binary incompatible with musl). Use ubuntu, node, rust, or python.");
-        }
-        return Ok(image.unwrap());
+fn resolve_base_image(image: Option<cli::BaseImage>) -> Result<cli::BaseImage> {
+    if let Some(image) = image {
+        return Ok(image);
     }
 
-    let (items, variants): (&[&str], &[cli::BaseImage]) = match agent {
-        cli::Agent::Opencode => (&["Ubuntu", "Node", "Rust", "Python"], &[
-            cli::BaseImage::Ubuntu,
-            cli::BaseImage::Node,
-            cli::BaseImage::Rust,
-            cli::BaseImage::Python,
-        ]),
-        cli::Agent::Claude | cli::Agent::Codex => (&["Alpine", "Ubuntu", "Node", "Rust", "Python"], &[
-            cli::BaseImage::Alpine,
-            cli::BaseImage::Ubuntu,
-            cli::BaseImage::Node,
-            cli::BaseImage::Rust,
-            cli::BaseImage::Python,
-        ]),
-    };
+    let items = ["Ubuntu", "Node", "Rust", "Python"];
+    let variants = [
+        cli::BaseImage::Ubuntu,
+        cli::BaseImage::Node,
+        cli::BaseImage::Rust,
+        cli::BaseImage::Python,
+    ];
 
     let sel = dialoguer::Select::new()
         .with_prompt("Select base image")
-        .items(items)
+        .items(&items)
         .default(0)
         .interact()
         .context("Selection cancelled")?;
@@ -187,11 +176,6 @@ struct BaseImageConfig {
 
 fn base_image_config(image: &cli::BaseImage) -> BaseImageConfig {
     match image {
-        cli::BaseImage::Alpine => BaseImageConfig {
-            from: "alpine:latest",
-            install_packages: "RUN apk add --no-cache curl git vim bash",
-            create_user: "RUN adduser -D -h /home/ai-pod ai-pod && chown -R ai-pod /app",
-        },
         cli::BaseImage::Ubuntu => BaseImageConfig {
             from: "ubuntu:latest",
             install_packages: "RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git vim && rm -rf /var/lib/apt/lists/*",
@@ -232,7 +216,7 @@ fn init_project(
     }
 
     let agent = resolve_agent(agent)?;
-    let image = resolve_base_image(&agent, image)?;
+    let image = resolve_base_image(image)?;
 
     let agent_str = match agent {
         cli::Agent::Claude => "claude",
@@ -552,6 +536,7 @@ async fn main() -> Result<()> {
             let ws = workdir.clone().or_else(|| cli.workdir.clone());
             let workspace = resolve_workspace(&ws)?;
             container::clean_container(&rt, &config, &workspace)?;
+            let _ = server::lifecycle::reload_config().await;
         }
         Some(Command::Mask {
             action: MaskAction::List { workdir },

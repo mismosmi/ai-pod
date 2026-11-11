@@ -114,7 +114,13 @@ pub fn needs_build(rt: &ContainerRuntime, image: &str, force: bool) -> Result<bo
     Ok(!image_exists(rt, image)?)
 }
 
+pub fn clean_build_marker(workspace: &Path) -> std::path::PathBuf {
+    workspace.join(".ai-pod").join("clean-build")
+}
+
 pub fn build_image(rt: &ContainerRuntime, dockerfile: &Path, image: &str, no_cache: bool) -> Result<()> {
+    let clean_marker = clean_build_marker(dockerfile.parent().unwrap_or(Path::new(".")));
+    let no_cache = no_cache || clean_marker.exists();
     eprintln!("{}", "Building container image...".blue().bold());
 
     let version_arg = format!("AI_POD_VERSION={}", env!("CARGO_PKG_VERSION"));
@@ -174,12 +180,13 @@ pub fn build_image(rt: &ContainerRuntime, dockerfile: &Path, image: &str, no_cac
         anyhow::bail!("{} build failed", rt.cmd());
     }
 
+    if clean_marker.exists() { std::fs::remove_file(clean_marker)?; }
     eprintln!("{}", "Image built successfully.".green().bold());
     Ok(())
 }
 
 pub fn ensure_image(rt: &ContainerRuntime, dockerfile: &Path, image: &str, force: bool, no_cache: bool) -> Result<()> {
-    if needs_build(rt, image, force)? {
+    if needs_build(rt, image, force || clean_build_marker(dockerfile.parent().unwrap_or(Path::new("."))).exists())? {
         build_image(rt, dockerfile, image, no_cache)?;
     } else {
         eprintln!("{}", "Container image is up to date.".green());

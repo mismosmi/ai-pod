@@ -3,19 +3,29 @@
 #   curl http://${HOST_GATEWAY}:7822/install/codex.sh | bash
 set -e
 
-# Install a tiny shim that lazily fetches the official Codex installer on
-# first invocation, then execs into the real binary. This keeps the image
-# small and lets users always run the latest agent without rebuilding.
-cat > /usr/local/bin/codex <<'SHIM'
-#!/bin/sh
-set -e
-if [ ! -x "$HOME/.local/bin/codex" ]; then
-  curl -fsSL https://chatgpt.com/codex/install.sh | bash
-fi
-exec "$HOME/.local/bin/codex" "$@"
-SHIM
-chmod 0755 /usr/local/bin/codex
-echo "Installed codex shim at /usr/local/bin/codex"
+# Use the portable upstream package on all supported base images.
+case "$(uname -m)" in
+  x86_64) arch=x86_64 ;;
+  aarch64|arm64) arch=aarch64 ;;
+  *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT HUP INT TERM
+curl -fsSL "https://github.com/openai/codex/releases/latest/download/codex-package-${arch}-unknown-linux-musl.tar.gz" -o "$work/codex.tar.gz"
+mkdir -p "$work/package" /usr/bin /usr/lib
+tar -xzf "$work/codex.tar.gz" -C "$work/package"
+# The daemon copies the complete package. Keep its root isolated from system
+# directories and expose the native executables on every user's PATH.
+rm -rf /usr/lib/codex
+mv "$work/package" /usr/lib/codex
+for binary in /usr/lib/codex/bin/*; do
+  ln -sf "$binary" "/usr/bin/${binary##*/}"
+done
+# Remove the previous layout, which incorrectly treated all of /usr as a package.
+rm -f /usr/codex-package.json
+rm -rf /usr/codex-path /usr/codex-resources
+rm -f /usr/local/bin/codex
+/usr/bin/codex --version
 
 # Completion-notification helper invoked by codex's `notify` config option.
 # Codex passes a JSON event as $1; we ignore it and send a generic message,

@@ -20,8 +20,7 @@ lazy_static! {
     /// `build`. Parallel podman commands sharing the overlay cache corrupt
     /// each other ("layer not known", missing `merged` dir), which is why
     /// builds previously had to pass --no-cache. Locking the whole runtime
-    /// lets us keep the layer cache enabled so alpine and apk aren't
-    /// re-fetched for every test.
+    /// lets us reuse the base image and installed packages across tests.
     ///
     /// `None` means no runtime is available on this machine; tests that
     /// require one skip via `try_runtime()`.
@@ -43,10 +42,10 @@ lazy_static! {
 /// The Dockerfile used by most e2e tests. Hardcoded here so we can build it
 /// once and reuse the resulting image across all tests that don't specifically
 /// test build behaviour.
-const SHARED_DOCKERFILE: &str = r#"FROM alpine:latest
-RUN apk add --no-cache curl git vim
+const SHARED_DOCKERFILE: &str = r#"FROM ubuntu:latest
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git vim && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-RUN adduser -D ai-pod && chown -R ai-pod /app
+RUN useradd -ms /bin/bash ai-pod && chown -R ai-pod /app
 RUN git config --system user.email "ai-pod@ai-pod" && \
     git config --system user.name "ai-pod"
 USER ai-pod
@@ -54,7 +53,7 @@ ENV PATH="/home/ai-pod/.local/bin:${PATH}"
 ENV EDITOR=vim
 "#;
 
-const SHARED_IMAGE_TAG: &str = "ai-pod-e2e-shared:test";
+const SHARED_IMAGE_TAG: &str = "ai-pod-e2e-shared:ubuntu";
 static SHARED_IMAGE_BUILT: OnceLock<()> = OnceLock::new();
 
 /// Returns the shared test image tag, building it on the first call.
@@ -145,10 +144,10 @@ fn make_test_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
     let dst = ws.path().join(image::DOCKERFILE_NAME);
     std::fs::write(
         &dst,
-        r#"FROM alpine:latest
-RUN apk add --no-cache curl git vim
+        r#"FROM ubuntu:latest
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git vim && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-RUN adduser -D ai-pod && chown -R ai-pod /app
+RUN useradd -ms /bin/bash ai-pod && chown -R ai-pod /app
 RUN git config --system user.email "ai-pod@ai-pod" && \
     git config --system user.name "ai-pod"
 USER ai-pod
@@ -395,6 +394,8 @@ fn e2e_clean_container_removes_all() {
             &name,
             "--label",
             "managed-by=ai-pod",
+            "-v",
+            "/scratch-data",
             tag,
             "sleep",
             "300",
@@ -403,6 +404,10 @@ fn e2e_clean_container_removes_all() {
         .unwrap();
     assert!(status.success());
 
+    let details = rt.command().args(["inspect", &name]).output().unwrap();
+    let details: serde_json::Value = serde_json::from_slice(&details.stdout).unwrap();
+    let anonymous = details[0]["Mounts"].as_array().unwrap().iter()
+        .find(|m| m["Destination"] == "/scratch-data").unwrap()["Name"].as_str().unwrap().to_owned();
     // Verify both exist
     assert!(container::volume_exists(&rt, &vol).unwrap());
     assert!(
@@ -411,9 +416,36 @@ fn e2e_clean_container_removes_all() {
             .is_empty()
     );
 
-    // Production clean_container should remove both
+    // Also cover unlabelled helpers, orphaned masks, networks and the image.
+    let helper = format!("{prefix}-init-stale");
+    assert!(rt.command().args(["create", "--name", &helper, tag, "true"]).status().unwrap().success());
+    let mask = workspace::mask_volume_name(ws.path(), "obsolete");
+    assert!(rt.command().args(["volume", "create", &mask]).status().unwrap().success());
+    let net = ai_pod::service::ensure_service_network(&rt, ws.path()).unwrap();
+    let workspace_image = image::image_name(ws.path());
+    assert!(rt.command().args(["tag", tag, &workspace_image]).status().unwrap().success());
     let (_cfg_dir, cfg) = make_test_config();
+    let state = cfg.project_state_file(&workspace::workspace_hash(ws.path()));
+    std::fs::write(&state, "{}").unwrap();
+    ai_pod::config::SessionState { workspace: Some(workspace::workspace_hash(ws.path())), runtime: rt.kind, network: None }
+        .save(&cfg, "orphaned-session").unwrap();
     container::clean_container(&rt, &cfg, ws.path()).unwrap();
+    assert!(!container::volume_exists(&rt, &mask).unwrap());
+    assert!(!container::volume_exists(&rt, &anonymous).unwrap());
+    assert!(image::needs_build(&rt, &workspace_image, false).unwrap());
+    assert!(!rt.command().args(["container", "inspect", &helper]).output().unwrap().status.success());
+    assert!(!rt.command().args(["network", "inspect", &net]).output().unwrap().status.success());
+    assert!(!state.exists());
+    assert!(!cfg.session_state_file("orphaned-session").exists());
+    assert!(image::clean_build_marker(ws.path()).exists());
+    // Unrelated/shared images must survive.
+    assert!(!image::needs_build(&rt, tag, false).unwrap());
+    let dockerfile = ws.path().join(image::DOCKERFILE_NAME);
+    std::fs::write(&dockerfile, format!("FROM {tag}\nRUN true\n")).unwrap();
+    image::ensure_image(&rt, &dockerfile, &workspace_image, false, false).unwrap();
+    assert!(!image::clean_build_marker(ws.path()).exists());
+    container::clean_container(&rt, &cfg, ws.path()).unwrap();
+
 
     assert!(
         !container::volume_exists(&rt, &vol).unwrap(),
@@ -637,7 +669,7 @@ async fn e2e_server_reachable_from_container() {
         }
     };
 
-    // Use the shared test image (has curl from apk add)
+    // Use the shared test image (includes curl)
     let tag = shared_image_tag(&rt);
 
     // Start the production server on a free port
@@ -1093,4 +1125,117 @@ async fn e2e_egress_gateway_forwards_proxy_and_blocks_direct_access() {
     egress::remove_filtered_network(&rt, workspace);
     cleanup_network(&rt, &workspace::service_network_name(workspace));
     server_handle.abort();
+}
+
+/// Home setup is versioned and every injected file belongs to the image USER,
+/// including when a Dockerfile changes both the user and home directory.
+#[test]
+fn e2e_home_injection_version_and_image_user() {
+    let rt = require_runtime!();
+    let base = shared_image_tag(&rt);
+    let ws = tempfile::TempDir::new().unwrap();
+    let dockerfile = ws.path().join(image::DOCKERFILE_NAME);
+    std::fs::write(
+        ws.path().join("fake-agent"),
+        r#"#!/bin/sh
+set -eu
+test "$#" = 1 && test "$1" = 'one two'
+test -z "${AI_POD_CLAUDE_MCP_CONFIG+x}"
+test -z "${AI_POD_CODEX_PLAYWRIGHT_CONFIG+x}"
+
+"#,
+    )
+    .unwrap();
+    std::fs::write(&dockerfile, format!("FROM {base}\nUSER root\nCOPY fake-agent /usr/bin/claude\nCOPY fake-agent /usr/bin/codex\nRUN chmod 755 /usr/bin/claude /usr/bin/codex && useradd -m -u 2345 -d /home/developer developer\nUSER developer\nENV HOME=/home/developer\nCMD [\"true\"]\n")).unwrap();
+    let tag = image::image_name(ws.path());
+    build_image(&rt, &dockerfile, &tag);
+    let (_dir, config) = make_test_config();
+    std::fs::create_dir_all(config.codex_dir()).unwrap();
+    std::fs::create_dir_all(config.home_dir.join(".claude")).unwrap();
+    std::fs::write(
+        config.codex_dir().join("AGENTS.md"),
+        "Keep my Codex preferences.\n",
+    )
+    .unwrap();
+    // Exceed Linux's per-argument limit to catch inline-script regressions.
+    let large_instructions = format!(
+        "Keep my Claude preferences.\n{}",
+        "Extra instruction line.\n".repeat(20_000)
+    );
+    std::fs::write(config.claude_md_path(), &large_instructions).unwrap();
+
+    let run = |script: &str, playwright: bool| {
+        container::run_in_container(
+            &rt,
+            &config,
+            ws.path(),
+            &tag,
+            "project",
+            "key",
+            "sh",
+            &["-c".into(), script.into()],
+            false,
+            playwright,
+            &[],
+        )
+        .unwrap();
+    };
+    run(
+        "test \"$HOME\" = /home/developer && test \"$(id -u)\" = 2345 && test \"$(stat -c %u $HOME/.claude.json)\" = 2345 && test \"$(stat -c %u $HOME/.codex/config.toml)\" = 2345 && test \"$(stat -c %u $HOME/.claude/skills/ai-pod/SKILL.md)\" = 2345 && printf preserved > $HOME/.claude/skills/ai-pod/SKILL.md && printf auth > $HOME/.codex/auth.json",
+        false,
+    );
+    run(
+        r#"test -z "$(find "$HOME" -maxdepth 1 -name '.ai-pod-init-*.sh' -print)" && test "$(wc -c < "$HOME/.claude/CLAUDE.md")" -gt 400000"#,
+        false,
+    );
+    let volume = workspace::volume_name(ws.path());
+    let output = rt
+        .command()
+        .args(["volume", "inspect", &volume])
+        .output()
+        .unwrap();
+    let inspect: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        inspect[0]["Labels"][container::HOME_VERSION_LABEL],
+        env!("CARGO_PKG_VERSION")
+    );
+    run(
+        r#"grep -q 'Keep my Codex preferences.' "$HOME/.codex/AGENTS.md" && grep -q 'Keep my Claude preferences.' "$HOME/.claude/CLAUDE.md" && grep -q 'ai-pod --playwright' "$HOME/.codex/AGENTS.md" && grep -q 'ai-pod --playwright' "$HOME/.claude/CLAUDE.md" && grep -q '8931/mcp' "$HOME/.claude.json" && grep -q '8931/mcp' "$HOME/.codex/config.toml" && printf %s "$OPENCODE_CONFIG_CONTENT" | grep -q '8931/mcp'"#,
+        false,
+    );
+    run(
+        r#"test "$AI_POD_API_KEY" = key && test -n "$AI_POD_SESSION_ID" && grep -Fq '${AI_POD_SESSION_ID}' "$HOME/.claude.json" && grep -q env_http_headers "$HOME/.codex/config.toml" && cd "$HOME" && sha256sum .claude.json .codex/config.toml > .config-checksums"#,
+        false,
+    );
+    run(
+        r#"cd "$HOME" && sha256sum -c .config-checksums && test "$(cat .claude/skills/ai-pod/SKILL.md)" = preserved && test "$(cat .codex/auth.json)" = auth"#,
+        true,
+    );
+    for playwright in [false, true] {
+        for agent in ["claude", "codex"] {
+            container::run_in_container(
+                &rt,
+                &config,
+                ws.path(),
+                &tag,
+                "project",
+                "key",
+                agent,
+                &["one two".into()],
+                false,
+                playwright,
+                &[],
+            )
+            .unwrap();
+        }
+    }
+    run(
+        r#"cd "$HOME" && sha256sum -c .config-checksums && printf old-version > .ai-pod-version"#,
+        false,
+    );
+    run(
+        r#"grep -q '^name: ai-pod$' "$HOME/.claude/skills/ai-pod/SKILL.md" && test "$(cat "$HOME/.codex/auth.json")" = auth"#,
+        false,
+    );
+    container::clean_container(&rt, &config, ws.path()).unwrap();
 }

@@ -3,16 +3,26 @@
 #   curl http://${HOST_GATEWAY}:7822/install/claude.sh | bash
 set -e
 
-# Install a tiny shim that lazily fetches the official Claude installer on
-# first invocation, then execs into the real binary. This keeps the image
-# small and lets users always run the latest agent without rebuilding.
-cat > /usr/local/bin/claude <<'SHIM'
-#!/bin/sh
-set -e
-if [ ! -x "$HOME/.local/bin/claude" ]; then
-  curl -fsSL https://claude.ai/install.sh | bash
+# Use Anthropic's signed stable repository rather than a per-user install.
+if command -v apt-get >/dev/null 2>&1; then
+  apt-get update
+  apt-get install -y --no-install-recommends ca-certificates curl gnupg
+  install -d -m 0755 /etc/apt/keyrings
+  curl -fsSL https://downloads.claude.ai/keys/claude-code.asc \
+    -o /etc/apt/keyrings/claude-code.asc
+  fingerprints=$(gpg --batch --show-keys --with-colons /etc/apt/keyrings/claude-code.asc | awk -F: '$1 == "fpr" {print $10}')
+  [ "$fingerprints" = '31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE' ] || {
+    echo 'Unexpected Claude Code signing key' >&2
+    exit 1
+  }
+  chmod 0644 /etc/apt/keyrings/claude-code.asc
+  echo 'deb [signed-by=/etc/apt/keyrings/claude-code.asc] https://downloads.claude.ai/claude-code/apt/stable stable main' > /etc/apt/sources.list.d/claude-code.list
+  apt-get update
+  apt-get install -y --no-install-recommends claude-code
+  rm -rf /var/lib/apt/lists/*
+else
+  echo 'Unsupported package manager: Claude Code requires apt' >&2
+  exit 1
 fi
-exec "$HOME/.local/bin/claude" "$@"
-SHIM
-chmod 0755 /usr/local/bin/claude
-echo "Installed claude shim at /usr/local/bin/claude"
+rm -f /usr/local/bin/claude
+claude --version

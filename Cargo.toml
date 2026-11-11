@@ -34,6 +34,7 @@ regex = "1"
 tower_governor = "0.8"
 ratatui = "0.30"
 crossterm = "0.29"
+tar = "0.4"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
