@@ -18,6 +18,14 @@ use anyhow::Result;
 use colored::Colorize;
 use std::path::Path;
 
+/// Preserve terminal capabilities without overriding image defaults when unset.
+fn terminal_env_args() -> impl Iterator<Item = &'static str> {
+    ["TERM", "COLORTERM", "TERM_PROGRAM"]
+        .into_iter()
+        .filter(|name| std::env::var_os(name).is_some())
+        .flat_map(|name| ["-e", name])
+}
+
 fn load_project_state(config: &AppConfig, workspace: &Path) -> ProjectState {
     let hash = workspace_hash(workspace);
     ProjectState::load(&config.project_state_file(&hash))
@@ -104,6 +112,7 @@ pub fn launch_container(
     let script_path = format!("{home}/.ai-pod-init-{session_id}.sh");
     let mut run_cmd = rt.command();
     run_cmd.args(["create", "--rm", "-it"]);
+    run_cmd.args(terminal_env_args());
     run_cmd.args([
         "--name",
         &container_name,
@@ -238,6 +247,9 @@ pub fn run_in_container(
     let stdio_flag = if interactive { "-it" } else { "-i" };
     let script_path = format!("{home}/.ai-pod-init-{session_id}.sh");
     let mut run_args: Vec<String> = vec!["create".into(), "--rm".into(), stdio_flag.into()];
+    if interactive {
+        run_args.extend(terminal_env_args().map(String::from));
+    }
     run_args.extend_from_slice(&[
         "--name".into(),
         container_name.clone(),
