@@ -60,13 +60,16 @@ mv "${TMP}" "${INSTALL_DIR}/${BINARY_NAME}"
 echo "Installed ${BINARY_NAME} to ${INSTALL_DIR}/${BINARY_NAME}"
 
 # Advise the user if the install dir isn't in PATH
-if ! printf '%s\n' "${PATH//:/$'\n'}" | grep -qx "${INSTALL_DIR}"; then
-  echo ""
-  echo "Note: ${INSTALL_DIR} is not in your PATH."
-  echo "Add this line to your shell config (~/.bashrc, ~/.zshrc, etc.) and restart your shell:"
-  echo ""
-  echo "  export PATH=\"\${HOME}/.local/bin:\${PATH}\""
-  echo ""
-fi
+case ":${PATH}:" in
+  *":${INSTALL_DIR}:"*) ;;
+  *)
+    echo ""
+    echo "Note: ${INSTALL_DIR} is not in your PATH."
+    echo "Add this line to your shell config (~/.bashrc, ~/.zshrc, etc.) and restart your shell:"
+    echo ""
+    echo "  export PATH=\"\${HOME}/.local/bin:\${PATH}\""
+    echo ""
+    ;;
+esac
 
 echo "Done! Run '${BINARY_NAME} --help' to get started."
