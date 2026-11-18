@@ -26,7 +26,7 @@ pub struct Cli {
     #[arg(long)]
     pub no_credential_check: bool,
 
-    /// Force image rebuild
+    /// Force image rebuild without Docker/Podman layer cache
     #[arg(long)]
     pub rebuild: bool,
 

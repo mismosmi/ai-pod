@@ -75,7 +75,7 @@ ai-pod --workdir /path/to/project
 | Flag | Description |
 |---|---|
 | `--workdir <PATH>` | Use a specific workspace directory (default: cwd) |
-| `--rebuild` | Force a rebuild of the container image |
+| `--rebuild` | Force a rebuild of the container image without the Docker/Podman layer cache |
 | `--no-cache` | Build the image without the Docker/Podman layer cache |
 | `--no-credential-check` | Skip scanning the workspace for credential files |
 | `-p, --publish <PORT>` | Publish a container port; repeatable and passed directly to Podman/Docker (e.g. `ai-pod -p 8080:80` or `ai-pod -p 8080:80 run bash`) |
