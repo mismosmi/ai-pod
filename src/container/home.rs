@@ -194,14 +194,48 @@ fn read_home_file(
     if !output.status.success() {
         let error = String::from_utf8_lossy(&output.stderr).to_lowercase();
         anyhow::ensure!(
-            error.contains("no such")
-                || error.contains("not found")
-                || error.contains("does not exist"),
+            is_missing_path_error(&error),
             "Failed reading {path}: {error}"
         );
         return Ok(None);
     }
     Ok(Some(std::fs::read_to_string(target)?))
+}
+
+/// True when `podman/docker cp` failed only because the source path doesn't exist yet
+/// (e.g. a brand-new home volume). Wording differs by runtime and version; Docker 29 says
+/// "could not find the file ... in container".
+fn is_missing_path_error(error: &str) -> bool {
+    let e = error.to_lowercase();
+    e.contains("no such")
+        || e.contains("not found")
+        || e.contains("does not exist")
+        || e.contains("could not find the file")
+}
+
+#[cfg(test)]
+mod missing_path_tests {
+    use super::is_missing_path_error;
+
+    #[test]
+    fn recognises_runtime_missing_file_messages() {
+        for msg in [
+            "Error: no such file or directory",
+            "Error response from daemon: Could not find the file /home/ai-pod/.ai-pod-version in container ai-pod-1",
+            "path not found",
+            "file does not exist",
+        ] {
+            assert!(is_missing_path_error(msg), "{msg}");
+        }
+    }
+
+    #[test]
+    fn other_errors_still_fail() {
+        assert!(!is_missing_path_error("permission denied"));
+        assert!(!is_missing_path_error(
+            "Error response from daemon: conflict: container is not running"
+        ));
+    }
 }
 
 pub(super) fn ensure_home_volume(rt: &ContainerRuntime, volume: &str) -> Result<()> {
