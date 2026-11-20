@@ -48,6 +48,8 @@ static CREDENTIAL_NAME_RE: LazyLock<RegexSet> = LazyLock::new(|| {
         r"^terraform\.tfstate$",
         // Key material and Terraform variable files, by extension
         r"\.(pem|key|p12|pfx|jks|keystore|tfvars)$",
+        // ai-pod's sealed secrets file: flagged only while it is still plaintext
+        r"^ai-pod\.secrets\.env$",
     ])
     .expect("credential name patterns are valid regexes")
 });
@@ -62,6 +64,22 @@ static CREDENTIAL_PATH_RE: LazyLock<RegexSet> = LazyLock::new(|| {
     ])
     .expect("credential path patterns are valid regexes")
 });
+
+/// True when the file is SOPS-encrypted (values are `ENC[...]` and SOPS metadata is
+/// present). Such files hold no plaintext secrets, so the scan does not flag them.
+/// Reads at most 256 KiB.
+pub(crate) fn is_sops_encrypted(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = Vec::new();
+    if file.take(256 * 1024).read_to_end(&mut buf).is_err() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&buf);
+    text.contains("ENC[AES256_GCM,") && text.contains("sops")
+}
 
 fn is_credential_file(path: &Path) -> bool {
     if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
@@ -226,6 +244,32 @@ mod tests_is_credential_file {
     }
 
     #[test]
+    fn sealed_secrets_file_flagged_only_while_plaintext() {
+        let ws = tempfile::tempdir().unwrap();
+        let f = ws.path().join("ai-pod.secrets.env");
+        std::fs::write(&f, "API_TOKEN=plaintext\n").unwrap();
+        assert_eq!(scan_workspace(ws.path()), vec![f.clone()]);
+        std::fs::write(
+            &f,
+            "API_TOKEN=ENC[AES256_GCM,data:abc,iv:def,tag:ghi,type:str]\nsops_version=3.9.0\n",
+        )
+        .unwrap();
+        assert!(scan_workspace(ws.path()).is_empty());
+    }
+
+    #[test]
+    fn sops_encrypted_dotenv_variants_are_not_flagged() {
+        let ws = tempfile::tempdir().unwrap();
+        let f = ws.path().join(".env.prod");
+        std::fs::write(
+            &f,
+            "DB=ENC[AES256_GCM,data:abc,iv:def,tag:ghi,type:str]\nsops_mac=ENC[AES256_GCM,data:x]\n",
+        )
+        .unwrap();
+        assert!(scan_workspace(ws.path()).is_empty());
+    }
+
+    #[test]
     fn aws_config_outside_aws_dir_is_not_credential() {
         assert!(!is_credential_file(std::path::Path::new("/project/config")));
     }
@@ -247,6 +291,7 @@ pub fn scan_workspace(workspace: &Path) -> Vec<PathBuf> {
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .filter(|e| is_credential_file(e.path()))
+        .filter(|e| !is_sops_encrypted(e.path()))
         .map(|e| e.into_path())
         .collect()
 }
