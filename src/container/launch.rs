@@ -72,6 +72,14 @@ fn passthrough_env_args_from(list: &str, is_set: impl Fn(&str) -> bool) -> Vec<S
         if !seen.insert(name.to_string()) {
             continue;
         }
+        if name.starts_with("SOPS_") {
+            eprintln!(
+                "{} not passing {} into the container: SOPS key material stays on the host",
+                "warning:".yellow().bold(),
+                name
+            );
+            continue;
+        }
         if is_set(name) {
             out.push("-e".to_string());
             out.push(name.to_string());
@@ -84,6 +92,21 @@ fn passthrough_env_args_from(list: &str, is_set: impl Fn(&str) -> bool) -> Vec<S
         }
     }
     out
+}
+
+/// Decrypt the workspace's SOPS-sealed secrets (see `sealed.rs`) and report them by name.
+fn load_sealed_secrets(workspace: &Path) -> Result<Option<super::sealed::SealedSecrets>> {
+    let sealed = super::sealed::load(workspace)?;
+    if let Some(s) = &sealed {
+        eprintln!(
+            "{} {} from {} (sops), passed by name: {}",
+            "Secrets:".blue().bold(),
+            s.len(),
+            s.file().file_name().unwrap_or_default().to_string_lossy(),
+            s.names().collect::<Vec<_>>().join(", ")
+        );
+    }
+    Ok(sealed)
 }
 
 pub fn launch_container(
@@ -101,6 +124,8 @@ pub fn launch_container(
     let volume_name = gen_volume_name(workspace);
     let workspace_mounts = crate::workspace::workspace_mount_args(workspace);
     let container_workdir = crate::workspace::container_workdir(workspace).to_string_lossy();
+    // Decrypt before creating anything, so a missing key fails the launch cleanly.
+    let sealed = load_sealed_secrets(workspace)?;
 
     rt.warn_if_rootless_userns_mismatch();
 
@@ -208,7 +233,12 @@ pub fn launch_container(
     for port in publish {
         run_cmd.args(["--publish", port]);
     }
-    run_cmd.args(passthrough_env_args());
+    let mut env_args = passthrough_env_args();
+    if let Some(s) = &sealed {
+        env_args = s.without_overridden(env_args);
+        env_args.extend(s.apply(&mut run_cmd));
+    }
+    run_cmd.args(env_args);
     run_cmd.args([
         "--entrypoint",
         "sh",
@@ -256,6 +286,7 @@ pub fn run_in_container(
     let volume_name = gen_volume_name(workspace);
     let workspace_mounts = crate::workspace::workspace_mount_args(workspace);
     let container_workdir = crate::workspace::container_workdir(workspace).to_string_lossy();
+    let sealed = load_sealed_secrets(workspace)?;
 
     rt.warn_if_rootless_userns_mismatch();
 
@@ -321,7 +352,12 @@ pub fn run_in_container(
     for port in publish {
         run_args.extend(["--publish".to_string(), port.clone()]);
     }
-    run_args.extend(passthrough_env_args());
+    let mut env_args = passthrough_env_args();
+    if let Some(s) = &sealed {
+        env_args = s.without_overridden(env_args);
+        env_args.extend(s.names().flat_map(|n| ["-e".to_string(), n.to_string()]));
+    }
+    run_args.extend(env_args);
     run_args.extend(workspace_mounts);
     run_args.extend(user_mount_args);
     run_args.extend(mask_args);
@@ -365,6 +401,10 @@ pub fn run_in_container(
 
     let mut run_cmd = rt.command();
     run_cmd.args(&run_args);
+    if let Some(s) = &sealed {
+        // Values go on the runtime's environment; run_args already carries the names.
+        let _ = s.apply(&mut run_cmd);
+    }
     let status = execute_main_container(
         rt,
         run_cmd,
@@ -447,6 +487,15 @@ mod passthrough_tests {
             args.iter().all(|a| !a.contains('=')),
             "values must never reach argv"
         );
+    }
+
+    #[test]
+    fn never_passes_sops_key_material() {
+        let args = passthrough_env_args_from(
+            "SOPS_AGE_KEY SOPS_AGE_KEY_FILE GITHUB_TOKEN",
+            set(&["SOPS_AGE_KEY", "SOPS_AGE_KEY_FILE", "GITHUB_TOKEN"]),
+        );
+        assert_eq!(args, vec!["-e", "GITHUB_TOKEN"]);
     }
 
     #[test]

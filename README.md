@@ -434,6 +434,45 @@ ln -s ~/.env-files/my-project/.env .env
 
 The symlink target is outside the mount — the container never sees the actual file. Your app still works on the host.
 
+### Passing secrets by name
+
+To give the agent a token from your host environment, list the variable **names** in `AI_POD_ENV_PASSTHROUGH`:
+
+```sh
+export AI_POD_ENV_PASSTHROUGH="GITHUB_TOKEN,NPM_TOKEN"
+ai-pod
+```
+
+ai-pod adds `-e NAME` for each name that is set, so the container runtime copies the value from ai-pod's own environment. Values never appear on the command line, in `ps`, in shell history or in `--dry-run` output. Unset names are skipped and reported by name. `SOPS_*` names are refused: key material stays on the host.
+
+### Team secrets with SOPS (age, KMS, Vault)
+
+Commit an encrypted `ai-pod.secrets.env` to the workspace and everyone with a key gets the same secrets in their pod, with nothing in plaintext at rest. ai-pod decrypts it **on the host** with [SOPS](https://github.com/getsops/sops) at launch, keeps the plaintext in memory, and passes each value by name the same way as above. The decryption key never enters the container.
+
+One-time setup with [age](https://github.com/FiloSottile/age):
+
+```sh
+age-keygen                         # prints a public key (age1...) and the private key
+export SOPS_AGE_KEY='AGE-SECRET-KEY-1...'   # keep the private key in your environment or password manager
+                                   # (or a key file: SOPS_AGE_KEY_FILE / ~/.config/sops/age/keys.txt)
+cat > .sops.yaml <<'EOF'
+creation_rules:
+  - path_regex: ai-pod\.secrets\.env$
+    age: age1yourpublickey...,age1teammatepublickey...
+EOF
+printf 'API_TOKEN=...\nDB_URL=...\n' | sops encrypt --filename-override ai-pod.secrets.env \
+  --input-type dotenv --output-type dotenv /dev/stdin > ai-pod.secrets.env
+git add .sops.yaml ai-pod.secrets.env
+```
+
+Edit later with `sops ai-pod.secrets.env`; add a teammate by appending their public key to `.sops.yaml` and running `sops updatekeys ai-pod.secrets.env`.
+
+- Another location: `AI_POD_SECRETS_FILE=path/to/file` (absolute or relative to the workspace).
+- If the file exists but cannot be decrypted (no key, `sops` not installed, not encrypted), the launch **fails** instead of starting without its secrets.
+- The credential scan treats a SOPS-encrypted file as safe and flags `ai-pod.secrets.env` only while it is still plaintext.
+- Values live in the session container's environment (visible to the agent, which is the point, and to `docker inspect` / `podman inspect` while the session runs). The container is removed when the session ends.
+- On Windows, run ai-pod in WSL; this works the same there.
+
 ### Host command approval
 
 Claude can only run host commands you have explicitly approved via the interactive prompt. Approved commands are persisted per-workspace so you only approve each one once. The MCP server pre-rejects obviously dangerous patterns (e.g. starting with `cd /`, piping to `| head`/`| tail`) before they reach the approval dialog.

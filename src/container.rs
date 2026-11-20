@@ -5,6 +5,7 @@ mod home;
 mod launch;
 mod lifecycle;
 mod mounts;
+mod sealed;
 
 pub use home::{refresh_skill_in_volume, HOME_VERSION_LABEL};
 pub use launch::{launch_container, run_in_container};
