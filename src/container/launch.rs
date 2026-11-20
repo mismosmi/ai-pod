@@ -31,6 +31,61 @@ fn load_project_state(config: &AppConfig, workspace: &Path) -> ProjectState {
     ProjectState::load(&config.project_state_file(&hash))
 }
 
+/// Env var holding a comma/space separated list of host env var NAMES to pass
+/// into the main container (e.g. `GITHUB_TOKEN,NPM_TOKEN`).
+pub const ENV_PASSTHROUGH_VAR: &str = "AI_POD_ENV_PASSTHROUGH";
+
+/// Build `-e NAME` pairs for host env vars listed in `AI_POD_ENV_PASSTHROUGH`.
+///
+/// Only the NAME is placed on the runtime command line; Podman/Docker read the
+/// value from the ai-pod process environment, so secrets never appear in argv,
+/// `--dry-run` output or logs. Names that are invalid or unset on the host are
+/// skipped (and reported by name on stderr) rather than passed as empty.
+pub fn passthrough_env_args() -> Vec<String> {
+    let list = std::env::var(ENV_PASSTHROUGH_VAR).unwrap_or_default();
+    passthrough_env_args_from(&list, |n| {
+        std::env::var_os(n).is_some_and(|v| !v.is_empty())
+    })
+}
+
+fn passthrough_env_args_from(list: &str, is_set: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for name in list
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+    {
+        let valid = name
+            .chars()
+            .next()
+            .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+            && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric());
+        if !valid {
+            eprintln!(
+                "{} ignoring invalid env name in {}: {:?}",
+                "warning:".yellow().bold(),
+                ENV_PASSTHROUGH_VAR,
+                name
+            );
+            continue;
+        }
+        if !seen.insert(name.to_string()) {
+            continue;
+        }
+        if is_set(name) {
+            out.push("-e".to_string());
+            out.push(name.to_string());
+        } else {
+            eprintln!(
+                "{} {} not set on host; not passed to container",
+                "note:".dimmed(),
+                name
+            );
+        }
+    }
+    out
+}
+
 pub fn launch_container(
     rt: &ContainerRuntime,
     config: &AppConfig,
@@ -153,6 +208,7 @@ pub fn launch_container(
     for port in publish {
         run_cmd.args(["--publish", port]);
     }
+    run_cmd.args(passthrough_env_args());
     run_cmd.args([
         "--entrypoint",
         "sh",
@@ -265,6 +321,7 @@ pub fn run_in_container(
     for port in publish {
         run_args.extend(["--publish".to_string(), port.clone()]);
     }
+    run_args.extend(passthrough_env_args());
     run_args.extend(workspace_mounts);
     run_args.extend(user_mount_args);
     run_args.extend(mask_args);
@@ -369,4 +426,37 @@ fn session_network(
     }
     .save(config, session_id)?;
     Ok(session)
+}
+
+#[cfg(test)]
+mod passthrough_tests {
+    use super::passthrough_env_args_from;
+
+    fn set(names: &'static [&'static str]) -> impl Fn(&str) -> bool {
+        move |n| names.contains(&n)
+    }
+
+    #[test]
+    fn passes_names_only_for_set_vars() {
+        let args = passthrough_env_args_from(
+            "GITHUB_TOKEN, NPM_TOKEN MISSING",
+            set(&["GITHUB_TOKEN", "NPM_TOKEN"]),
+        );
+        assert_eq!(args, vec!["-e", "GITHUB_TOKEN", "-e", "NPM_TOKEN"]);
+        assert!(
+            args.iter().all(|a| !a.contains('=')),
+            "values must never reach argv"
+        );
+    }
+
+    #[test]
+    fn skips_invalid_duplicate_and_empty_entries() {
+        let args = passthrough_env_args_from(",,A=B, 1BAD, OK, OK,", set(&["OK", "A=B", "1BAD"]));
+        assert_eq!(args, vec!["-e", "OK"]);
+    }
+
+    #[test]
+    fn empty_list_yields_nothing() {
+        assert!(passthrough_env_args_from("", set(&["X"])).is_empty());
+    }
 }
