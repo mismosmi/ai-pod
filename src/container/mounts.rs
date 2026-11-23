@@ -1,12 +1,13 @@
 //! Host bind mounts and per-workspace mask volumes.
 
-use super::{volume_exists, CONTAINER_HOME};
+use super::home::HOME_MOUNT_STATE_DIR;
+use super::{CONTAINER_HOME, volume_exists};
 use crate::config::MountSpec;
 use crate::runtime::ContainerRuntime;
 use crate::workspace::mask_volume_name;
 use anyhow::{Context, Result};
 use colored::Colorize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Create a fresh mask volume and chown its root to the container's `ai-pod` user
 /// so the unprivileged in-container user can write under /app/<dir>.
@@ -111,17 +112,45 @@ pub(crate) fn resolve_container_target(spec: &MountSpec, home_dir: &Path) -> Res
     Ok(format!("{}/{}", CONTAINER_HOME, rel.display()))
 }
 
-/// Build `-v` arg pairs for global host bind-mounts. Returned as a flat list
-/// (`-v`, `host:target:opts`, ...) ready to splice into the container run
-/// command after the workspace bind. Missing host paths are skipped with a
-/// stderr warning so a temporarily-absent host directory doesn't brick every
-/// project.
+pub(super) struct GlobalMounts {
+    pub(super) args: Vec<String>,
+    targets: Vec<PathBuf>,
+}
+
+impl GlobalMounts {
+    /// Relative paths to prepare in the home volume before attaching the binds.
+    /// When a parent is covered by another bind, that bind's own parent is
+    /// prepared separately.
+    pub(super) fn home_parents(&self, home: &Path) -> Vec<&Path> {
+        let mut parents: Vec<_> = self
+            .targets
+            .iter()
+            .filter_map(|target| target.parent())
+            .filter(|parent| !self.targets.iter().any(|target| parent.starts_with(target)))
+            .filter_map(|parent| parent.strip_prefix(home).ok())
+            .flat_map(Path::ancestors)
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .collect();
+        parents.sort_unstable();
+        parents.dedup();
+        parents
+    }
+}
+
+/// Build `-v` arg pairs and retain the targets of the mounts that will be
+/// attached. Missing host paths are skipped with a stderr warning.
 ///
 /// Uses the `:z` SELinux label (shared) to match the home-volume mount, so the
 /// host user retains access to e.g. `~/.claude/skills` after the container
 /// touches it. Read-only mounts get `:z,ro`.
-pub(crate) fn build_mount_args(home_dir: &Path, mounts: &[MountSpec]) -> Result<Vec<String>> {
-    let mut out = Vec::with_capacity(mounts.len() * 2);
+pub(super) fn build_mount_args(
+    home_dir: &Path,
+    container_home: &Path,
+    mounts: &[MountSpec],
+) -> GlobalMounts {
+    let mut args = Vec::with_capacity(mounts.len() * 2);
+    let mut targets = Vec::with_capacity(mounts.len());
+    let state_dir = container_home.join(HOME_MOUNT_STATE_DIR);
     for m in mounts {
         // Re-validate against the current $HOME and the current rule set so
         // a stale or hand-edited `~/.ai-pod/config.json` can't bypass the
@@ -139,6 +168,14 @@ pub(crate) fn build_mount_args(home_dir: &Path, mounts: &[MountSpec]) -> Result<
                 continue;
             }
         };
+        if Path::new(&target).starts_with(&state_dir) {
+            eprintln!(
+                "{} mount target {} overlaps ai-pod mount state; skipping",
+                "warning:".yellow().bold(),
+                target
+            );
+            continue;
+        }
         // symlink_metadata so a dangling symlink (target temporarily missing)
         // still counts as present — `MountSpec`'s doc comment says symlinks
         // are intentionally not resolved.
@@ -162,10 +199,11 @@ pub(crate) fn build_mount_args(home_dir: &Path, mounts: &[MountSpec]) -> Result<
             );
         }
         let opts = if m.writable { "z" } else { "z,ro" };
-        out.push("-v".to_string());
-        out.push(format!("{}:{}:{}", m.host, target, opts));
+        args.push("-v".to_string());
+        args.push(format!("{}:{}:{}", m.host, target, opts));
+        targets.push(Path::new(&target).components().collect());
     }
-    Ok(out)
+    GlobalMounts { args, targets }
 }
 
 /// Best-effort removal of a single mask volume. Prints a message on success and
@@ -243,7 +281,7 @@ mod tests {
             container: Some("/home/ai-pod/.claude/skills".into()),
             writable: false,
         }];
-        let args = build_mount_args(dir.path(), &mounts).unwrap();
+        let args = build_mount_args(dir.path(), Path::new(CONTAINER_HOME), &mounts).args;
         assert_eq!(
             args,
             vec![
@@ -264,7 +302,7 @@ mod tests {
             container: Some("/home/ai-pod/.claude/skills".into()),
             writable: true,
         }];
-        let args = build_mount_args(dir.path(), &mounts).unwrap();
+        let args = build_mount_args(dir.path(), Path::new(CONTAINER_HOME), &mounts).args;
         assert_eq!(
             args,
             vec![
@@ -285,7 +323,7 @@ mod tests {
             container: None,
             writable: false,
         }];
-        let args = build_mount_args(dir.path(), &mounts).unwrap();
+        let args = build_mount_args(dir.path(), Path::new(CONTAINER_HOME), &mounts).args;
         assert_eq!(
             args,
             vec![
@@ -304,8 +342,32 @@ mod tests {
             container: Some("/home/ai-pod/x".into()),
             writable: false,
         }];
-        let args = build_mount_args(dir.path(), &mounts).unwrap();
+        let args = build_mount_args(dir.path(), Path::new(CONTAINER_HOME), &mounts).args;
         assert!(args.is_empty(), "missing host path should be skipped");
+    }
+
+    #[test]
+    fn home_mount_parents_are_relative_to_the_image_home() {
+        let dir = TempDir::new().unwrap();
+        let host = dir.path().join("existing");
+        std::fs::create_dir(&host).unwrap();
+        let mounts = [
+            "/home/custom/direct",
+            "/home/custom/one/two/first",
+            "/home/custom/one/./two/second",
+            "/home/custom/one/two/first/hidden/nested",
+            "/home/custom-other/outside",
+        ]
+        .map(|target| MountSpec {
+            host: host.to_str().unwrap().into(),
+            container: Some(target.into()),
+            writable: false,
+        });
+        let mounts = build_mount_args(dir.path(), Path::new("/home/custom"), &mounts);
+        assert_eq!(
+            mounts.home_parents(Path::new("/home/custom")),
+            [Path::new("one"), Path::new("one/two")]
+        );
     }
 
     #[test]
@@ -334,7 +396,7 @@ mod tests {
             container: None,
             writable: false,
         }];
-        let args = build_mount_args(dir.path(), &mounts).unwrap();
+        let args = build_mount_args(dir.path(), Path::new(CONTAINER_HOME), &mounts).args;
         assert!(args.is_empty(), "invalid stored mount should be skipped");
     }
 
@@ -349,7 +411,7 @@ mod tests {
             container: Some("/home/ai-pod/exploit".into()),
             writable: false,
         }];
-        let args = build_mount_args(dir.path(), &mounts).unwrap();
+        let args = build_mount_args(dir.path(), Path::new(CONTAINER_HOME), &mounts).args;
         assert!(
             args.is_empty(),
             "stored invalid host should be warn-skipped"
@@ -370,7 +432,7 @@ mod tests {
             container: Some("/home/ai-pod/.claude/skills".into()),
             writable: false,
         }];
-        let args = build_mount_args(dir.path(), &mounts).unwrap();
+        let args = build_mount_args(dir.path(), Path::new(CONTAINER_HOME), &mounts).args;
         assert_eq!(args.len(), 2, "dangling symlink should still mount");
         assert!(args[1].starts_with(&host_str));
     }

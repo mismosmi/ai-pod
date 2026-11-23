@@ -171,6 +171,42 @@ fn cleanup_volume(rt: &ContainerRuntime, name: &str) {
     let _ = rt.command().args(["volume", "rm", "-f", name]).output();
 }
 
+fn container_create_events(rt: &ContainerRuntime, since: &str) -> Vec<serde_json::Value> {
+    let until = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 1)
+    .to_string();
+    let output = rt
+        .command()
+        .args([
+            "events",
+            "--since",
+            since,
+            "--until",
+            &until,
+            "--filter",
+            "type=container",
+            "--filter",
+            "event=create",
+            "--format",
+            "{{json .}}",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1127,6 +1163,156 @@ async fn e2e_egress_gateway_forwards_proxy_and_blocks_direct_access() {
     server_handle.abort();
 }
 
+#[test]
+fn e2e_home_mount_parents_preserve_existing_ownership() {
+    use ai_pod::config::{GlobalConfig, MountSpec};
+    use std::os::unix::fs::MetadataExt;
+
+    let rt = require_runtime!();
+    let base = shared_image_tag(&rt);
+    let ws = tempfile::TempDir::new().unwrap();
+    let tag = image::image_name(ws.path());
+    assert!(
+        rt.command()
+            .args(["tag", base, &tag])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (_dir, config) = make_test_config();
+    let cache = config.home_dir.join(".cache/tools/uv");
+    let credentials = config.home_dir.join("credentials.json");
+    let outside = config.home_dir.join("outside");
+    let new_bind = config.home_dir.join("new-bind");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(&credentials, "test credentials").unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::create_dir(&new_bind).unwrap();
+
+    let mount = |host: &Path, target: Option<&str>| MountSpec {
+        host: host.to_str().unwrap().into(),
+        container: target.map(str::to_owned),
+        writable: false,
+    };
+    let mut global = GlobalConfig {
+        mounts: vec![
+            mount(&cache, None),
+            mount(&credentials, Some("/home/ai-pod/.claude/.credentials.json")),
+            mount(&outside, Some("/opt/ai-pod-test/outside")),
+        ],
+    };
+    global.save(&config).unwrap();
+
+    let owner = |path: &Path| {
+        let metadata = path.metadata().unwrap();
+        (metadata.uid(), metadata.gid())
+    };
+    let sources = [&cache, &credentials, &outside, &new_bind];
+    let original_owners = sources.map(|path| owner(path));
+    let volume = workspace::volume_name(ws.path());
+    let legacy_container = format!("legacy-{volume}");
+    let events_since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .to_string();
+    let check = |extra: &str| {
+        let script = format!(
+            r#"
+cd "$HOME"
+for dir in .cache .cache/tools .claude; do
+    test "$(stat -c '%u:%g' "$dir")" = "$(id -u):$(id -g)"
+done
+test -d .cache/tools/uv
+touch .cache/tools/workspace-only
+test "$(cat .claude/.credentials.json)" = 'test credentials'
+test -f .claude/settings.json
+test "$(stat -c '%u:%g' /opt/ai-pod-test)" = 0:0
+{extra}
+"#
+        );
+        container::run_in_container(
+            &rt,
+            &config,
+            ws.path(),
+            &tag,
+            "project",
+            "key",
+            "sh",
+            &["-ec".into(), script],
+            false,
+            false,
+            &[],
+        )
+    };
+    let result = check("").and_then(|()| {
+        // Simulate an untracked parent left behind by an earlier launch.
+        let status = rt
+            .command()
+            .args([
+                "run",
+                "--rm",
+                "--name",
+                &legacy_container,
+                "--user",
+                "0:0",
+                "--network",
+                "none",
+                "-v",
+                &format!("{volume}:/home/ai-pod:z"),
+                "--entrypoint",
+                "sh",
+                &tag,
+                "-ec",
+                "mkdir -p /home/ai-pod/.cache/legacy; printf preserved > /home/ai-pod/.cache/legacy/keep; chown 0:0 /home/ai-pod/.cache/legacy",
+            ])
+            .status()?;
+        anyhow::ensure!(status.success(), "could not set up legacy mount parent");
+        global
+            .mounts
+            .push(mount(&new_bind, Some("/home/ai-pod/.cache/legacy/nested/data")));
+        global.save(&config)?;
+        let check_new = r#"
+test -d .cache/legacy/nested/data
+test "$(stat -c '%u:%g' .cache/legacy)" = 0:0
+test "$(cat .cache/legacy/keep)" = preserved
+"#;
+        check(check_new)?;
+        check(check_new)
+    });
+    container::clean_container(&rt, &config, ws.path()).unwrap();
+    result.unwrap();
+    assert_eq!(original_owners, sources.map(|path| owner(path)));
+
+    let events = container_create_events(&rt, &events_since);
+    let prefix = workspace::container_prefix(ws.path());
+    let mut helpers_per_launch = Vec::new();
+    for event in &events {
+        let image = event["Image"]
+            .as_str()
+            .or_else(|| event["Actor"]["Attributes"]["image"].as_str())
+            .unwrap_or_default()
+            .trim_start_matches("localhost/")
+            .trim_end_matches(":latest");
+        if image != tag {
+            continue;
+        }
+        let name = event["Name"]
+            .as_str()
+            .or_else(|| event["Actor"]["Attributes"]["name"].as_str())
+            .unwrap_or_default()
+            .trim_start_matches('/');
+        if name.starts_with(&prefix) {
+            helpers_per_launch.push(0);
+        } else if name != legacy_container
+            && let Some(helpers) = helpers_per_launch.last_mut()
+        {
+            *helpers += 1;
+        }
+    }
+    assert_eq!(helpers_per_launch, [1, 1, 0]);
+}
+
 /// Home setup is versioned and every injected file belongs to the image USER,
 /// including when a Dockerfile changes both the user and home directory.
 #[test]
@@ -1264,40 +1450,10 @@ test -z "${AI_POD_CODEX_PLAYWRIGHT_CONFIG+x}"
         r#"grep -q '^name: ai-pod$' "$HOME/.claude/skills/ai-pod/SKILL.md" && test "$(cat "$HOME/.codex/auth.json")" = auth"#,
         false,
     );
-    let until = (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + 1)
-    .to_string();
-    let events = rt
-        .command()
-        .args([
-            "events",
-            "--since",
-            &events_since,
-            "--until",
-            &until,
-            "--filter",
-            "type=container",
-            "--filter",
-            "event=create",
-            "--format",
-            "{{json .}}",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        events.status.success(),
-        "{}",
-        String::from_utf8_lossy(&events.stderr)
-    );
     let prefix = workspace::container_prefix(ws.path());
-    let names: std::collections::HashSet<String> = String::from_utf8(events.stdout)
-        .unwrap()
-        .lines()
-        .filter_map(|line| {
-            let event: serde_json::Value = serde_json::from_str(line).unwrap();
+    let names: std::collections::HashSet<String> = container_create_events(&rt, &events_since)
+        .iter()
+        .filter_map(|event| {
             event["Name"]
                 .as_str()
                 .or_else(|| event["Actor"]["Attributes"]["name"].as_str())
