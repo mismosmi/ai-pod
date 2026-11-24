@@ -4,10 +4,12 @@ use super::agent_config::{
     claude_mcp_entry, codex_config_merge, generate_runtime_settings, sync_claude_playwright,
     sync_codex_playwright, with_playwright_guidance,
 };
-use super::{checked_status, volume_exists, CONTAINER_HOME};
+use super::mounts::GlobalMounts;
+use super::{CONTAINER_HOME, checked_status, volume_exists};
 use crate::config::AppConfig;
 use crate::runtime::ContainerRuntime;
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::process::Stdio;
 
@@ -26,6 +28,7 @@ fn read_git_global(key: &str) -> Option<String> {
 /// successfully applied injection version (volume labels are immutable).
 pub const HOME_VERSION_LABEL: &str = "ai-pod.created-version";
 const HOME_VERSION_FILE: &str = ".ai-pod-version";
+pub(super) const HOME_MOUNT_STATE_DIR: &str = ".ai-pod-mount-parents-v1";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct ImageUser {
@@ -101,10 +104,12 @@ pub(super) fn execute_main_container(
     config: &AppConfig,
     playwright: bool,
     script_path: &str,
-    user: &ImageUser,
+    volume: &HomeVolume<'_>,
 ) -> Result<std::process::ExitStatus> {
     checked_status(command.status()?, "create main container")?;
     let result = (|| -> Result<std::process::ExitStatus> {
+        volume.prepare_mount_parents(rt, name)?;
+        let user = volume.user;
         if let Some(script) = prepare_home_volume(rt, config, name, &user.home, playwright)? {
             let mut archive = tempfile::tempfile()?;
             {
@@ -183,13 +188,23 @@ fn read_home_file(
 ) -> Result<Option<String>> {
     let target = tmp.join("read");
     let _ = std::fs::remove_file(&target);
+    if copy_from_home(rt, container, home, path, &target)? {
+        return Ok(Some(std::fs::read_to_string(target)?));
+    }
+    Ok(None)
+}
+
+fn copy_from_home(
+    rt: &ContainerRuntime,
+    container: &str,
+    home: &str,
+    path: &str,
+    target: &Path,
+) -> Result<bool> {
     let output = rt
         .command()
-        .args([
-            "cp",
-            &format!("{container}:{home}/{path}"),
-            &target.to_string_lossy(),
-        ])
+        .args(["cp", &format!("{container}:{home}/{path}")])
+        .arg(target)
         .output()?;
     if !output.status.success() {
         let error = String::from_utf8_lossy(&output.stderr).to_lowercase();
@@ -199,13 +214,37 @@ fn read_home_file(
                 || error.contains("does not exist"),
             "Failed reading {path}: {error}"
         );
-        return Ok(None);
+        return Ok(false);
     }
-    Ok(Some(std::fs::read_to_string(target)?))
+    Ok(true)
 }
 
-pub(super) fn ensure_home_volume(rt: &ContainerRuntime, volume: &str) -> Result<()> {
-    if !volume_exists(rt, volume)? {
+pub(super) struct HomeVolume<'a> {
+    name: &'a str,
+    image: &'a str,
+    user: &'a ImageUser,
+    mount_parents: Vec<&'a Path>,
+}
+
+impl<'a> HomeVolume<'a> {
+    pub(super) fn new(
+        name: &'a str,
+        image: &'a str,
+        user: &'a ImageUser,
+        mounts: &'a GlobalMounts,
+    ) -> Self {
+        Self {
+            name,
+            image,
+            user,
+            mount_parents: mounts.home_parents(Path::new(&user.home)),
+        }
+    }
+
+    pub(super) fn ensure_exists(&self, rt: &ContainerRuntime) -> Result<()> {
+        if volume_exists(rt, self.name)? {
+            return Ok(());
+        }
         checked_status(
             rt.command()
                 .args([
@@ -215,13 +254,106 @@ pub(super) fn ensure_home_volume(rt: &ContainerRuntime, volume: &str) -> Result<
                     "managed-by=ai-pod",
                     "--label",
                     &format!("{HOME_VERSION_LABEL}={}", env!("CARGO_PKG_VERSION")),
-                    volume,
                 ])
+                .arg(self.name)
                 .status()?,
             "create home volume",
-        )?;
+        )
     }
-    Ok(())
+
+    fn prepare_mount_parents(&self, rt: &ContainerRuntime, container: &str) -> Result<()> {
+        if rt.dry_run || self.mount_parents.is_empty() {
+            return Ok(());
+        }
+        let user = self.user;
+        let tmp = tempfile::tempdir()?;
+        let state = tmp.path().join("mount-parents");
+        copy_from_home(rt, container, &user.home, HOME_MOUNT_STATE_DIR, &state)?;
+        let identity = serde_json::to_vec(user)?;
+        let mut pending = Vec::new();
+        // Descendants come first so one mkdir -p can create any missing ancestors.
+        for parent in self.mount_parents.iter().rev() {
+            let mut hash = Sha256::new();
+            hash.update(&identity);
+            hash.update(parent.as_os_str().as_encoded_bytes());
+            let marker = hex::encode(hash.finalize());
+            if !state
+                .join(&marker)
+                .symlink_metadata()
+                .is_ok_and(|metadata| metadata.is_dir())
+            {
+                pending.push((*parent, marker));
+            }
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+        self.create_mount_parents(rt, &pending)
+    }
+
+    /// Runtimes may create missing mount parents as root when attaching binds.
+    /// Create them as the image user with only the named home volume mounted.
+    fn create_mount_parents(
+        &self,
+        rt: &ContainerRuntime,
+        pending: &[(&Path, String)],
+    ) -> Result<()> {
+        let user = self.user;
+        let script = r#"set -eu
+umask 077
+cd -P "$1"
+home=$PWD
+state=$2
+shift 2
+mkdir -p "./$state"
+cd -P "./$state"
+[ "$PWD" = "$home/$state" ]
+while [ "$#" -gt 0 ]; do
+    parent=$home/$1
+    marker=$2
+    shift 2
+    if [ ! -d "$parent" ]; then
+        # Retain the final newline so paths ending in newlines compare correctly.
+        resolved=$(realpath -m -- "$parent" && printf .)
+        if [ "$resolved" = "$(printf '%s\n.' "$parent")" ]; then
+            mkdir -p -- "$parent" ||
+                printf 'Leaving mount parent %s to the container runtime.\n' "$parent" >&2
+        fi
+    fi
+    # Record each handled parent separately so concurrent launches can add entries.
+    mkdir -p "./$marker"
+done
+"#;
+        let status = rt
+            .command()
+            .args([
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--workdir",
+                "/",
+                "--env",
+                "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+                "-v",
+                &format!("{}:{}:z", self.name, user.home),
+                "--entrypoint",
+                "/bin/sh",
+                self.image,
+                "-c",
+                script,
+                "ai-pod-home-mounts",
+                &user.home,
+                HOME_MOUNT_STATE_DIR,
+            ])
+            .args(
+                pending
+                    .iter()
+                    .flat_map(|(parent, marker)| [*parent, Path::new(marker)]),
+            )
+            .status()?;
+        checked_status(status, "prepare home mount parents")
+    }
 }
 
 pub(super) const MAIN_BOOTSTRAP: &str = r#"init=$1

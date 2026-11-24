@@ -1,10 +1,8 @@
 //! Interactive sessions, explicit commands, and their session networks.
 
 use super::agent_config::opencode_config_content;
-use super::home::{
-    ensure_home_volume, execute_main_container, image_command, image_user, MAIN_BOOTSTRAP,
-};
-use super::mounts::{build_mount_args, mask_mount_args};
+use super::home::{HomeVolume, MAIN_BOOTSTRAP, execute_main_container, image_command, image_user};
+use super::mounts::{GlobalMounts, build_mount_args, mask_mount_args};
 use super::{checked_status, containers_for_prefix};
 use crate::config::AppConfig;
 use crate::config::GlobalConfig;
@@ -29,6 +27,11 @@ fn terminal_env_args() -> impl Iterator<Item = &'static str> {
 fn load_project_state(config: &AppConfig, workspace: &Path) -> ProjectState {
     let hash = workspace_hash(workspace);
     ProjectState::load(&config.project_state_file(&hash))
+}
+
+fn load_global_mounts(config: &AppConfig, container_home: &str) -> GlobalMounts {
+    let global = GlobalConfig::load(config);
+    build_mount_args(&config.home_dir, Path::new(container_home), &global.mounts)
 }
 
 pub fn launch_container(
@@ -74,7 +77,9 @@ pub fn launch_container(
     }
     .save(config, &session_id)?;
 
-    ensure_home_volume(rt, &volume_name)?;
+    let mounts = load_global_mounts(config, home);
+    let home_volume = HomeVolume::new(&volume_name, image, &user, &mounts);
+    home_volume.ensure_exists(rt)?;
 
     let host_gw_env = format!("HOST_GATEWAY={}", rt.host_gateway());
     let server_url_env = format!("AI_POD_SERVER_URL={}", rt.server_url());
@@ -90,8 +95,6 @@ pub fn launch_container(
 
     let project_state = load_project_state(config, workspace);
     let mask_args = mask_mount_args(rt, workspace, image, &project_state.masked_directories)?;
-    let global = GlobalConfig::load(config);
-    let user_mount_args = build_mount_args(&config.home_dir, &global.mounts)?;
 
     // Create the per-workspace service network up front and attach the main
     // container to it at launch. Lazy attach via `podman network connect` after
@@ -126,9 +129,7 @@ pub fn launch_container(
         &container_workdir,
     ]);
     run_cmd.args(&workspace_mounts);
-    for arg in &user_mount_args {
-        run_cmd.arg(arg);
-    }
+    run_cmd.args(&mounts.args);
     for arg in &mask_args {
         run_cmd.arg(arg);
     }
@@ -170,8 +171,8 @@ pub fn launch_container(
         config,
         playwright,
         &script_path,
-        &user,
-    )?;
+        &home_volume,
+    );
 
     // Main container has exited (cleanly or otherwise); tear down anything the
     // agent started for this session. Best-effort: this is also covered by the
@@ -179,7 +180,7 @@ pub fn launch_container(
     crate::service::cleanup_services_for_session(rt, &session_id);
     crate::egress::cleanup_for_session(rt, &session_id);
     let _ = std::fs::remove_file(config.session_state_file(&session_id));
-    checked_status(run_status, "run container")
+    checked_status(run_status?, "run container")
 }
 
 pub fn run_in_container(
@@ -214,7 +215,9 @@ pub fn run_in_container(
 
     let user = image_user(rt, config, image)?;
     let home = &user.home;
-    ensure_home_volume(rt, &volume_name)?;
+    let mounts = load_global_mounts(config, home);
+    let home_volume = HomeVolume::new(&volume_name, image, &user, &mounts);
+    home_volume.ensure_exists(rt)?;
 
     eprintln!(
         "{} {} {}",
@@ -225,8 +228,6 @@ pub fn run_in_container(
 
     let project_state = load_project_state(config, workspace);
     let mask_args = mask_mount_args(rt, workspace, image, &project_state.masked_directories)?;
-    let global = GlobalConfig::load(config);
-    let user_mount_args = build_mount_args(&config.home_dir, &global.mounts)?;
 
     // See the matching comment in launch_container — main goes on the
     // per-workspace service network at launch so service containers can be
@@ -266,7 +267,7 @@ pub fn run_in_container(
         run_args.extend(["--publish".to_string(), port.clone()]);
     }
     run_args.extend(workspace_mounts);
-    run_args.extend(user_mount_args);
+    run_args.extend(mounts.args.iter().cloned());
     run_args.extend(mask_args);
     for env in net.env {
         run_args.extend(["-e".into(), env]);
@@ -315,14 +316,14 @@ pub fn run_in_container(
         config,
         playwright,
         &script_path,
-        &user,
-    )?;
+        &home_volume,
+    );
 
     crate::service::cleanup_services_for_session(rt, &session_id);
     crate::egress::cleanup_for_session(rt, &session_id);
     let _ = std::fs::remove_file(config.session_state_file(&session_id));
 
-    if !status.success() {
+    if !status?.success() {
         anyhow::bail!("Command exited with non-zero status");
     }
 
